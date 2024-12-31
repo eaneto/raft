@@ -25,7 +25,12 @@ pub enum Command {
     Unknown,
 }
 
-pub fn parse_command(buf: &[u8]) -> Result<Command, &str> {
+/// Parses a command.
+///
+/// # Errors
+///
+/// If the command is unparseable, an error is returned.
+pub fn parse(buf: &[u8]) -> Result<Command, &str> {
     let command_byte = match buf.first() {
         Some(command_byte) => *command_byte,
         None => return Err("Unable to parse command byte"),
@@ -40,11 +45,8 @@ pub fn parse_command(buf: &[u8]) -> Result<Command, &str> {
 }
 
 fn parse_request_vote_command(buf: &[u8]) -> Result<Command, &str> {
-    let length = match buf.get(1..9) {
-        Some(length) => length,
-        None => {
-            return Err("Unparseable command, unable to parse length");
-        }
+    let Some(length) = buf.get(1..9) else {
+        return Err("Unparseable command, unable to parse length");
     };
 
     let length = usize::from_be_bytes(length.try_into().unwrap());
@@ -60,11 +62,8 @@ fn parse_request_vote_command(buf: &[u8]) -> Result<Command, &str> {
 }
 
 fn parse_log_request_command(buf: &[u8]) -> Result<Command, &str> {
-    let length = match buf.get(1..9) {
-        Some(length) => length,
-        None => {
-            return Err("Unparseable command, unable to parse length");
-        }
+    let Some(length) = buf.get(1..9) else {
+        return Err("Unparseable command, unable to parse length");
     };
 
     let length = usize::from_be_bytes(length.try_into().unwrap());
@@ -101,7 +100,7 @@ mod tests {
         buf.extend(length);
         buf.extend(request_bytes);
 
-        let command = parse_command(&buf);
+        let command = parse(&buf);
 
         assert!(command.is_ok());
         assert_eq!(
@@ -118,7 +117,7 @@ mod tests {
     #[test]
     fn parse_unknown_command() {
         let command_byte = 7_u8.to_be_bytes();
-        let command = parse_command(&command_byte);
+        let command = parse(&command_byte);
 
         assert!(command.is_ok());
         assert_eq!(command.unwrap(), Command::Unknown)

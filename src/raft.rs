@@ -48,6 +48,7 @@ pub struct Node {
 }
 
 impl Server {
+    #[must_use]
     pub fn new(id: u64, nodes: HashMap<u64, Node>) -> Server {
         Server {
             id,
@@ -61,31 +62,33 @@ impl Server {
             votes_received: HashSet::new(),
             sent_length: HashMap::new(),
             acked_length: HashMap::new(),
-            nodes: nodes.clone(),
+            nodes,
             last_heartbeat: None,
         }
     }
 
+    #[must_use]
     fn current_term(&self) -> u64 {
         self.current_term
     }
 
     fn increment_current_term(&mut self) {
-        self.current_term = self.current_term + 1
+        self.current_term += 1;
     }
 
     fn decrement_current_term(&mut self) {
-        self.current_term = self.current_term - 1
+        self.current_term -= 1;
     }
 
     fn update_current_term(&mut self, value: u64) {
-        self.current_term = value
+        self.current_term = value;
     }
 
     fn is_candidate(&self) -> bool {
         matches!(self.state, State::Candidate)
     }
 
+    #[must_use]
     pub fn is_leader(&self) -> bool {
         matches!(self.state, State::Leader)
     }
@@ -102,18 +105,20 @@ impl Server {
         self.state = State::Candidate;
     }
 
+    #[must_use]
     fn commit_length(&self) -> u64 {
         self.commit_length
     }
 
     fn increment_commit_length(&mut self) {
-        self.commit_length = self.commit_length + 1
+        self.commit_length += 1;
     }
 
     fn update_commit_length(&mut self, value: u64) {
-        self.commit_length = value
+        self.commit_length = value;
     }
 
+    #[must_use]
     pub fn election_timeout(&self) -> u16 {
         self.election_timeout
     }
@@ -140,12 +145,13 @@ impl Server {
         self.sent_length.insert(node_id, sent_length_by_node - 1);
     }
 
+    #[must_use]
     pub fn last_heartbeat(&self) -> Option<Instant> {
         self.last_heartbeat
     }
 
     fn update_last_heartbeat(&mut self) {
-        self.last_heartbeat = Some(Instant::now())
+        self.last_heartbeat = Some(Instant::now());
     }
 
     fn log_length(&self) -> usize {
@@ -154,9 +160,13 @@ impl Server {
 
     /// Checks if the last heartbeat received from the leader(if there
     /// is a last heartbeat) has passed the election timeout.
+    #[must_use]
     pub fn no_hearbeats_received_from_leader(&self) -> bool {
-        let election_timeout = Duration::from_millis(self.election_timeout() as u64);
-        let time_elapsed = Instant::now() - election_timeout;
+        let election_timeout = Duration::from_millis(u64::from(self.election_timeout()));
+        let time_elapsed = match Instant::now().checked_sub(election_timeout) {
+            Some(time) => time,
+            None => Instant::now(),
+        };
         let last_heartbeat = self.last_heartbeat();
         (last_heartbeat
             .is_some_and(|heartbeat| time_elapsed.duration_since(heartbeat) > election_timeout)
@@ -190,7 +200,7 @@ impl Server {
             // TODO Send requests in parallel.
             // TODO Treat error
             trace!("Sending vote request to {}", &node.id);
-            if let Ok(response) = self.send_vote_request(&vote_request, node) {
+            if let Ok(response) = Self::send_vote_request(&vote_request, node) {
                 self.process_vote_response(response);
             }
         }
@@ -202,11 +212,10 @@ impl Server {
         }
     }
 
-    fn send_vote_request(
-        &self,
-        vote_request: &VoteRequest,
-        node: &Node,
-    ) -> Result<VoteResponse, &str> {
+    fn send_vote_request<'this>(
+        vote_request: &'this VoteRequest,
+        node: &'this Node,
+    ) -> Result<VoteResponse, &'this str> {
         let command_byte = 4_u8.to_be_bytes();
         let encoded_request = bincode::serialize(vote_request).unwrap();
         let mut buf = Vec::new();
@@ -216,54 +225,40 @@ impl Server {
 
         let mut retries: u8 = 0;
         let stream = loop {
-            match TcpStream::connect(&node.address) {
-                Ok(stream) => break Some(stream),
-                Err(_) => {
-                    if retries >= 3 {
-                        break None;
-                    } else {
-                        retries += 1;
-                    }
-                }
+            if let Ok(stream) = TcpStream::connect(&node.address) {
+                break Some(stream);
             }
+            if retries >= 3 {
+                break None;
+            }
+            retries += 1;
         };
 
-        let mut stream = match stream {
-            Some(stream) => stream,
-            None => {
-                error!("Can't connect to node at {}", &node.address);
-                return Err("Can't connect to node");
-            }
+        let Some(mut stream) = stream else {
+            error!("Can't connect to node at {}", &node.address);
+            return Err("Can't connect to node");
         };
 
         // What should be done in case of failure?
-        match stream.write_all(&buf) {
-            Ok(()) => {
-                trace!("Successfully sent request to node {}", &node.id)
-            }
-            Err(_) => {
-                error!("Unable to send request to node {}", &node.id);
-                return Err("Unable to send request to node");
-            }
-        };
+        if stream.write_all(&buf).is_err() {
+            trace!("Successfully sent request to node {}", &node.id);
+        } else {
+            error!("Unable to send request to node {}", &node.id);
+            return Err("Unable to send request to node");
+        }
         let mut buf = [0; 1024];
-        let _ = match stream.read(&mut buf) {
-            Ok(size) => size,
-            Err(_) => {
-                error!("Can't read response from client {}", &node.id);
-                return Err("Can't read response from client");
-            }
+        let Ok(_) = stream.read(&mut buf) else {
+            error!("Can't read response from client {}", &node.id);
+            return Err("Can't read response from client");
         };
         if buf[0] == 0 {
             let length = buf.get(1..9).unwrap();
             let length = usize::from_be_bytes(length.try_into().unwrap());
-            let encoded_response = match buf.get(9..(9 + length)) {
-                Some(response) => response,
-                None => return Err("Incomplete response, unable to parse vote response"),
+            let Some(encoded_response) = buf.get(9..(9 + length)) else {
+                return Err("Incomplete response, unable to parse vote response");
             };
-            let response = match bincode::deserialize(encoded_response) {
-                Ok(response) => response,
-                Err(_) => return Err("Unable to deserialize server response"),
+            let Ok(response) = bincode::deserialize(encoded_response) else {
+                return Err("Unable to deserialize server response");
             };
             Ok(response)
         } else {
@@ -344,10 +339,10 @@ impl Server {
     }
 
     fn last_term(&self) -> u64 {
-        if self.log.len() > 0 {
-            self.log[self.log.len() - 1].term
-        } else {
+        if self.log.is_empty() {
             0
+        } else {
+            self.log[self.log.len() - 1].term
         }
     }
 
@@ -380,36 +375,33 @@ impl Server {
 
     // Can only be called by the leader
     fn replicate_log(&self, node: &Node) -> Result<LogResponse, &str> {
-        let request = match self.sent_length.get(&node.id) {
-            Some(entry) => {
-                let prefix_length = *entry as usize;
-                let suffix = &self.log[prefix_length..];
-                let prefix_term = if prefix_length > 0 {
-                    self.log[prefix_length - 1].term
-                } else {
-                    0
-                };
-                LogRequest {
-                    leader_id: self.id,
-                    term: self.current_term(),
-                    prefix_length,
-                    prefix_term,
-                    leader_commit: self.commit_length(),
-                    suffix: suffix.to_vec(),
-                }
+        let request = if let Some(entry) = self.sent_length.get(&node.id) {
+            let prefix_length = usize::try_from(*entry).unwrap_or_default();
+            let suffix = &self.log[prefix_length..];
+            let prefix_term = if prefix_length > 0 {
+                self.log[prefix_length - 1].term
+            } else {
+                0
+            };
+            LogRequest {
+                leader_id: self.id,
+                term: self.current_term(),
+                prefix_length,
+                prefix_term,
+                leader_commit: self.commit_length(),
+                suffix: suffix.to_vec(),
             }
+        } else {
             // If there are logs sent just send an empty vector as a
             // heartbeat.
-            None => {
-                debug!("Sending heartbeat to replicas");
-                LogRequest {
-                    leader_id: self.id,
-                    term: self.current_term(),
-                    prefix_length: 0,
-                    prefix_term: 0,
-                    leader_commit: self.commit_length(),
-                    suffix: Vec::new(),
-                }
+            debug!("Sending heartbeat to replicas");
+            LogRequest {
+                leader_id: self.id,
+                term: self.current_term(),
+                prefix_length: 0,
+                prefix_term: 0,
+                leader_commit: self.commit_length(),
+                suffix: Vec::new(),
             }
         };
 
@@ -427,66 +419,48 @@ impl Server {
 
         let mut retries: u8 = 0;
         let stream = loop {
-            match TcpStream::connect(&node.address) {
-                Ok(stream) => break Some(stream),
-                Err(_) => {
-                    if retries >= 3 {
-                        break None;
-                    } else {
-                        retries += 1;
-                    }
-                }
+            if let Ok(stream) = TcpStream::connect(&node.address) {
+                break Some(stream);
             }
+            if retries >= 3 {
+                break None;
+            }
+            retries += 1;
         };
 
-        let mut stream = match stream {
-            Some(stream) => stream,
-            None => {
-                error!("Can't connect to node at {}", &node.address);
-                return Err("Can't connect to node");
-            }
+        let Some(mut stream) = stream else {
+            error!("Can't connect to node at {}", &node.address);
+            return Err("Can't connect to node");
         };
 
         // What should be done in case of failure?
-        match stream.write_all(&buf) {
-            Ok(()) => {
-                trace!("Successfully sent request to node {}", &node.id)
-            }
-            Err(_) => {
-                error!("Unable to send request to node {}", &node.id);
-                return Err("Unable to send request to node");
-            }
+        if stream.write_all(&buf).is_ok() {
+            trace!("Successfully sent request to node {}", &node.id);
+        } else {
+            error!("Unable to send request to node {}", &node.id);
+            return Err("Unable to send request to node");
         };
         let mut buf = [0; 1024];
-        let _ = match stream.read(&mut buf) {
-            Ok(size) => size,
-            Err(_) => {
-                error!("Can't read response from client {}", &node.id);
-                return Err("Can't read response from client");
-            }
+        let Ok(_) = stream.read(&mut buf) else {
+            error!("Can't read response from client {}", &node.id);
+            return Err("Can't read response from client");
         };
         if buf[0] == 0 {
             let length = buf.get(1..9).unwrap();
             let length = usize::from_be_bytes(length.try_into().unwrap());
-            let encoded_response = match buf.get(9..(9 + length)) {
-                Some(response) => response,
-                None => {
-                    error!(
-                        "Incomplete response, unable to parse log response from client {}",
-                        &node.id
-                    );
-                    return Err("Incomplete response, unable to parse log response");
-                }
+            let Some(encoded_response) = buf.get(9..(9 + length)) else {
+                error!(
+                    "Incomplete response, unable to parse log response from client {}",
+                    &node.id
+                );
+                return Err("Incomplete response, unable to parse log response");
             };
-            let response = match bincode::deserialize(encoded_response) {
-                Ok(response) => response,
-                Err(_) => {
-                    error!(
-                        "Unable to deserialize server response from client {}",
-                        &node.id
-                    );
-                    return Err("Unable to deserialize server response");
-                }
+            let Ok(response) = bincode::deserialize(encoded_response) else {
+                error!(
+                    "Unable to deserialize server response from client {}",
+                    &node.id
+                );
+                return Err("Unable to deserialize server response");
             };
             trace!("Received successful response from {}", &node.id);
             Ok(response)
@@ -523,7 +497,7 @@ impl Server {
         }
     }
 
-    pub fn receive_log_request(&mut self, log_request: LogRequest) -> LogResponse {
+    pub fn receive_log_request(&mut self, log_request: &LogRequest) -> LogResponse {
         self.update_last_heartbeat();
         if log_request.term > self.current_term() {
             self.update_current_term(log_request.term);
@@ -584,7 +558,7 @@ impl Server {
         }
     }
 
-    fn send_append_entries(&mut self, log_request: LogRequest) {
+    fn send_append_entries(&mut self, log_request: &LogRequest) {
         let log_length = self.log_length();
         if !log_request.suffix.is_empty() && log_length > log_request.prefix_length {
             let index = cmp::min(
@@ -615,7 +589,7 @@ impl Server {
 }
 
 // RPC
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub struct VoteRequest {
     pub node_id: u64,
     pub current_term: u64,
@@ -623,7 +597,7 @@ pub struct VoteRequest {
     pub last_term: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Copy, Clone)]
 pub struct VoteResponse {
     node_id: u64,
     term: u64,
@@ -647,7 +621,7 @@ pub struct LogRequest {
     pub suffix: Vec<LogEntry>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub struct LogResponse {
     node_id: u64,
     term: u64,
