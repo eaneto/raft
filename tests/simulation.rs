@@ -310,6 +310,22 @@ impl Sim {
         self.groups = groups;
     }
 
+    /// Models `AGENTS.md` §8 rule 7: a node whose persistent state failed to
+    /// load discards **all** Raft state and rejoins as a fresh follower. The
+    /// cross-time safety invariants (committed-entry agreement, Log Matching,
+    /// Leader Completeness) are deliberately *not* reset, so the rejoining
+    /// node is still held to them; only this node's own monotonic-progress
+    /// baseline restarts, because it is a new incarnation.
+    fn wipe_node(&mut self, i: usize) {
+        let peers = self.ids.iter().copied().filter(|&id| id != self.ids[i]);
+        self.nodes[i] = RaftNode::new(self.ids[i], peers);
+        self.applied[i].clear();
+        self.prev_commit[i] = 0;
+        self.prev_applied[i] = 0;
+        self.election_deadline[i] = self.arm_election();
+        self.heartbeat_deadline[i] = self.now + HEARTBEAT_PERIOD;
+    }
+
     fn leaders(&self) -> Vec<usize> {
         (0..self.nodes.len())
             .filter(|&i| self.nodes[i].is_leader())
@@ -904,5 +920,70 @@ fn assert_survives_continuous_chaos(seed: u64) {
 fn five_node_cluster_survives_continuous_chaos() {
     for seed in seeds(&[1, 42, 1_000, 0x5EED]) {
         assert_survives_continuous_chaos(seed);
+    }
+}
+
+/// `AGENTS.md` §8 rule 7: a follower that lost its persistent state discards
+/// everything and rejoins fresh; the leader repopulates it via `AppendEntries`
+/// (backing `nextIndex` down to the start) and it re-applies the whole
+/// committed sequence, never a conflicting entry.
+fn assert_wiped_follower_recovers(seed: u64) {
+    let node_count = 5;
+    let net = Net {
+        drop_permille: 0,
+        dup_permille: 0,
+        jitter: 5,
+        repartition_every: 0,
+    };
+    let mut sim = Sim::new(node_count, seed).with_net(net);
+
+    let leader = sim.run_until_leader(5_000);
+    let early: Vec<Vec<u8>> = (0..6).map(|k| format!("early-{k}").into_bytes()).collect();
+    for command in &early {
+        sim.propose_at(leader, command);
+        sim.run_until(sim.now + 200);
+    }
+    sim.run_until(sim.now + 1_000);
+
+    // Pick a follower and wipe it.
+    let victim = (leader + 2) % node_count;
+    assert!(!sim.nodes[victim].is_leader());
+    sim.wipe_node(victim);
+    assert!(sim.applied_commands(victim).is_empty());
+
+    // Keep the cluster working; the fresh node must catch back up.
+    let late: Vec<Vec<u8>> = (0..6).map(|k| format!("late-{k}").into_bytes()).collect();
+    for command in &late {
+        let current = sim.run_until_leader(5_000);
+        sim.propose_at(current, command);
+        sim.run_until(sim.now + 200);
+    }
+    sim.run_until(sim.now + 5_000);
+
+    let want: Vec<Bytes> = early
+        .iter()
+        .chain(&late)
+        .map(|c| Bytes::copy_from_slice(c))
+        .collect();
+    let reference = sim.run_until_leader(5_000);
+    let leader_log = sim.nodes[reference].log().clone();
+    for i in 0..node_count {
+        assert_eq!(
+            sim.nodes[i].log(),
+            &leader_log,
+            "seed={seed}: node {i} log did not reconverge after the wipe",
+        );
+        assert_eq!(
+            sim.applied_commands(i),
+            want,
+            "seed={seed}: node {i} did not re-apply the full committed sequence",
+        );
+    }
+}
+
+#[test]
+fn a_wiped_follower_rejoins_and_catches_up() {
+    for seed in seeds(&[1, 2, 3, 42, 1_000, 0x5EED, 7, 99]) {
+        assert_wiped_follower_recovers(seed);
     }
 }
