@@ -5,13 +5,20 @@
 //! iteration order leaking into behaviour. A failing assertion carries its seed
 //! so it can be replayed with `SEED=<n> just sim-seed`.
 //!
+//! The [`Sim`] event loop re-checks the Raft safety invariants (AGENTS.md §9)
+//! after every core step, so any unreliable-network test that returns at all
+//! has held Election Safety, Log Matching, Leader Completeness, State Machine
+//! Safety, and `commitIndex` / `lastApplied` monotonicity for its whole run.
+//!
 //! See AGENTS.md "Testing standards".
+
+use std::collections::BTreeMap;
 
 use bytes::Bytes;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use raft::core::{Effect, Input, LogicalInstant, Message, NodeId, RaftNode};
+use raft::core::{Effect, Input, LogIndex, LogicalInstant, Message, NodeId, RaftNode};
 
 // Timer and network constants, in logical milliseconds. The heartbeat period
 // sits comfortably below the election-timeout floor, so a healthy leader is
@@ -23,6 +30,31 @@ const NET_DELAY: u64 = 10;
 /// Sentinel deadline meaning "not armed": a leader runs no election timer.
 const NEVER: u64 = u64::MAX;
 
+/// How the simulated network misbehaves for a run.
+///
+/// [`RELIABLE`] is in-order, lossless, single-partition, and draws no
+/// randomness of its own, so the reliable-network tests stay bit-for-bit
+/// reproducible even as the faulty paths are added around them.
+#[derive(Clone, Copy)]
+struct Net {
+    /// Per-mille chance each sent message is dropped outright.
+    drop_permille: u32,
+    /// Per-mille chance a non-dropped message is also delivered a second time.
+    dup_permille: u32,
+    /// Extra delay, `0..=jitter`, added to `NET_DELAY` per message. Non-zero
+    /// jitter lets later messages overtake earlier ones (reordering).
+    jitter: u64,
+    /// Re-draw the partition this often (logical ms); `0` never partitions.
+    repartition_every: u64,
+}
+
+const RELIABLE: Net = Net {
+    drop_permille: 0,
+    dup_permille: 0,
+    jitter: 0,
+    repartition_every: 0,
+};
+
 /// A message in flight on the simulated network.
 struct Envelope {
     deliver_at: u64,
@@ -32,21 +64,32 @@ struct Envelope {
 }
 
 /// A whole cluster driven on one thread against a logical clock.
-///
-/// The network here is reliable and in-order with a fixed delay; loss,
-/// reordering, and partitions arrive with the log-replication tests.
 struct Sim {
+    seed: u64,
     now: u64,
     ids: Vec<NodeId>,
     nodes: Vec<RaftNode>,
     election_deadline: Vec<u64>,
     heartbeat_deadline: Vec<u64>,
     inflight: Vec<Envelope>,
+    net: Net,
+    /// Partition group per node; two nodes exchange messages only when their
+    /// groups match. All-zero means one connected network.
+    groups: Vec<usize>,
+    next_net_change: u64,
     /// Per node, the `(index, command)` pairs the core told it to apply, in
-    /// the order it was told. The event loop asserts index order as it fills
-    /// this; tests then check the nodes agree.
+    /// order. `step` asserts index order as it fills this.
     applied: Vec<Vec<(u64, Bytes)>>,
     rng: StdRng,
+
+    // --- invariant bookkeeping (AGENTS.md §9) ---
+    prev_commit: Vec<u64>,
+    prev_applied: Vec<u64>,
+    /// index -> (entry term, command, term it was first observed committed in).
+    committed: BTreeMap<u64, (u64, Bytes, u64)>,
+    /// term -> the one node ever seen leading it (Election Safety).
+    leader_of_term: BTreeMap<u64, usize>,
+    saw_leader: bool,
 }
 
 impl Sim {
@@ -62,20 +105,44 @@ impl Sim {
             .collect();
         let heartbeat_deadline = vec![HEARTBEAT_PERIOD; node_count];
         Self {
+            seed,
             now: 0,
             ids,
             nodes,
             election_deadline,
             heartbeat_deadline,
             inflight: Vec::new(),
+            net: RELIABLE,
+            groups: vec![0; node_count],
+            next_net_change: NEVER,
             applied: vec![Vec::new(); node_count],
             rng,
+            prev_commit: vec![0; node_count],
+            prev_applied: vec![0; node_count],
+            committed: BTreeMap::new(),
+            leader_of_term: BTreeMap::new(),
+            saw_leader: false,
         }
+    }
+
+    /// Switches on the given network faults. Chainable after [`Sim::new`].
+    const fn with_net(mut self, net: Net) -> Self {
+        self.net = net;
+        self.next_net_change = if net.repartition_every > 0 {
+            net.repartition_every
+        } else {
+            NEVER
+        };
+        self
     }
 
     fn index_of(&self, id: NodeId) -> usize {
         // Every routed id was built in `new`, so the fallback is unreachable.
         self.ids.iter().position(|&known| known == id).unwrap_or(0)
+    }
+
+    fn connected(&self, from: NodeId, to: NodeId) -> bool {
+        self.groups[self.index_of(from)] == self.groups[self.index_of(to)]
     }
 
     fn next_event_time(&self) -> u64 {
@@ -85,26 +152,39 @@ impl Sim {
             .copied()
             .chain(self.heartbeat_deadline.iter().copied());
         let messages = self.inflight.iter().map(|envelope| envelope.deliver_at);
-        timers.chain(messages).min().unwrap_or(NEVER)
+        timers
+            .chain(messages)
+            .chain(std::iter::once(self.next_net_change))
+            .min()
+            .unwrap_or(NEVER)
     }
 
     /// Runs the event loop until logical time `end` (inclusive), advancing the
     /// clock only to times where something actually happens.
     fn run_until(&mut self, end: u64) {
         loop {
-            let t = self.next_event_time();
-            if t > end {
+            let now = self.next_event_time();
+            if now > end {
                 self.now = end;
                 return;
             }
-            self.now = t;
+            self.now = now;
+
+            if self.next_net_change == now {
+                self.shuffle_partition();
+                self.next_net_change = if self.net.repartition_every > 0 {
+                    now + self.net.repartition_every
+                } else {
+                    NEVER
+                };
+            }
 
             for i in 0..self.nodes.len() {
-                if self.election_deadline[i] == t {
+                if self.election_deadline[i] == now {
                     self.step(i, Input::ElectionTimeout);
                 }
-                if self.heartbeat_deadline[i] == t {
-                    self.heartbeat_deadline[i] = t + HEARTBEAT_PERIOD;
+                if self.heartbeat_deadline[i] == now {
+                    self.heartbeat_deadline[i] = now + HEARTBEAT_PERIOD;
                     self.step(i, Input::HeartbeatTick);
                 }
             }
@@ -112,9 +192,13 @@ impl Sim {
             let (due, pending): (Vec<Envelope>, Vec<Envelope>) = self
                 .inflight
                 .drain(..)
-                .partition(|envelope| envelope.deliver_at == t);
+                .partition(|envelope| envelope.deliver_at == now);
             self.inflight = pending;
             for envelope in due {
+                // A partition drops in-flight messages across the cut.
+                if !self.connected(envelope.from, envelope.to) {
+                    continue;
+                }
                 let i = self.index_of(envelope.to);
                 self.step(
                     i,
@@ -124,6 +208,8 @@ impl Sim {
                     },
                 );
             }
+
+            self.check_invariants();
         }
     }
 
@@ -132,12 +218,7 @@ impl Sim {
         let effects = self.nodes[i].step(input, LogicalInstant::from_millis(self.now));
         for effect in effects {
             match effect {
-                Effect::SendRpc { to, message } => self.inflight.push(Envelope {
-                    deliver_at: self.now + NET_DELAY,
-                    from: self.nodes[i].id(),
-                    to,
-                    message,
-                }),
+                Effect::SendRpc { to, message } => self.send(i, to, message),
                 Effect::ResetElectionTimer => {
                     self.election_deadline[i] = self.arm_election();
                 }
@@ -146,12 +227,13 @@ impl Sim {
                     assert_eq!(
                         index.get(),
                         expected,
-                        "node {i} applied index {} out of order (expected {expected})",
+                        "seed={}: node {i} applied index {} out of order (expected {expected})",
+                        self.seed,
                         index.get(),
                     );
                     self.applied[i].push((index.get(), command));
                 }
-                // No durability model yet (that is step 6).
+                // No durability model in the simulator yet (that is step 6).
                 Effect::Persist { .. } | Effect::PersistLog { .. } => {}
             }
         }
@@ -165,8 +247,67 @@ impl Sim {
         }
     }
 
+    /// Queues a message on the network, applying drop / jitter / duplication.
+    fn send(&mut self, from_idx: usize, to: NodeId, message: Message) {
+        if self.net.drop_permille > 0 && self.rng.gen_ratio(self.net.drop_permille, 1000) {
+            return;
+        }
+        let from = self.nodes[from_idx].id();
+        let first = self.now + NET_DELAY + self.jitter();
+        let duplicate =
+            self.net.dup_permille > 0 && self.rng.gen_ratio(self.net.dup_permille, 1000);
+        let second = duplicate.then(|| self.now + NET_DELAY + self.jitter());
+
+        self.inflight.push(Envelope {
+            deliver_at: first,
+            from,
+            to,
+            message: message.clone(),
+        });
+        if let Some(deliver_at) = second {
+            self.inflight.push(Envelope {
+                deliver_at,
+                from,
+                to,
+                message,
+            });
+        }
+    }
+
+    fn jitter(&mut self) -> u64 {
+        if self.net.jitter > 0 {
+            self.rng.gen_range(0..=self.net.jitter)
+        } else {
+            0
+        }
+    }
+
     fn arm_election(&mut self) -> u64 {
         self.now + self.rng.gen_range(ELECTION_MIN..ELECTION_MAX)
+    }
+
+    /// Redraws the partition: mostly a full heal, otherwise a random two-way
+    /// split with both sides non-empty.
+    fn shuffle_partition(&mut self) {
+        let n = self.nodes.len();
+        if n < 2 || self.rng.gen_ratio(3, 5) {
+            self.groups = vec![0; n];
+            return;
+        }
+        loop {
+            let split: Vec<usize> = (0..n)
+                .map(|_| usize::from(self.rng.gen_bool(0.5)))
+                .collect();
+            if split.contains(&0) && split.contains(&1) {
+                self.groups = split;
+                return;
+            }
+        }
+    }
+
+    fn set_groups(&mut self, groups: Vec<usize>) {
+        assert_eq!(groups.len(), self.nodes.len());
+        self.groups = groups;
     }
 
     fn leaders(&self) -> Vec<usize> {
@@ -183,20 +324,225 @@ impl Sim {
         }
     }
 
-    /// Feeds `command` to the current leader as a client proposal and routes
-    /// the resulting effects.
-    fn propose(&mut self, seed: u64, command: &[u8]) {
+    /// A current leader whose partition group is `group`, if any.
+    fn leader_in_group(&self, group: usize) -> Option<usize> {
+        self.leaders()
+            .into_iter()
+            .find(|&i| self.groups[i] == group)
+    }
+
+    /// Runs in short slices until there is exactly one leader, up to `budget`
+    /// logical ms from now. Returns that leader; asserts one appears.
+    fn run_until_leader(&mut self, budget: u64) -> usize {
+        let deadline = self.now + budget;
+        while self.now < deadline {
+            if let Some(leader) = self.sole_leader() {
+                return leader;
+            }
+            self.run_until(self.now + HEARTBEAT_PERIOD);
+        }
+        let found = self.sole_leader();
+        assert!(
+            found.is_some(),
+            "seed={}: no sole leader within {budget}ms",
+            self.seed,
+        );
+        found.unwrap_or(0)
+    }
+
+    /// Feeds `command` to the sole current leader as a client proposal.
+    fn propose_to_leader(&mut self, command: &[u8]) {
         let leader = self.sole_leader();
         assert!(
             leader.is_some(),
-            "seed={seed}: no sole leader to accept a proposal",
+            "seed={}: no sole leader to accept a proposal",
+            self.seed,
+        );
+        self.propose_at(leader.unwrap_or(0), command);
+    }
+
+    /// Feeds `command` to node `idx`, which must currently believe it leads.
+    fn propose_at(&mut self, idx: usize, command: &[u8]) {
+        assert!(
+            self.nodes[idx].is_leader(),
+            "seed={}: node {idx} is not a leader",
+            self.seed,
         );
         self.step(
-            leader.unwrap_or(0),
+            idx,
             Input::Propose {
                 command: Bytes::copy_from_slice(command),
             },
         );
+        self.check_invariants();
+    }
+
+    fn applied_commands(&self, i: usize) -> Vec<Bytes> {
+        self.applied[i].iter().map(|(_, cmd)| cmd.clone()).collect()
+    }
+
+    fn log_terms_and_commands(&self, i: usize) -> Vec<(u64, Bytes)> {
+        self.nodes[i]
+            .log()
+            .entries_from(LogIndex::new(1))
+            .iter()
+            .map(|entry| (entry.term.get(), entry.command.clone()))
+            .collect()
+    }
+
+    /// Re-checks the AGENTS.md §9 safety invariants against the whole cluster.
+    /// Called after every core step, so any test that returns has held them.
+    fn check_invariants(&mut self) {
+        self.check_monotonic_progress();
+        self.check_one_leader_per_term();
+        self.record_and_check_committed();
+        self.check_leader_completeness();
+        self.check_applied_agreement();
+        self.check_log_matching();
+    }
+
+    /// §9.9 / §9.10: `commitIndex` and `lastApplied` never go backwards, and a
+    /// node never applies past what it has committed.
+    fn check_monotonic_progress(&mut self) {
+        let seed = self.seed;
+        for i in 0..self.nodes.len() {
+            let commit = self.nodes[i].commit_index().get();
+            let applied = self.nodes[i].last_applied().get();
+            assert!(
+                commit >= self.prev_commit[i],
+                "seed={seed}: node {i} commit_index regressed {} -> {commit}",
+                self.prev_commit[i],
+            );
+            assert!(
+                applied >= self.prev_applied[i],
+                "seed={seed}: node {i} last_applied regressed {} -> {applied}",
+                self.prev_applied[i],
+            );
+            assert!(
+                applied <= commit,
+                "seed={seed}: node {i} last_applied {applied} exceeds commit_index {commit}",
+            );
+            self.prev_commit[i] = commit;
+            self.prev_applied[i] = applied;
+        }
+    }
+
+    /// §9.1: at most one leader per term, across the whole run.
+    fn check_one_leader_per_term(&mut self) {
+        let seed = self.seed;
+        for i in 0..self.nodes.len() {
+            if !self.nodes[i].is_leader() {
+                continue;
+            }
+            self.saw_leader = true;
+            let term = self.nodes[i].current_term().get();
+            match self.leader_of_term.get(&term) {
+                Some(&j) => {
+                    assert!(
+                        j == i,
+                        "seed={seed}: nodes {j} and {i} both led term {term}"
+                    );
+                }
+                None => {
+                    self.leader_of_term.insert(term, i);
+                }
+            }
+        }
+    }
+
+    /// §9.5: every entry a node counts as committed agrees, at that index, with
+    /// what any other node ever committed there.
+    fn record_and_check_committed(&mut self) {
+        let seed = self.seed;
+        for i in 0..self.nodes.len() {
+            let commit_term = self.nodes[i].current_term().get();
+            let commit = self.nodes[i].commit_index().get();
+            for (pos, (term, command)) in self.log_terms_and_commands(i).into_iter().enumerate() {
+                let idx = pos as u64 + 1;
+                if idx > commit {
+                    break;
+                }
+                match self.committed.get(&idx) {
+                    Some((seen_term, seen_command, _)) => assert!(
+                        *seen_term == term && *seen_command == command,
+                        "seed={seed}: node {i} has committed entry {idx} = ({term}, {command:?}) \
+                         but ({seen_term}, {seen_command:?}) was committed there earlier",
+                    ),
+                    None => {
+                        self.committed.insert(idx, (term, command, commit_term));
+                    }
+                }
+            }
+        }
+    }
+
+    /// §9.4: a current leader holds every entry committed in an earlier or
+    /// equal term (Leader Completeness, projected onto the live leaders).
+    fn check_leader_completeness(&self) {
+        let seed = self.seed;
+        for i in 0..self.nodes.len() {
+            if !self.nodes[i].is_leader() {
+                continue;
+            }
+            let leader_term = self.nodes[i].current_term().get();
+            let log = self.log_terms_and_commands(i);
+            for (&idx, (term, command, commit_term)) in &self.committed {
+                if *commit_term > leader_term {
+                    continue;
+                }
+                let pos = usize::try_from(idx - 1).unwrap_or(usize::MAX);
+                let held = log.get(pos);
+                assert!(
+                    held.is_some(),
+                    "seed={seed}: leader {i} (term {leader_term}) is missing committed entry {idx}",
+                );
+                if let Some((held_term, held_command)) = held {
+                    assert!(
+                        held_term == term && held_command == command,
+                        "seed={seed}: leader {i} entry {idx} differs from what was committed there",
+                    );
+                }
+            }
+        }
+    }
+
+    /// §9.5: applied sequences agree on their common prefix.
+    fn check_applied_agreement(&self) {
+        let seed = self.seed;
+        for left in 0..self.nodes.len() {
+            for right in (left + 1)..self.nodes.len() {
+                let common = self.applied[left].len().min(self.applied[right].len());
+                assert!(
+                    self.applied[left][..common] == self.applied[right][..common],
+                    "seed={seed}: nodes {left} and {right} applied different commands \
+                     in their common prefix",
+                );
+            }
+        }
+    }
+
+    /// §9.3: Log Matching. Past the longest identical prefix of two logs, no
+    /// shared index may carry the same term.
+    fn check_log_matching(&self) {
+        let seed = self.seed;
+        for left in 0..self.nodes.len() {
+            for right in (left + 1)..self.nodes.len() {
+                let log_l = self.nodes[left].log().entries_from(LogIndex::new(1));
+                let log_r = self.nodes[right].log().entries_from(LogIndex::new(1));
+                let common = log_l.len().min(log_r.len());
+                let mut prefix = 0;
+                while prefix < common && log_l[prefix] == log_r[prefix] {
+                    prefix += 1;
+                }
+                for k in prefix..common {
+                    assert!(
+                        log_l[k].term != log_r[k].term,
+                        "seed={seed}: Log Matching broke at index {} between nodes {left} and {right}",
+                        k + 1,
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -271,7 +617,7 @@ fn assert_proposals_replicate_and_commit(node_count: usize, seed: u64) {
     );
 
     for command in commands {
-        sim.propose(seed, command);
+        sim.propose_to_leader(command);
         sim.run_until(sim.now + 250); // let one round of replication settle
     }
     sim.run_until(sim.now + 1_000); // and a few heartbeats to carry commit
@@ -300,13 +646,9 @@ fn assert_proposals_replicate_and_commit(node_count: usize, seed: u64) {
             "seed={seed}: node {i} commit_index {} != {n}",
             node.commit_index().get(),
         );
-        assert!(
-            node.last_applied().get() <= node.commit_index().get(),
-            "seed={seed}: node {i} applied past its commit index",
-        );
-        let applied: Vec<Bytes> = sim.applied[i].iter().map(|(_, cmd)| cmd.clone()).collect();
         assert_eq!(
-            applied, want,
+            sim.applied_commands(i),
+            want,
             "seed={seed}: node {i} applied the wrong commands or order",
         );
     }
@@ -323,5 +665,244 @@ fn three_node_cluster_replicates_and_commits_proposals() {
 fn five_node_cluster_replicates_and_commits_proposals() {
     for seed in seeds(&[1, 7, 99, 0x00C0_FFEE]) {
         assert_proposals_replicate_and_commit(5, seed);
+    }
+}
+
+/// A lossy, jittery, duplicating network (no partitions) still settles on one
+/// leader that then holds the job across a quiet stretch.
+fn assert_elects_and_holds_under_loss(node_count: usize, seed: u64) {
+    let net = Net {
+        drop_permille: 60,
+        dup_permille: 100,
+        jitter: 25,
+        repartition_every: 0,
+    };
+    let mut sim = Sim::new(node_count, seed).with_net(net);
+
+    let leader = sim.run_until_leader(20_000);
+    sim.run_until(sim.now + 3_000);
+    assert!(
+        sim.nodes[leader].is_leader(),
+        "seed={seed}: node {leader} did not hold leadership through the quiet stretch",
+    );
+    assert_eq!(
+        sim.sole_leader(),
+        Some(leader),
+        "seed={seed}: leadership was not stable under loss",
+    );
+}
+
+#[test]
+fn five_node_cluster_elects_a_stable_leader_under_message_loss() {
+    for seed in seeds(&[1, 2, 3, 42, 1_000, 0x5EED, 0x00C0_FFEE]) {
+        assert_elects_and_holds_under_loss(5, seed);
+    }
+}
+
+/// Under loss, duplication, and reordering (no partitions), a stream of
+/// proposals still commits, and every node converges to the full applied
+/// sequence once the network is given time to settle.
+fn assert_commits_under_chaotic_delivery(node_count: usize, seed: u64) {
+    let net = Net {
+        drop_permille: 80,
+        dup_permille: 150,
+        jitter: 30,
+        repartition_every: 0,
+    };
+    let mut sim = Sim::new(node_count, seed).with_net(net);
+
+    let commands: Vec<Vec<u8>> = (0..12).map(|k| format!("op-{k}").into_bytes()).collect();
+    for command in &commands {
+        sim.run_until_leader(10_000);
+        sim.propose_to_leader(command);
+        sim.run_until(sim.now + 500);
+    }
+    sim.run_until(sim.now + 30_000); // long settle
+
+    let want: Vec<Bytes> = commands.iter().map(|c| Bytes::copy_from_slice(c)).collect();
+    let leader = sim.run_until_leader(10_000);
+    assert_eq!(
+        sim.applied_commands(leader),
+        want,
+        "seed={seed}: leader {leader} did not commit every proposal",
+    );
+    for i in 0..node_count {
+        assert_eq!(
+            sim.applied_commands(i),
+            want,
+            "seed={seed}: node {i} did not converge to the full applied sequence",
+        );
+    }
+}
+
+#[test]
+fn five_node_cluster_commits_under_chaotic_delivery() {
+    for seed in seeds(&[1, 2, 3, 42, 1_000, 0x5EED]) {
+        assert_commits_under_chaotic_delivery(5, seed);
+    }
+}
+
+/// A minority partition (the old leader plus one) cannot commit; the majority
+/// elects a fresh leader and makes progress. On heal, the minority discards
+/// its uncommitted tail and catches up to the majority's log.
+fn assert_partition_isolates_then_heals(seed: u64) {
+    let node_count = 5;
+    let net = Net {
+        drop_permille: 0,
+        dup_permille: 0,
+        jitter: 5,
+        repartition_every: 0,
+    };
+    let mut sim = Sim::new(node_count, seed).with_net(net);
+
+    let old_leader = sim.run_until_leader(5_000);
+    sim.propose_to_leader(b"a");
+    sim.run_until(sim.now + 400);
+    sim.propose_to_leader(b"b");
+    sim.run_until(sim.now + 600);
+    assert_eq!(
+        sim.nodes[old_leader].commit_index().get(),
+        2,
+        "seed={seed}: cluster did not commit the pre-partition writes",
+    );
+
+    // Cut the old leader and its next-door node off from the other three.
+    let mut groups = vec![0usize; node_count];
+    groups[old_leader] = 1;
+    groups[(old_leader + 1) % node_count] = 1;
+    sim.set_groups(groups);
+    sim.run_until(sim.now + 2_000);
+
+    // The isolated old leader still thinks it leads; its write must not commit.
+    if sim.nodes[old_leader].is_leader() {
+        sim.propose_at(old_leader, b"orphan");
+    }
+    sim.run_until(sim.now + 2_000);
+    assert_eq!(
+        sim.nodes[old_leader].commit_index().get(),
+        2,
+        "seed={seed}: an isolated minority leader committed a write",
+    );
+
+    // The majority side elects someone and commits two more entries.
+    let mut maj_leader = sim.leader_in_group(0);
+    let deadline = sim.now + 5_000;
+    while maj_leader.is_none() && sim.now < deadline {
+        sim.run_until(sim.now + HEARTBEAT_PERIOD);
+        maj_leader = sim.leader_in_group(0);
+    }
+    assert!(
+        maj_leader.is_some(),
+        "seed={seed}: majority side elected no leader",
+    );
+    let maj_leader = maj_leader.unwrap_or(0);
+    sim.propose_at(maj_leader, b"c");
+    sim.run_until(sim.now + 400);
+    sim.propose_at(maj_leader, b"d");
+    sim.run_until(sim.now + 1_000);
+    assert!(
+        sim.nodes[maj_leader].commit_index().get() >= 4,
+        "seed={seed}: majority side failed to commit during the partition",
+    );
+
+    // Heal and let everything reconverge.
+    sim.set_groups(vec![0; node_count]);
+    sim.run_until(sim.now + 15_000);
+
+    let want: Vec<Bytes> = ["a", "b", "c", "d"]
+        .iter()
+        .map(|s| Bytes::copy_from_slice(s.as_bytes()))
+        .collect();
+    let leader = sim.run_until_leader(10_000);
+    let leader_log = sim.nodes[leader].log().clone();
+    for i in 0..node_count {
+        assert_eq!(
+            sim.nodes[i].log(),
+            &leader_log,
+            "seed={seed}: node {i} log did not reconverge after heal",
+        );
+        assert_eq!(
+            sim.applied_commands(i),
+            want,
+            "seed={seed}: node {i} applied sequence wrong after heal",
+        );
+    }
+}
+
+#[test]
+fn five_node_cluster_survives_a_partition_and_heal() {
+    for seed in seeds(&[1, 2, 3, 42, 1_000, 0x5EED, 7, 99]) {
+        assert_partition_isolates_then_heals(seed);
+    }
+}
+
+/// The kitchen sink: loss, duplication, reordering, and a partition redrawn
+/// every ~700ms, with a client proposing throughout. Correctness is enforced
+/// continuously by `check_invariants`; this asserts the run stayed live (a
+/// leader existed and commits happened) and, once the churn stops and the
+/// network heals, every node converges to one identical applied sequence.
+fn assert_survives_continuous_chaos(seed: u64) {
+    let node_count = 5;
+    let net = Net {
+        drop_permille: 50,
+        dup_permille: 120,
+        jitter: 25,
+        repartition_every: 700,
+    };
+    let mut sim = Sim::new(node_count, seed).with_net(net);
+
+    let mut proposed = 0u32;
+    while sim.now < 45_000 {
+        if let Some(leader) = sim.sole_leader() {
+            let command = format!("c{proposed}");
+            sim.propose_at(leader, command.as_bytes());
+            proposed += 1;
+        }
+        sim.run_until(sim.now + 137); // an odd slice, to sample many phases
+    }
+
+    assert!(
+        sim.saw_leader,
+        "seed={seed}: no leader ever emerged under chaos",
+    );
+    assert!(
+        !sim.committed.is_empty(),
+        "seed={seed}: nothing ever committed under chaos",
+    );
+
+    // Stop repartitioning, force a heal, and let the cluster settle.
+    sim.net.repartition_every = 0;
+    sim.next_net_change = NEVER;
+    sim.set_groups(vec![0; node_count]);
+    sim.run_until(sim.now + 10_000);
+
+    // A fresh leader cannot advance commitIndex over prior-term entries until
+    // it commits one of its own (§5.4.2), so nudge it with a few writes; then
+    // every node's applied sequence must be identical and non-empty.
+    for round in 0..4 {
+        let leader = sim.run_until_leader(10_000);
+        sim.propose_at(leader, format!("flush-{round}").as_bytes());
+        sim.run_until(sim.now + 3_000);
+    }
+
+    let reference = sim.applied_commands(0);
+    assert!(
+        reference.len() > proposed as usize / 4,
+        "seed={seed}: only {} of {proposed} proposals ever committed",
+        reference.len(),
+    );
+    for i in 0..node_count {
+        assert_eq!(
+            sim.applied_commands(i),
+            reference,
+            "seed={seed}: node {i} did not converge to node 0's applied sequence",
+        );
+    }
+}
+
+#[test]
+fn five_node_cluster_survives_continuous_chaos() {
+    for seed in seeds(&[1, 42, 1_000, 0x5EED]) {
+        assert_survives_continuous_chaos(seed);
     }
 }
