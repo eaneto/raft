@@ -13,7 +13,7 @@
 use super::{LogEntry, LogIndex, NodeId, Term};
 
 /// Arguments for the `RequestVote` RPC (Figure 2), sent by a candidate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RequestVoteArgs {
     /// The candidate's term.
     pub term: Term,
@@ -26,7 +26,7 @@ pub struct RequestVoteArgs {
 }
 
 /// Reply to a `RequestVote` RPC (Figure 2).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RequestVoteReply {
     /// The responder's `currentTerm`, so a stale candidate can step down.
     pub term: Term,
@@ -36,7 +36,7 @@ pub struct RequestVoteReply {
 
 /// Arguments for the `AppendEntries` RPC (Figure 2), sent by the leader both to
 /// replicate entries and, with `entries` empty, as a heartbeat.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AppendEntriesArgs {
     /// The leader's term.
     pub term: Term,
@@ -53,7 +53,7 @@ pub struct AppendEntriesArgs {
 }
 
 /// Reply to an `AppendEntries` RPC (Figure 2).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AppendEntriesReply {
     /// The responder's `currentTerm`, so a stale leader can step down.
     pub term: Term,
@@ -73,7 +73,7 @@ pub struct AppendEntriesReply {
 ///
 /// The core emits these inside [`Effect::SendRpc`](super::Effect::SendRpc) and
 /// receives them inside [`Input::Deliver`](super::Input::Deliver).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Message {
     /// A candidate soliciting a vote.
     RequestVote(RequestVoteArgs),
