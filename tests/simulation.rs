@@ -5,12 +5,10 @@
 //! iteration order leaking into behaviour. A failing assertion carries its seed
 //! so it can be replayed with `SEED=<n> just sim-seed`.
 //!
-//! The [`Sim`] event loop re-checks the Raft safety invariants (AGENTS.md §9)
-//! after every core step, so any unreliable-network test that returns at all
-//! has held Election Safety, Log Matching, Leader Completeness, State Machine
-//! Safety, and `commitIndex` / `lastApplied` monotonicity for its whole run.
-//!
-//! See AGENTS.md "Testing standards".
+//! The [`Sim`] event loop re-checks the Raft safety properties after every core
+//! step, so any unreliable-network test that returns at all has held Election
+//! Safety, Log Matching, Leader Completeness, State Machine Safety, and
+//! `commitIndex` / `lastApplied` monotonicity for its whole run.
 
 use std::collections::BTreeMap;
 
@@ -82,7 +80,7 @@ struct Sim {
     applied: Vec<Vec<(u64, Bytes)>>,
     rng: StdRng,
 
-    // --- invariant bookkeeping (AGENTS.md §9) ---
+    // --- invariant bookkeeping (Raft safety properties) ---
     prev_commit: Vec<u64>,
     prev_applied: Vec<u64>,
     /// index -> (entry term, command, term it was first observed committed in).
@@ -310,8 +308,8 @@ impl Sim {
         self.groups = groups;
     }
 
-    /// Models `AGENTS.md` §8 rule 7: a node whose persistent state failed to
-    /// load discards **all** Raft state and rejoins as a fresh follower. The
+    /// Models the cluster-recovery path: a node whose persistent state failed
+    /// to load discards **all** Raft state and rejoins as a fresh follower. The
     /// cross-time safety invariants (committed-entry agreement, Log Matching,
     /// Leader Completeness) are deliberately *not* reset, so the rejoining
     /// node is still held to them; only this node's own monotonic-progress
@@ -406,8 +404,8 @@ impl Sim {
             .collect()
     }
 
-    /// Re-checks the AGENTS.md §9 safety invariants against the whole cluster.
-    /// Called after every core step, so any test that returns has held them.
+    /// Re-checks the Raft safety properties against the whole cluster. Called
+    /// after every core step, so any test that returns has held them.
     fn check_invariants(&mut self) {
         self.check_monotonic_progress();
         self.check_one_leader_per_term();
@@ -923,10 +921,10 @@ fn five_node_cluster_survives_continuous_chaos() {
     }
 }
 
-/// `AGENTS.md` §8 rule 7: a follower that lost its persistent state discards
-/// everything and rejoins fresh; the leader repopulates it via `AppendEntries`
-/// (backing `nextIndex` down to the start) and it re-applies the whole
-/// committed sequence, never a conflicting entry.
+/// The cluster-recovery path: a follower that lost its persistent state
+/// discards everything and rejoins fresh; the leader repopulates it via
+/// `AppendEntries` (backing `nextIndex` down to the start) and it re-applies
+/// the whole committed sequence, never a conflicting entry.
 fn assert_wiped_follower_recovers(seed: u64) {
     let node_count = 5;
     let net = Net {

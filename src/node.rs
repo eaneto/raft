@@ -2,17 +2,19 @@
 //! and the storage; runs the single event loop; and performs the core's
 //! effects.
 //!
-//! **Concurrency model: threads with blocking IO, no async runtime**
-//! (`AGENTS.md` §7). One "raft thread" owns the [`RaftNode`] and is the only
-//! place [`RaftNode::step`] is called. Transport threads decode inbound
-//! frames and push them onto an [`mpsc`] channel; client proposals and the
-//! shutdown signal arrive on the same channel. Timers are `recv_timeout`
-//! deadlines, re-armed from a seeded [`StdRng`], so a given seed drives the
-//! same election jitter every run.
+//! **Concurrency model: threads with blocking IO, no async runtime.** One
+//! "raft thread" owns the [`RaftNode`] and is the only place [`RaftNode::step`]
+//! is called. Transport threads decode inbound frames and push them onto an
+//! [`mpsc`] channel; client proposals and the shutdown signal arrive on the
+//! same channel. Timers are `recv_timeout` deadlines, re-armed from a seeded
+//! [`StdRng`], so a given seed drives the same election jitter every run.
 //!
-//! A storage write that fails is fatal (`AGENTS.md` §8 rules 1 and 6): the
-//! loop stops and returns [`Stopped::FatalStorage`]. The embedding binary must
-//! treat that as process-fatal — log and exit, never continue.
+//! A storage write that fails is fatal: a failed `fsync` can leave the OS
+//! reporting success on the next one while the data never reached disk, so
+//! there is nothing safe to do but stop. The loop returns
+//! [`Stopped::FatalStorage`] and the embedding binary must treat that as
+//! process-fatal — log and exit, never continue, never read the data back and
+//! trust it.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -87,8 +89,9 @@ impl Config {
 pub enum Stopped {
     /// [`Node::shutdown`] was called, or the [`Node`] handle was dropped.
     ShutDown,
-    /// A storage write failed. Per `AGENTS.md` §8 the process must not
-    /// continue: the embedding binary should log this and exit.
+    /// A storage write failed. The process must not continue — a failed
+    /// `fsync` is not safely recoverable — so the embedding binary should log
+    /// this and exit.
     FatalStorage(storage::Error),
 }
 
@@ -158,7 +161,8 @@ impl Node {
     /// [`StartError::Transport`] if the listen socket cannot be bound, or
     /// [`StartError::Storage`] if the persistent state cannot be read at all.
     /// Recoverable corruption is *not* an error: it is logged and the node
-    /// starts fresh (`AGENTS.md` §8 rule 7).
+    /// discards its Raft state and starts as a fresh follower, to be
+    /// repopulated by the leader.
     pub fn start<S, M>(config: Config, storage: S, state_machine: M) -> Result<Self, StartError>
     where
         S: Storage + Send + 'static,
@@ -263,7 +267,7 @@ impl<S: Storage, M: StateMachine> Driver<S, M> {
             Err(storage::Error::Corrupt { detail }) => {
                 log::error!(
                     "node {}: persistent state unusable ({detail}); discarding all Raft state \
-                     and rejoining fresh (AGENTS.md §8 rule 7)",
+                     and rejoining as a fresh follower to be repopulated by the leader",
                     config.id,
                 );
                 PersistentState::fresh()

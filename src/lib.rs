@@ -1,13 +1,26 @@
 //! A Raft consensus implementation focused on correctness and understandability.
 //!
-//! Project standards, scope, architecture, and the durability model live in
-//! [`AGENTS.md`](https://github.com/) at the repo root. Read it before changing code.
+//! The design is *sans-IO*: [`core`] is a pure, deterministic state machine
+//! that performs no IO, reads no clock, spawns no thread, and draws no
+//! randomness — every side effect is returned as an [`core::Effect`] value for
+//! a driver to run. [`node`] is that driver (threads + blocking IO, no async
+//! runtime); [`storage`], [`transport`], and [`clock`] are the traits it
+//! depends on, each with a real implementation and a simulated one so the whole
+//! cluster can be replayed deterministically from a single seed.
+//!
+//! Persistence is designed to be correct on Linux regardless of filesystem: the
+//! storage layer assumes the worst-case `fsync` semantics (a failed `fsync` may
+//! drop the dirty pages while a later one still reports success), treats any
+//! `fsync` failure as fatal, and makes `currentTerm` / `votedFor` / log
+//! appends durable before the RPC that relied on them is answered.
 
 // --------------------------------------------------------------------------
-// TECH DEBT: the modules below are the original prototype and predate the
-// standards in AGENTS.md ("Migration plan"). They are exempted from the lint
-// gate so it stays meaningful for new code. Bring one module up to standard
-// at a time, then delete its `allow`.
+// TECH DEBT: the modules below are the original IO-coupled prototype. They
+// predate the project's coding standards (concrete error enums, no bare
+// `unwrap`/`panic` on reachable paths, `///` docs on public items, paper
+// terminology, no behaviour depending on `HashMap` iteration order) and are
+// exempted from the lint gate so it stays meaningful for new code. Bring one
+// module up to standard at a time, then delete its `allow`.
 // --------------------------------------------------------------------------
 #[allow(
     missing_docs,
@@ -32,8 +45,8 @@ pub mod command;
 pub mod raft;
 
 // --------------------------------------------------------------------------
-// New code below this line meets the AGENTS.md standards and carries no lint
-// debt. Keep it that way.
+// New code below this line meets the project's coding standards and carries no
+// lint debt. Keep it that way.
 // --------------------------------------------------------------------------
 
 pub mod clock;

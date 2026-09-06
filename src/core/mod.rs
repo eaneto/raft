@@ -349,7 +349,8 @@ pub enum Input {
         message: Message,
     },
     /// A client asks the cluster to append and eventually commit a command.
-    /// Only a leader acts on it; other roles reject or redirect (a later step).
+    /// Only a leader acts on it; a follower or candidate currently drops it
+    /// (redirecting the client to the leader is future work).
     Propose {
         /// The opaque command bytes.
         command: Bytes,
@@ -367,8 +368,10 @@ pub enum Input {
 /// The core never acts on the world itself; [`RaftNode::step`] returns these in
 /// the order they must happen and the driver executes them. In particular,
 /// every [`Effect::Persist`] and [`Effect::PersistLog`] must be durable before
-/// the driver sends any [`Effect::SendRpc`] that follows it in the same batch
-/// (persist-before-reply, §8).
+/// the driver sends any [`Effect::SendRpc`] that follows it in the same batch:
+/// a node must never tell a peer it granted a vote or stored an entry that a
+/// crash could then make it forget (Figure 2, "Updated on stable storage
+/// before responding to RPCs").
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
     /// Send `message` to peer `to`.
@@ -381,7 +384,7 @@ pub enum Effect {
     /// Flush the persistent state to stable storage before continuing.
     ///
     /// The payload is the paper's "persistent state on all servers" minus the
-    /// log; log durability gets its own effect in the storage step.
+    /// log; log durability has its own effect, [`Effect::PersistLog`].
     Persist {
         /// The term to persist.
         current_term: Term,
@@ -392,12 +395,13 @@ pub enum Effect {
     ///
     /// `entries` is the log's contents from `from_index` (1-based) to its end,
     /// in order. A leader append sets `from_index` to one past the previous
-    /// last index, so `entries` is just the new tail; a follower splice
-    /// (step 5b) may pass a lower `from_index` to overwrite conflicting
+    /// last index, so `entries` is just the new tail; a follower splicing in a
+    /// leader's entries may pass a lower `from_index` to overwrite conflicting
     /// entries. `from_index` is always `>= LogIndex::new(1)`.
     ///
     /// Like [`Effect::Persist`], this must be durable before any
-    /// [`Effect::SendRpc`] later in the same batch (persist-before-reply, §8).
+    /// [`Effect::SendRpc`] later in the same batch, so a crash cannot make the
+    /// node forget an entry it already acknowledged.
     PersistLog {
         /// 1-based index of the first entry in `entries`.
         from_index: LogIndex,
@@ -405,7 +409,8 @@ pub enum Effect {
         entries: Vec<LogEntry>,
     },
     /// Apply the committed entry at `index` to the application state machine.
-    /// Emitted one entry at a time, in index order (Applied-in-order, §9.10).
+    /// Emitted one entry at a time, in strictly increasing index order and
+    /// never past `commitIndex`.
     ApplyToStateMachine {
         /// Index of the entry to apply.
         index: LogIndex,
@@ -668,8 +673,8 @@ impl RaftNode {
 
     /// Emits [`Effect::ApplyToStateMachine`] for every entry from
     /// `last_applied + 1` through `commit_index`, one at a time in index order,
-    /// advancing `last_applied` as it goes (§9.10, Applied-in-order). Stops if
-    /// an index is somehow missing rather than inventing a command.
+    /// advancing `last_applied` as it goes so it never overtakes `commit_index`.
+    /// Stops if an index is somehow missing rather than inventing a command.
     fn apply_committed(&mut self, effects: &mut Vec<Effect>) {
         while self.last_applied < self.commit_index {
             let next = self.last_applied.next();
@@ -830,7 +835,7 @@ impl RaftNode {
     /// Only a leader acts: it appends one entry for `command` at its current
     /// term, makes the new tail durable with [`Effect::PersistLog`], then
     /// sends every peer the entries it is missing. Any other role drops the
-    /// proposal for now — client redirect to the leader is a later step.
+    /// proposal — redirecting the client to the leader is future work.
     ///
     /// A majority still has to store the entry before it commits (§5.4.2), so
     /// on a multi-node cluster nothing is applied until the acks come back. A

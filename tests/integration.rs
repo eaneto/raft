@@ -3,8 +3,6 @@
 //! These exercise the wiring the simulation tests deliberately bypass: real
 //! sockets, real OS threads, real timers, real `FileStorage`. Keep them small
 //! and few — deep behavioural coverage belongs in `simulation.rs`.
-//!
-//! See AGENTS.md "Testing standards".
 
 use std::net::{SocketAddr, TcpListener};
 use std::sync::{Arc, Mutex};

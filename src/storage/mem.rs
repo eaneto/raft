@@ -12,13 +12,16 @@ use std::path::PathBuf;
 use super::{Error, PersistentState, Storage};
 use crate::core::{LogEntry, LogIndex, NodeId, Term};
 
-/// What a simulated `fsync` does once it is triggered (`AGENTS.md` §8).
+/// What a simulated `fsync` does once it is triggered.
+///
+/// These model the worst-case `fsync`-failure behaviours Linux can exhibit,
+/// which is why the storage contract treats a failed `fsync` as fatal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncFault {
     /// The sync errors and the not-yet-durable writes are lost (dropped dirty
     /// pages); every *later* sync then returns `Ok` although nothing more ever
-    /// reaches the disk. This is the ext4 `data=ordered` worst case and the
-    /// reason `AGENTS.md` §8 rule 1 makes a failed `fsync` fatal.
+    /// reaches the disk. This is the ext4 `data=ordered` worst case: it is what
+    /// makes a failed `fsync` impossible to recover from, and therefore fatal.
     DropWritesThenLie,
     /// The sync errors, but the pending writes actually survived (best case).
     RetainWrites,

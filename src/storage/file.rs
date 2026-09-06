@@ -6,11 +6,13 @@
 //!   `[u32 LE payload length][u32 LE CRC32C of payload][payload]`, and a
 //!   payload is `[u64 LE term][u32 LE command length][command bytes]`.
 //!   Recovery reads records until one is short or fails its checksum and
-//!   truncates the file there: a torn tail is expected (`AGENTS.md` §8 rule 3).
+//!   truncates the file there: a torn tail from a crash mid-append is expected,
+//!   not treated as corruption.
 //! - `meta.0`, `meta.1` — two independent copies of `{ currentTerm, votedFor }`,
-//!   each `[u32 LE CRC32C][u64 LE term][u8 has_vote][u64 LE vote id]`. On load a
-//!   copy that fails its checksum is ignored; if both parse but disagree the
-//!   higher term wins and the vote is dropped (`AGENTS.md` §8 rule 5).
+//!   each `[u32 LE CRC32C][u64 LE term][u8 has_vote][u64 LE vote id]`. Keeping
+//!   two lets recovery survive one being torn or corrupt. On load a copy that
+//!   fails its checksum is ignored; if both parse but disagree the higher term
+//!   wins and the vote is dropped (the conservative choice).
 //!
 //! Every write `fsync`s the file it touched, and the directory as well when a
 //! file was newly created. A failed `fsync` is returned as the fatal
@@ -49,7 +51,8 @@ impl FileStorage {
     /// Opens (creating if absent) the data directory and the log file.
     ///
     /// On Linux this also logs the data directory's filesystem type and warns
-    /// if it is outside the CI-exercised tier (`AGENTS.md` §8).
+    /// if it is outside the tier exercised by CI (ext4, xfs); durability is
+    /// expected to work elsewhere but is not tested there.
     ///
     /// # Errors
     ///
@@ -358,8 +361,8 @@ fn load_metadata(path0: &Path, path1: &Path) -> Result<(Term, Option<NodeId>), E
     let b = read_metadata(path1)?;
     match (a, b) {
         (MetaRead::Missing, MetaRead::Missing) => Ok((Term::ZERO, None)),
-        // AGENTS.md §8 rule 5: a copy that fails its checksum is ignored in
-        // favour of the readable one.
+        // A copy that fails its checksum is ignored in favour of the readable
+        // one.
         (MetaRead::Value(term, vote), MetaRead::Missing | MetaRead::Corrupt)
         | (MetaRead::Missing | MetaRead::Corrupt, MetaRead::Value(term, vote)) => Ok((term, vote)),
         (MetaRead::Value(ta, va), MetaRead::Value(tb, vb)) => {
