@@ -51,13 +51,17 @@ this file just tracks the sequence of small steps and what's done.
       monotonicity; tests for loss, chaotic delivery, partition+heal, and
       continuous chaos over seed batteries) — `e0bec45`
 
+- [x] **6. Storage layer** (`src/storage/`). `Storage` trait + `FileStorage`
+      (CRC32C length-prefixed log with torn-tail recovery; redundant fsync'd
+      `currentTerm`/`votedFor` with checksum fallback + disagree rule;
+      fsync-fatal `Error::Sync`; parent-dir fsync on create; `/proc/self/mountinfo`
+      tier warning) + `MemStorage` (staged-vs-durable, `DropWritesThenLie` /
+      `RetainWrites` fault injection, `restart()`). Dependency-free CRC-32C.
+      Cluster-recovery sim test (`a_wiped_follower_rejoins_and_catches_up`).
+      New dev-dep `tempfile`. — `b6c559c`
+
 ## Next
 
-- [ ] **6. Storage layer** (`src/storage/`). Trait + real impl + simulated impl.
-      Checksummed, recoverable log (length-prefixed + CRC32C, torn tail expected);
-      redundant `currentTerm` / `votedFor` in two fsync'd files; `fsync` failure is
-      fatal; fsync the parent dir after create/rename. Model the failure modes in
-      the simulated impl (`AGENTS.md` §8). Cluster-recovery path has a test.
 - [ ] **7. Driver** (`src/node.rs`). Owns real clock, seeded RNG, timers, real
       transport (TCP), storage. Runs the event loop, performs effects. Decide
       async vs. threads and record it in `AGENTS.md` §7.
