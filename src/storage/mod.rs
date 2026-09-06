@@ -49,7 +49,28 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
+use bytes::Bytes;
+
 use crate::core::{LogEntry, LogIndex, NodeId, Term};
+
+/// Where in the log a snapshot was taken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotMeta {
+    /// The snapshot represents every log entry up to and including this index.
+    pub last_included_index: LogIndex,
+    /// Term of the entry at `last_included_index`.
+    pub last_included_term: Term,
+}
+
+/// A snapshot recovered from storage: its position in the log and the opaque
+/// state-machine bytes it holds. Raft never inspects `data`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Snapshot {
+    /// Where the snapshot was taken.
+    pub meta: SnapshotMeta,
+    /// The application state machine's serialized state at that point.
+    pub data: Bytes,
+}
 
 /// The persistent state as recovered from disk at startup.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,7 +79,11 @@ pub struct PersistentState {
     pub current_term: Term,
     /// The last durable `votedFor`, if any.
     pub voted_for: Option<NodeId>,
-    /// The recovered log entries, index 1 first, torn tail already dropped.
+    /// The recovered snapshot, if one was ever taken. When present, `entries`
+    /// hold only the log *after* it: `entries[0]` is at
+    /// `snapshot.meta.last_included_index + 1`.
+    pub snapshot: Option<Snapshot>,
+    /// The recovered log entries after the snapshot, torn tail already dropped.
     pub entries: Vec<LogEntry>,
 }
 
@@ -69,6 +94,7 @@ impl PersistentState {
         Self {
             current_term: Term::ZERO,
             voted_for: None,
+            snapshot: None,
             entries: Vec::new(),
         }
     }
@@ -102,15 +128,32 @@ pub trait Storage {
         voted_for: Option<NodeId>,
     ) -> Result<(), Error>;
 
-    /// Makes the log equal to `keep the first from_index - 1 entries, then
-    /// these` — the on-disk counterpart of
+    /// Makes the log equal to `keep the entries before from_index, then these`
+    /// — the on-disk counterpart of
     /// [`Effect::PersistLog`](crate::core::Effect::PersistLog). `from_index` is
-    /// 1-based and must be `>= 1` and `<= len + 1`.
+    /// a global 1-based index; it must be within
+    /// `snapshot_last_index + 1 ..= len + 1`.
     ///
     /// # Errors
     ///
     /// [`Error::Sync`] (fatal — see module docs) or [`Error::Io`].
     fn persist_log(&mut self, from_index: LogIndex, entries: &[LogEntry]) -> Result<(), Error>;
+
+    /// Durably records a snapshot taken at `meta` and discards every log record
+    /// at or below `meta.last_included_index` — those entries are now
+    /// represented by the snapshot. The on-disk counterpart of the driver
+    /// persisting a snapshot before feeding the core
+    /// [`Input::CompactLog`](crate::core::Input::CompactLog) or
+    /// [`Input::SnapshotInstalled`](crate::core::Input::SnapshotInstalled).
+    ///
+    /// The snapshot is made durable before the log prefix is dropped, so a
+    /// crash in between leaves the log with a few already-covered entries at
+    /// its head, which the next [`Storage::load`] trims — never a gap.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Sync`] (fatal — see module docs) or [`Error::Io`].
+    fn persist_snapshot(&mut self, meta: SnapshotMeta, data: &[u8]) -> Result<(), Error>;
 }
 
 /// A storage failure.
