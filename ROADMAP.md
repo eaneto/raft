@@ -50,7 +50,6 @@ this file just tracks the sequence of small steps and what's done.
       every step enforcing §9.1/§9.3/§9.4/§9.5 + commitIndex/lastApplied
       monotonicity; tests for loss, chaotic delivery, partition+heal, and
       continuous chaos over seed batteries) — `e0bec45`
-
 - [x] **6. Storage layer** (`src/storage/`). `Storage` trait + `FileStorage`
       (CRC32C length-prefixed log with torn-tail recovery; redundant fsync'd
       `currentTerm`/`votedFor` with checksum fallback + disagree rule;
@@ -59,12 +58,18 @@ this file just tracks the sequence of small steps and what's done.
       `RetainWrites` fault injection, `restart()`). Dependency-free CRC-32C.
       Cluster-recovery sim test (`a_wiped_follower_rejoins_and_catches_up`).
       New dev-dep `tempfile`. — `b6c559c`
+- [x] **7. Driver** (`src/node.rs` + `src/transport/`, `src/clock.rs`,
+      `src/statemachine.rs`). **Threads + blocking IO, no async runtime**
+      (recorded in `AGENTS.md` §7). One raft thread runs a `recv_timeout` event
+      loop, performs every `Effect`, fires seeded-RNG timers; storage write
+      error → `Stopped::FatalStorage`, `Corrupt` load → start fresh. `TcpTransport`:
+      length-prefixed bincode frames, thread-per-connection, lazy redial.
+      `RaftNode::from_state` / `Log::from_entries` + `serde` derives on the wire
+      types. Integration tests over real TCP (3-node replication; restart reloads
+      the log). — `8d37968`
 
 ## Next
 
-- [ ] **7. Driver** (`src/node.rs`). Owns real clock, seeded RNG, timers, real
-      transport (TCP), storage. Runs the event loop, performs effects. Decide
-      async vs. threads and record it in `AGENTS.md` §7.
 - [ ] **8. Snapshotting / log compaction** + `InstallSnapshot` (paper §7, thesis §5).
 - [ ] **9. Cluster membership changes** — prefer single-server (thesis §4); record
       the decision when starting.
@@ -85,10 +90,10 @@ this file just tracks the sequence of small steps and what's done.
 ## Target module layout (`AGENTS.md` §5)
 
 ```
-src/core/           done through leader election
-src/storage/        step 6
-src/transport/      step 7
-src/clock.rs        step 7
-src/statemachine.rs step 5b (trait the committed log applies to)
-src/node.rs         step 7
+src/core/           done through log replication (steps 1–5)
+src/storage/        step 6 — done
+src/transport/      step 7 — done
+src/clock.rs        step 7 — done
+src/statemachine.rs step 7 — done (trait the committed log applies to)
+src/node.rs         step 7 — done
 ```
