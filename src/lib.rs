@@ -30,3 +30,10 @@ pub mod command;
     clippy::todo
 )]
 pub mod raft;
+
+// --------------------------------------------------------------------------
+// New code below this line meets the AGENTS.md standards and carries no lint
+// debt. Keep it that way.
+// --------------------------------------------------------------------------
+
+pub mod core;
