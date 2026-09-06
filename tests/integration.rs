@@ -168,3 +168,70 @@ fn a_restarted_node_reloads_its_log_from_disk() {
         .collect();
     assert_eq!(commands, vec![b"one".as_slice(), b"two".as_slice()]);
 }
+
+#[test]
+fn a_single_node_compacts_its_log_and_reloads_from_the_snapshot() {
+    let id = NodeId::new(1);
+    let addr = free_addr();
+    let dir = unwrap(tempfile::tempdir());
+
+    let total: usize = 12;
+    let sm = SharedSm::new();
+    // Compact every 3 applied entries, so by the end most of the log is gone.
+    let config = Config::new(id, addr, dir.path())
+        .with_seed(1)
+        .with_snapshot_threshold(3);
+    let node = unwrap(Node::start(
+        config,
+        unwrap(FileStorage::open(dir.path())),
+        sm.clone(),
+    ));
+
+    std::thread::sleep(Duration::from_millis(700));
+    let commands: Vec<Bytes> = (0..total)
+        .map(|k| Bytes::from(format!("op-{k}").into_bytes()))
+        .collect();
+    for command in &commands {
+        assert!(node.propose(command.clone()).is_ok());
+    }
+    assert!(
+        wait_until(Duration::from_secs(5), || sm.applied().len() >= total),
+        "single node did not apply all proposals: {:?}",
+        sm.applied(),
+    );
+    let _ = node.shutdown();
+
+    // The on-disk state is now a snapshot plus a short log tail.
+    let mut storage = unwrap(FileStorage::open(dir.path()));
+    let reloaded = unwrap(storage.load());
+    let Some(snapshot) = reloaded.snapshot else {
+        unreachable!("a snapshot was taken");
+    };
+    assert!(
+        snapshot.meta.last_included_index.get() >= (total as u64) - 3,
+        "snapshot only covers through {}",
+        snapshot.meta.last_included_index,
+    );
+    assert!(
+        reloaded.entries.len() < total,
+        "log was not compacted: {} entries",
+        reloaded.entries.len(),
+    );
+
+    // Restarting on that dir restores the state machine from the snapshot and
+    // replays only the tail, ending up with the full applied sequence.
+    let sm2 = SharedSm::new();
+    let node2 = unwrap(Node::start(
+        Config::new(id, free_addr(), dir.path())
+            .with_seed(2)
+            .with_snapshot_threshold(3),
+        unwrap(FileStorage::open(dir.path())),
+        sm2.clone(),
+    ));
+    assert!(
+        wait_until(Duration::from_secs(5), || sm2.applied() == commands),
+        "restarted node did not reproduce the applied sequence: {:?}",
+        sm2.applied(),
+    );
+    let _ = node2.shutdown();
+}

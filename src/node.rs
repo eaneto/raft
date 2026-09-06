@@ -28,9 +28,9 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use crate::clock::{Clock, MonotonicClock};
-use crate::core::{Effect, Input, Message, NodeId, RaftNode};
+use crate::core::{Effect, Input, InstallSnapshotArgs, Message, NodeId, RaftNode};
 use crate::statemachine::StateMachine;
-use crate::storage::{self, PersistentState, Storage};
+use crate::storage::{self, PersistentState, SnapshotMeta, Storage};
 use crate::transport::{self, TcpTransport, Transport};
 
 /// Static configuration for one server.
@@ -51,6 +51,12 @@ pub struct Config {
     /// How often a leader sends heartbeats. Keep it well below
     /// `election_timeout.0`.
     pub heartbeat_interval: Duration,
+    /// Compact the log once `lastApplied` has run `snapshot_threshold` entries
+    /// past the last snapshot. `None` disables compaction, so the log grows
+    /// without bound.
+    pub snapshot_threshold: Option<u64>,
+    /// Largest `InstallSnapshot` chunk, in bytes.
+    pub snapshot_chunk_size: usize,
 }
 
 impl Config {
@@ -66,6 +72,8 @@ impl Config {
             seed: 0,
             election_timeout: (Duration::from_millis(150), Duration::from_millis(300)),
             heartbeat_interval: Duration::from_millis(50),
+            snapshot_threshold: None,
+            snapshot_chunk_size: 64 * 1024,
         }
     }
 
@@ -80,6 +88,13 @@ impl Config {
     #[must_use]
     pub const fn with_seed(mut self, seed: u64) -> Self {
         self.seed = seed;
+        self
+    }
+
+    /// Sets the log-compaction threshold (see [`Config::snapshot_threshold`]).
+    #[must_use]
+    pub const fn with_snapshot_threshold(mut self, entries: u64) -> Self {
+        self.snapshot_threshold = Some(entries);
         self
     }
 }
@@ -242,6 +257,12 @@ impl Drop for Node {
     }
 }
 
+/// A snapshot being reassembled from a leader's `InstallSnapshot` chunk stream.
+struct IncomingSnapshot {
+    meta: SnapshotMeta,
+    buf: Vec<u8>,
+}
+
 /// Everything the event loop owns.
 struct Driver<S, M> {
     config: Config,
@@ -253,6 +274,11 @@ struct Driver<S, M> {
     node: RaftNode,
     election_deadline: Option<Instant>,
     heartbeat_deadline: Option<Instant>,
+    /// The newest snapshot this node holds, for serving
+    /// [`Effect::SendSnapshot`]. `None` until it takes or installs one.
+    snapshot: Option<(SnapshotMeta, Bytes)>,
+    /// A snapshot currently arriving from the leader, if any.
+    incoming_snapshot: Option<IncomingSnapshot>,
 }
 
 impl<S: Storage, M: StateMachine> Driver<S, M> {
@@ -260,7 +286,7 @@ impl<S: Storage, M: StateMachine> Driver<S, M> {
         config: Config,
         transport: TcpTransport,
         mut storage: S,
-        state_machine: M,
+        mut state_machine: M,
     ) -> Result<Self, Stopped> {
         let state = match storage.load() {
             Ok(state) => state,
@@ -275,16 +301,31 @@ impl<S: Storage, M: StateMachine> Driver<S, M> {
             Err(other) => return Err(Stopped::FatalStorage(other)),
         };
 
+        let PersistentState {
+            current_term,
+            voted_for,
+            snapshot,
+            entries,
+        } = state;
+
+        // A recovered snapshot seeds the state machine, and the core comes up
+        // with commitIndex / lastApplied already at the snapshot point.
+        let snapshot = snapshot.map(|snap| {
+            state_machine.restore(&snap.data);
+            (snap.meta, snap.data)
+        });
+        let snapshot_base = snapshot
+            .as_ref()
+            .map(|(meta, _)| (meta.last_included_index, meta.last_included_term));
+
         let peer_ids = config.peers.iter().map(|(id, _)| *id);
-        // Snapshot restore is wired up with the storage snapshot support; until
-        // then a recovered node always replays its whole log.
         let node = RaftNode::from_state(
             config.id,
             peer_ids,
-            state.current_term,
-            state.voted_for,
-            None,
-            state.entries,
+            current_term,
+            voted_for,
+            snapshot_base,
+            entries,
         );
 
         let mut rng = StdRng::seed_from_u64(config.seed);
@@ -299,6 +340,8 @@ impl<S: Storage, M: StateMachine> Driver<S, M> {
             node,
             election_deadline: Some(first_election),
             heartbeat_deadline: None,
+            snapshot,
+            incoming_snapshot: None,
         })
     }
 
@@ -335,7 +378,8 @@ impl<S: Storage, M: StateMachine> Driver<S, M> {
 
     fn step(&mut self, input: Input) -> Result<(), storage::Error> {
         let effects = self.node.step(input, self.clock.now());
-        self.perform(effects)
+        self.perform(effects)?;
+        self.maybe_compact()
     }
 
     fn perform(&mut self, effects: Vec<Effect>) -> Result<(), storage::Error> {
@@ -357,20 +401,129 @@ impl<S: Storage, M: StateMachine> Driver<S, M> {
                     self.election_deadline =
                         Some(Instant::now() + random_timeout(&mut self.rng, &self.config));
                 }
-                Effect::SendSnapshot { .. } | Effect::StoreSnapshotChunk { .. } => {
-                    // Serving and receiving snapshots is wired up together with
-                    // the storage snapshot format and the state-machine
-                    // snapshot/restore hooks. Until then the core never emits
-                    // these: nothing compacts the log, so no peer is ever
-                    // behind the (always-zero) compaction base.
-                    log::error!(
-                        "node {}: snapshot effect before snapshot support is wired up",
-                        self.config.id,
-                    );
+                Effect::SendSnapshot { to } => self.send_snapshot(to),
+                Effect::StoreSnapshotChunk {
+                    last_included_index,
+                    last_included_term,
+                    offset,
+                    data,
+                    done,
+                } => {
+                    let meta = SnapshotMeta {
+                        last_included_index,
+                        last_included_term,
+                    };
+                    self.receive_snapshot_chunk(meta, offset, &data, done)?;
                 }
             }
         }
         Ok(())
+    }
+
+    /// Streams the node's current snapshot to `to` as `InstallSnapshot` chunks.
+    fn send_snapshot(&self, to: NodeId) {
+        let Some((meta, data)) = &self.snapshot else {
+            log::warn!(
+                "node {}: asked to send a snapshot it does not hold",
+                self.config.id,
+            );
+            return;
+        };
+        let chunk = self.config.snapshot_chunk_size.max(1);
+        let total = data.len();
+        let mut offset = 0;
+        loop {
+            let end = (offset + chunk).min(total);
+            let done = end == total;
+            self.transport.send(
+                to,
+                &Message::InstallSnapshot(InstallSnapshotArgs {
+                    term: self.node.current_term(),
+                    leader_id: self.config.id,
+                    last_included_index: meta.last_included_index,
+                    last_included_term: meta.last_included_term,
+                    offset: offset as u64,
+                    data: data[offset..end].to_vec(),
+                    done,
+                }),
+            );
+            if done {
+                break;
+            }
+            offset = end;
+        }
+    }
+
+    /// Accumulates one received `InstallSnapshot` chunk. On the terminal chunk,
+    /// persists the whole snapshot, restores the state machine from it, and
+    /// feeds the core [`Input::SnapshotInstalled`] so it adopts the snapshot
+    /// and acknowledges the leader.
+    fn receive_snapshot_chunk(
+        &mut self,
+        meta: SnapshotMeta,
+        offset: u64,
+        data: &[u8],
+        done: bool,
+    ) -> Result<(), storage::Error> {
+        let expected = self
+            .incoming_snapshot
+            .as_ref()
+            .filter(|inc| inc.meta == meta)
+            .map_or(0, |inc| inc.buf.len() as u64);
+        if offset == 0 || offset != expected {
+            // A fresh transfer, or a gap: (re)start reassembly.
+            self.incoming_snapshot = if offset == 0 {
+                Some(IncomingSnapshot {
+                    meta,
+                    buf: data.to_vec(),
+                })
+            } else {
+                // Out-of-order chunk with nothing to attach it to; wait for the
+                // leader's next stream, which restarts from offset 0.
+                None
+            };
+        } else if let Some(inc) = self.incoming_snapshot.as_mut() {
+            inc.buf.extend_from_slice(data);
+        }
+
+        if done && let Some(inc) = self.incoming_snapshot.take() {
+            self.storage.persist_snapshot(inc.meta, &inc.buf)?;
+            let bytes = Bytes::from(inc.buf);
+            self.state_machine.restore(&bytes);
+            self.snapshot = Some((inc.meta, bytes));
+            return self.step(Input::SnapshotInstalled {
+                last_included_index: inc.meta.last_included_index,
+                last_included_term: inc.meta.last_included_term,
+            });
+        }
+        Ok(())
+    }
+
+    /// If the log has grown `snapshot_threshold` entries past the last
+    /// snapshot, ask the state machine to snapshot itself through `lastApplied`,
+    /// persist that, and have the core drop the covered log prefix.
+    fn maybe_compact(&mut self) -> Result<(), storage::Error> {
+        let Some(threshold) = self.config.snapshot_threshold else {
+            return Ok(());
+        };
+        let last_applied = self.node.last_applied();
+        let base = self.node.snapshot_last_index().get();
+        if last_applied.get().saturating_sub(base) < threshold.max(1) {
+            return Ok(());
+        }
+        let Some(term) = self.node.log().term_at(last_applied) else {
+            return Ok(());
+        };
+        let meta = SnapshotMeta {
+            last_included_index: last_applied,
+            last_included_term: term,
+        };
+        let data = self.state_machine.snapshot();
+        self.storage.persist_snapshot(meta, &data)?;
+        self.snapshot = Some((meta, data));
+        self.step(Input::CompactLog {
+            up_to_index: last_applied,
+        })
     }
 
     fn fire_due_timers(&mut self) -> Result<(), storage::Error> {
