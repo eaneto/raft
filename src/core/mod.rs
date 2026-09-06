@@ -436,12 +436,14 @@ impl RaftNode {
             Input::Deliver { from, message } => match message {
                 Message::RequestVote(args) => self.handle_request_vote(args),
                 Message::RequestVoteReply(reply) => self.handle_request_vote_reply(from, reply),
-                // AppendEntries send/receive lands in the replication steps.
-                Message::AppendEntries(_) | Message::AppendEntriesReply(_) => Vec::new(),
+                Message::AppendEntries(args) => self.handle_append_entries(&args),
+                // Leader-side ack handling lands with log replication.
+                Message::AppendEntriesReply(_) => Vec::new(),
             },
             Input::ElectionTimeout => self.handle_election_timeout(),
-            // Filled in by the heartbeat step and log replication.
-            Input::Propose { .. } | Input::HeartbeatTick => Vec::new(),
+            Input::HeartbeatTick => self.handle_heartbeat_tick(),
+            // Filled in by log replication.
+            Input::Propose { .. } => Vec::new(),
         }
     }
 
@@ -509,6 +511,42 @@ impl RaftNode {
         effects
     }
 
+    /// Handles an incoming `AppendEntries` (Figure 2).
+    ///
+    /// This step covers the term and role rules and the §5.3 log-matching
+    /// *check*; it does not yet truncate, append, or advance `commitIndex`
+    /// (Figure 2 receiver rules 3–5), which arrive with log replication. A
+    /// heartbeat carries no entries, so those rules are inert here.
+    ///
+    /// Reception from the current leader (term `>=` ours) resets the election
+    /// timer whether or not the consistency check passes — diverging logs do
+    /// not make the leader illegitimate.
+    fn handle_append_entries(&mut self, args: &AppendEntriesArgs) -> Vec<Effect> {
+        let before = (self.current_term, self.voted_for);
+        let mut effects = Vec::new();
+
+        // Receiver rule 1: reply false to a leader from an older term, and do
+        // not treat it as leader contact.
+        if args.term < self.current_term {
+            effects.push(self.append_entries_reply(args.leader_id, false));
+            return effects;
+        }
+
+        // A newer term, or the same term while we still think we are a
+        // candidate: the sender is the leader for this term, so step down.
+        if args.term > self.current_term || self.is_candidate() {
+            self.become_follower(args.term);
+        }
+
+        let consistent = args.prev_log_index == LogIndex::ZERO
+            || self.log.term_at(args.prev_log_index) == Some(args.prev_log_term);
+
+        self.persist_if_changed(before, &mut effects);
+        effects.push(Effect::ResetElectionTimer);
+        effects.push(self.append_entries_reply(args.leader_id, consistent));
+        effects
+    }
+
     /// Handles the election timer firing: a follower or candidate starts a new
     /// election for `currentTerm + 1` (paper §5.2).
     ///
@@ -546,6 +584,16 @@ impl RaftNode {
         // A single-node cluster reaches quorum on its own vote right away.
         effects.extend(self.promote_if_quorum());
         effects
+    }
+
+    /// Handles the heartbeat interval elapsing: a leader re-broadcasts
+    /// `AppendEntries` to reassert authority; every other role ignores it.
+    fn handle_heartbeat_tick(&self) -> Vec<Effect> {
+        if self.is_leader() {
+            self.broadcast_append_entries()
+        } else {
+            Vec::new()
+        }
     }
 
     /// Adopts `term` as `currentTerm` and reverts to [`Role::Follower`].
@@ -599,6 +647,14 @@ impl RaftNode {
         }
 
         self.become_leader();
+        self.broadcast_append_entries()
+    }
+
+    /// Sends an `AppendEntries` to every peer.
+    ///
+    /// For now the payload is always an empty heartbeat; log replication will
+    /// make it per-peer, carrying the entries from `next_index` onward.
+    fn broadcast_append_entries(&self) -> Vec<Effect> {
         let prev_log_index = self.log.last_index();
         let prev_log_term = self.log.last_term();
         self.peers
@@ -643,6 +699,17 @@ impl RaftNode {
             message: Message::RequestVoteReply(RequestVoteReply {
                 term: self.current_term,
                 vote_granted,
+            }),
+        }
+    }
+
+    /// Builds an `AppendEntriesReply` effect addressed to `leader`.
+    const fn append_entries_reply(&self, leader: NodeId, success: bool) -> Effect {
+        Effect::SendRpc {
+            to: leader,
+            message: Message::AppendEntriesReply(AppendEntriesReply {
+                term: self.current_term,
+                success,
             }),
         }
     }
@@ -729,8 +796,8 @@ mod tests {
     use bytes::Bytes;
 
     use super::{
-        AppendEntriesArgs, Effect, Input, Log, LogEntry, LogIndex, LogicalInstant, Message, NodeId,
-        RaftNode, RequestVoteArgs, RequestVoteReply, Role, Term,
+        AppendEntriesArgs, AppendEntriesReply, Effect, Input, Log, LogEntry, LogIndex,
+        LogicalInstant, Message, NodeId, RaftNode, RequestVoteArgs, RequestVoteReply, Role, Term,
     };
 
     /// The core does not consult the clock under this timer model, so every
@@ -762,6 +829,27 @@ mod tests {
             term: Term::new(term),
             vote_granted: granted,
         })
+    }
+
+    fn heartbeat(term: u64, leader: u64, prev_log_index: u64, prev_log_term: u64) -> Message {
+        Message::AppendEntries(AppendEntriesArgs {
+            term: Term::new(term),
+            leader_id: NodeId::new(leader),
+            prev_log_index: LogIndex::new(prev_log_index),
+            prev_log_term: Term::new(prev_log_term),
+            entries: Vec::new(),
+            leader_commit: LogIndex::ZERO,
+        })
+    }
+
+    fn append_reply(to: u64, term: u64, success: bool) -> Effect {
+        Effect::SendRpc {
+            to: NodeId::new(to),
+            message: Message::AppendEntriesReply(AppendEntriesReply {
+                term: Term::new(term),
+                success,
+            }),
+        }
     }
 
     fn deliver(from: u64, message: Message) -> Input {
@@ -1112,5 +1200,117 @@ mod tests {
                 voted_for: None,
             }],
         );
+    }
+
+    #[test]
+    fn append_entries_from_the_current_leader_resets_the_timer_and_acks() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(1);
+
+        let effects = n.step(deliver(2, heartbeat(1, 2, 0, 0)), NOW);
+
+        assert!(n.is_follower());
+        assert_eq!(n.current_term(), Term::new(1));
+        assert_eq!(
+            effects,
+            vec![Effect::ResetElectionTimer, append_reply(2, 1, true)],
+        );
+    }
+
+    #[test]
+    fn append_entries_with_a_newer_term_steps_a_candidate_down() {
+        let mut n = node(1, &[2, 3]);
+        drive(&mut n, Input::ElectionTimeout); // candidate, term 1
+        drive(&mut n, Input::ElectionTimeout); // candidate, term 2
+
+        let effects = n.step(deliver(3, heartbeat(5, 3, 0, 0)), NOW);
+
+        assert!(n.is_follower());
+        assert_eq!(n.current_term(), Term::new(5));
+        assert_eq!(n.voted_for(), None);
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Persist {
+                    current_term: Term::new(5),
+                    voted_for: None,
+                },
+                Effect::ResetElectionTimer,
+                append_reply(3, 5, true),
+            ],
+        );
+    }
+
+    #[test]
+    fn same_term_append_entries_makes_a_candidate_yield_without_a_new_fsync() {
+        let mut n = node(1, &[2, 3]);
+        drive(&mut n, Input::ElectionTimeout); // candidate, term 1, voted for self
+
+        let effects = n.step(deliver(2, heartbeat(1, 2, 0, 0)), NOW);
+
+        assert!(n.is_follower());
+        assert_eq!(n.voted_for(), Some(NodeId::new(1))); // vote kept, term unchanged
+        assert_eq!(
+            effects,
+            vec![Effect::ResetElectionTimer, append_reply(2, 1, true)],
+        );
+    }
+
+    #[test]
+    fn append_entries_from_a_stale_leader_is_rejected_and_is_not_contact() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(5);
+
+        let effects = n.step(deliver(2, heartbeat(2, 2, 0, 0)), NOW);
+
+        assert_eq!(n.current_term(), Term::new(5));
+        // No ResetElectionTimer: a stale leader does not count as contact.
+        assert_eq!(effects, vec![append_reply(2, 5, false)]);
+    }
+
+    #[test]
+    fn append_entries_failing_the_consistency_check_acks_false_but_still_resets() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(1);
+        n.log.append(entry(1)); // index 1, term 1
+
+        // Leader claims prev entry at index 1 has term 2; ours has term 1.
+        let effects = n.step(deliver(2, heartbeat(1, 2, 1, 2)), NOW);
+
+        assert_eq!(
+            effects,
+            vec![Effect::ResetElectionTimer, append_reply(2, 1, false)],
+        );
+    }
+
+    #[test]
+    fn heartbeat_tick_makes_the_leader_rebroadcast_append_entries() {
+        let mut n = node(1, &[2, 3]);
+        drive(&mut n, Input::ElectionTimeout);
+        drive(&mut n, deliver(2, vote_reply(1, true)));
+        assert!(n.is_leader());
+
+        let effects = n.step(Input::HeartbeatTick, NOW);
+
+        let beat = |to: u64| Effect::SendRpc {
+            to: NodeId::new(to),
+            message: Message::AppendEntries(AppendEntriesArgs {
+                term: Term::new(1),
+                leader_id: NodeId::new(1),
+                prev_log_index: LogIndex::ZERO,
+                prev_log_term: Term::ZERO,
+                entries: Vec::new(),
+                leader_commit: LogIndex::ZERO,
+            }),
+        };
+        assert_eq!(effects, vec![beat(2), beat(3)]);
+    }
+
+    #[test]
+    fn heartbeat_tick_is_a_no_op_for_a_follower() {
+        let mut n = node(1, &[2, 3]);
+
+        assert!(n.step(Input::HeartbeatTick, NOW).is_empty());
+        assert!(n.is_follower());
     }
 }
