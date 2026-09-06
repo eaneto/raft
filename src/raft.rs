@@ -199,7 +199,7 @@ impl Server {
         for node in nodes.values() {
             // TODO Send requests in parallel.
             // TODO Treat error
-            trace!("Sending vote request to {}", &node.id);
+            trace!("Sending vote request to {}", node.id);
             if let Ok(response) = Self::send_vote_request(&vote_request, node) {
                 self.process_vote_response(response);
             }
@@ -235,20 +235,20 @@ impl Server {
         };
 
         let Some(mut stream) = stream else {
-            error!("Can't connect to node at {}", &node.address);
+            error!("Can't connect to node at {}", node.address);
             return Err("Can't connect to node");
         };
 
         // What should be done in case of failure?
         if stream.write_all(&buf).is_err() {
-            trace!("Successfully sent request to node {}", &node.id);
+            trace!("Successfully sent request to node {}", node.id);
         } else {
-            error!("Unable to send request to node {}", &node.id);
+            error!("Unable to send request to node {}", node.id);
             return Err("Unable to send request to node");
         }
         let mut buf = [0; 1024];
         let Ok(_) = stream.read(&mut buf) else {
-            error!("Can't read response from client {}", &node.id);
+            error!("Can't read response from client {}", node.id);
             return Err("Can't read response from client");
         };
         if buf[0] == 0 {
@@ -278,7 +278,7 @@ impl Server {
             && vote_response.vote_in_favor
         {
             self.vote_on_new_leader(vote_response.node_id);
-            trace!("Received vote in favor from {}", &vote_response.node_id);
+            trace!("Received vote in favor from {}", vote_response.node_id);
             if self.has_majority_of_votes() {
                 info!("Majority of votes in favor received, becoming leader");
                 self.become_leader();
@@ -304,7 +304,7 @@ impl Server {
         // e.g. if there are 5 nodes, the majority must be 3, without
         // the increment diving five by two will result in 2 instead
         // of 3.
-        let majority = (nodes_on_cluster + 1) / 2;
+        let majority = nodes_on_cluster.div_ceil(2);
         let votes_received = self.votes_received.len();
         votes_received >= majority
     }
@@ -429,20 +429,20 @@ impl Server {
         };
 
         let Some(mut stream) = stream else {
-            error!("Can't connect to node at {}", &node.address);
+            error!("Can't connect to node at {}", node.address);
             return Err("Can't connect to node");
         };
 
         // What should be done in case of failure?
         if stream.write_all(&buf).is_ok() {
-            trace!("Successfully sent request to node {}", &node.id);
+            trace!("Successfully sent request to node {}", node.id);
         } else {
-            error!("Unable to send request to node {}", &node.id);
+            error!("Unable to send request to node {}", node.id);
             return Err("Unable to send request to node");
         };
         let mut buf = [0; 1024];
         let Ok(_) = stream.read(&mut buf) else {
-            error!("Can't read response from client {}", &node.id);
+            error!("Can't read response from client {}", node.id);
             return Err("Can't read response from client");
         };
         if buf[0] == 0 {
@@ -451,21 +451,21 @@ impl Server {
             let Some(encoded_response) = buf.get(9..(9 + length)) else {
                 error!(
                     "Incomplete response, unable to parse log response from client {}",
-                    &node.id
+                    node.id
                 );
                 return Err("Incomplete response, unable to parse log response");
             };
             let Ok(response) = bincode::deserialize(encoded_response) else {
                 error!(
                     "Unable to deserialize server response from client {}",
-                    &node.id
+                    node.id
                 );
                 return Err("Unable to deserialize server response");
             };
-            trace!("Received successful response from {}", &node.id);
+            trace!("Received successful response from {}", node.id);
             Ok(response)
         } else {
-            trace!("Received failed response from {}", &node.id);
+            trace!("Received failed response from {}", node.id);
             Err("Response is not successful")
         }
     }
@@ -548,7 +548,7 @@ impl Server {
                 }
             }
 
-            if acks >= (self.nodes.len() + 1) / 2 {
+            if acks >= self.nodes.len().div_ceil(2) {
                 // TODO: Deliver log
                 self.increment_commit_length();
             } else {
@@ -659,7 +659,7 @@ mod tests {
             sent_length: HashMap::new(),
             acked_length: HashMap::new(),
             nodes: HashMap::new(),
-            last_heartbeat: Option::Some(one_second_ago),
+            last_heartbeat: Some(one_second_ago),
         };
 
         let result = server.no_hearbeats_received_from_leader();
@@ -682,7 +682,7 @@ mod tests {
             sent_length: HashMap::new(),
             acked_length: HashMap::new(),
             nodes: HashMap::new(),
-            last_heartbeat: Option::Some(Instant::now()),
+            last_heartbeat: Some(Instant::now()),
         };
 
         let result = server.no_hearbeats_received_from_leader();
