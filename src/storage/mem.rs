@@ -193,10 +193,7 @@ mod tests {
     }
 
     fn entry(term: u64, cmd: &'static [u8]) -> LogEntry {
-        LogEntry {
-            term: Term::new(term),
-            command: Bytes::from_static(cmd),
-        }
+        LogEntry::command(Term::new(term), Bytes::from_static(cmd))
     }
 
     #[track_caller]

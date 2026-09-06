@@ -164,7 +164,7 @@ fn a_restarted_node_reloads_its_log_from_disk() {
     let commands: Vec<&[u8]> = reloaded
         .entries
         .iter()
-        .map(|entry| entry.command.as_ref())
+        .filter_map(|entry| entry.command_bytes().map(AsRef::as_ref))
         .collect();
     assert_eq!(commands, vec![b"one".as_slice(), b"two".as_slice()]);
 }
