@@ -180,10 +180,15 @@ If you find yourself wanting to do IO in the core, return an `Effect` instead.
   No `Box<dyn Error>` in library APIs; no `&str` errors.
 - **Fatal vs recoverable**: a lost network message is recoverable (Raft handles it). A
   failed `fsync` is **fatal** (§8) — log and exit, do not paper over it.
-- **Concurrency**: the core is single-threaded and synchronous. The driver may be async
-  (`tokio`) or thread-based — decide when writing `node.rs` and record it here. The
-  simulator drives the core directly on one thread with a logical clock; it must not
-  depend on a real async runtime.
+- **Concurrency**: the core is single-threaded and synchronous. **The driver
+  (`src/node.rs`) is thread-based with blocking IO — no async runtime.** One "raft
+  thread" owns the `RaftNode` and is the only caller of `step`; the TCP transport runs a
+  listener thread, a reader thread per accepted connection, and a sender thread per peer,
+  all communicating with the raft thread over `std::sync::mpsc`. Timers are `recv_timeout`
+  deadlines re-armed from a seeded `StdRng`. Rationale: the core is already synchronous, a
+  Raft cluster has a handful of connections, and threads keep the control flow and the
+  dependency set simple. The simulator drives the core directly on one thread with a
+  logical clock; it must not depend on a real async runtime.
 - **Determinism**: nothing that affects an `Effect` may depend on `HashMap`/`HashSet`
   iteration order, address-of, wall-clock time, or thread scheduling. Use `BTreeMap` or
   iterate a sorted `Vec<NodeId>`.

@@ -36,7 +36,9 @@ pub use message::{
 /// Terms are totally ordered and start at [`Term::ZERO`]. A node's current term
 /// must never decrease, so this type offers [`Term::next`] but no way to go
 /// backwards.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct Term(u64);
 
 impl Term {
@@ -80,7 +82,9 @@ impl fmt::Display for Term {
 /// "before the first entry": it is the `prevLogIndex` an `AppendEntries` carries
 /// for an empty log, and the `lastApplied` / `commitIndex` of a node that has
 /// applied nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct LogIndex(u64);
 
 impl LogIndex {
@@ -128,7 +132,9 @@ impl fmt::Display for LogIndex {
 ///
 /// Ordered so that peers can be iterated deterministically (sorted), never in
 /// `HashMap` order — see the module docs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct NodeId(u64);
 
 impl NodeId {
@@ -157,7 +163,7 @@ impl fmt::Display for NodeId {
 /// An entry does not carry its own index — the index is its 1-based position in
 /// the [`Log`]. After log compaction the index of the first surviving entry is
 /// tracked by the log, not by the entry.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LogEntry {
     /// The term of the leader that first appended this entry.
     pub term: Term,
@@ -185,6 +191,13 @@ impl Log {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A log holding `entries`, index 1 first. Used by the driver to restore a
+    /// log recovered from storage.
+    #[must_use]
+    pub const fn from_entries(entries: Vec<LogEntry>) -> Self {
+        Self { entries }
     }
 
     /// Whether the log holds no entries.
@@ -448,6 +461,30 @@ impl RaftNode {
             last_applied: LogIndex::ZERO,
             role: Role::Follower,
         }
+    }
+
+    /// Rebuilds a server from persistent state recovered at startup (Figure 2:
+    /// `currentTerm`, `votedFor`, `log`).
+    ///
+    /// It comes up as a [`Role::Follower`] with `commitIndex` and `lastApplied`
+    /// at zero — both are volatile, so a restarted node re-learns its commit
+    /// point from the current leader and re-applies the committed prefix to a
+    /// fresh state machine (until snapshots arrive, that replay is the whole
+    /// recovery story). `peers` is filtered / sorted / deduped as in
+    /// [`RaftNode::new`].
+    #[must_use]
+    pub fn from_state(
+        id: NodeId,
+        peers: impl IntoIterator<Item = NodeId>,
+        current_term: Term,
+        voted_for: Option<NodeId>,
+        log: Vec<LogEntry>,
+    ) -> Self {
+        let mut node = Self::new(id, peers);
+        node.current_term = current_term;
+        node.voted_for = voted_for;
+        node.log = Log::from_entries(log);
+        node
     }
 
     /// Advances the state machine by one input and returns the effects the

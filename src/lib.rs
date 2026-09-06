@@ -36,5 +36,9 @@ pub mod raft;
 // debt. Keep it that way.
 // --------------------------------------------------------------------------
 
+pub mod clock;
 pub mod core;
+pub mod node;
+pub mod statemachine;
 pub mod storage;
+pub mod transport;
