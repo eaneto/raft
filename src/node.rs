@@ -16,6 +16,7 @@
 //! process-fatal — log and exit, never continue, never read the data back and
 //! trust it.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -28,7 +29,10 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use crate::clock::{Clock, MonotonicClock};
-use crate::core::{Effect, Input, InstallSnapshotArgs, Message, NodeId, RaftNode};
+use crate::core::{
+    ClusterConfig, Effect, Input, InstallSnapshotArgs, LogIndex, MembershipChange, Message, NodeId,
+    RaftNode,
+};
 use crate::statemachine::StateMachine;
 use crate::storage::{self, PersistentState, SnapshotMeta, Storage};
 use crate::transport::{self, TcpTransport, Transport};
@@ -57,6 +61,9 @@ pub struct Config {
     pub snapshot_threshold: Option<u64>,
     /// Largest `InstallSnapshot` chunk, in bytes.
     pub snapshot_chunk_size: usize,
+    /// Start as a passive non-voting learner (a brand-new node joining an
+    /// existing cluster). Only takes effect when there is no recovered state.
+    pub join_as_learner: bool,
 }
 
 impl Config {
@@ -74,7 +81,15 @@ impl Config {
             heartbeat_interval: Duration::from_millis(50),
             snapshot_threshold: None,
             snapshot_chunk_size: 64 * 1024,
+            join_as_learner: false,
         }
+    }
+
+    /// Marks this node as a brand-new learner joining an existing cluster.
+    #[must_use]
+    pub const fn joining_as_learner(mut self) -> Self {
+        self.join_as_learner = true;
+        self
     }
 
     /// Sets the peer list.
@@ -152,9 +167,28 @@ impl fmt::Display for NodeGone {
 impl std::error::Error for NodeGone {}
 
 enum Event {
-    Deliver { from: NodeId, message: Message },
+    Deliver {
+        from: NodeId,
+        message: Message,
+    },
     Propose(Bytes),
+    /// A membership change; `SocketAddr` is `Some` only for `AddServer`, so the
+    /// driver can reach the new server.
+    Membership(MembershipChange, Option<SocketAddr>),
+    /// A request for a status snapshot, answered on the given channel.
+    Describe(Sender<NodeStatus>),
     Shutdown,
+}
+
+/// A point-in-time view of a running [`Node`], from [`Node::status`].
+#[derive(Clone, Debug)]
+pub struct NodeStatus {
+    /// Whether this node currently believes it is the leader.
+    pub is_leader: bool,
+    /// The voters in the active configuration, sorted.
+    pub voters: Vec<NodeId>,
+    /// The highest committed log index.
+    pub commit_index: LogIndex,
 }
 
 /// A running Raft server.
@@ -234,6 +268,46 @@ impl Node {
             .map_err(|_| NodeGone)
     }
 
+    /// Asks the leader to add `id` (reachable at `addr`) to the cluster. The
+    /// core only acts while this node leads; the new server catches up as a
+    /// non-voting learner before its configuration entry is appended.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeGone`] if the event loop has already stopped.
+    pub fn add_server(&self, id: NodeId, addr: SocketAddr) -> Result<(), NodeGone> {
+        self.events
+            .send(Event::Membership(
+                MembershipChange::AddServer(id),
+                Some(addr),
+            ))
+            .map_err(|_| NodeGone)
+    }
+
+    /// Asks the leader to remove `id` from the cluster.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeGone`] if the event loop has already stopped.
+    pub fn remove_server(&self, id: NodeId) -> Result<(), NodeGone> {
+        self.events
+            .send(Event::Membership(MembershipChange::RemoveServer(id), None))
+            .map_err(|_| NodeGone)
+    }
+
+    /// Returns a point-in-time [`NodeStatus`].
+    ///
+    /// # Errors
+    ///
+    /// [`NodeGone`] if the event loop has already stopped.
+    pub fn status(&self) -> Result<NodeStatus, NodeGone> {
+        let (tx, rx) = mpsc::channel();
+        self.events
+            .send(Event::Describe(tx))
+            .map_err(|_| NodeGone)?;
+        rx.recv().map_err(|_| NodeGone)
+    }
+
     /// Signals shutdown and waits for the event loop to stop, returning why.
     #[must_use]
     pub fn shutdown(mut self) -> Stopped {
@@ -279,6 +353,10 @@ struct Driver<S, M> {
     snapshot: Option<(SnapshotMeta, Bytes)>,
     /// A snapshot currently arriving from the leader, if any.
     incoming_snapshot: Option<IncomingSnapshot>,
+    /// Known addresses for peers, seeded from [`Config::peers`] and extended by
+    /// [`Node::add_server`]. Used to reconcile the transport with a committed
+    /// configuration.
+    peer_addrs: BTreeMap<NodeId, SocketAddr>,
 }
 
 impl<S: Storage, M: StateMachine> Driver<S, M> {
@@ -322,15 +400,23 @@ impl<S: Storage, M: StateMachine> Driver<S, M> {
             )
         });
 
+        let peer_addrs: BTreeMap<NodeId, SocketAddr> = config.peers.iter().copied().collect();
         let peer_ids = config.peers.iter().map(|(id, _)| *id);
-        let node = RaftNode::from_state(
-            config.id,
-            peer_ids,
-            current_term,
-            voted_for,
-            snapshot_base,
-            entries,
-        );
+        // A brand-new joining node (no prior state) comes up as a passive
+        // learner until the leader's configuration entry names it; a node with
+        // recovered state derives its configuration from that state instead.
+        let node = if config.join_as_learner && snapshot_base.is_none() && entries.is_empty() {
+            RaftNode::new_learner(config.id)
+        } else {
+            RaftNode::from_state(
+                config.id,
+                peer_ids,
+                current_term,
+                voted_for,
+                snapshot_base,
+                entries,
+            )
+        };
 
         let mut rng = StdRng::seed_from_u64(config.seed);
         let first_election = Instant::now() + random_timeout(&mut rng, &config);
@@ -346,6 +432,7 @@ impl<S: Storage, M: StateMachine> Driver<S, M> {
             heartbeat_deadline: None,
             snapshot,
             incoming_snapshot: None,
+            peer_addrs,
         })
     }
 
@@ -369,6 +456,31 @@ impl<S: Storage, M: StateMachine> Driver<S, M> {
                     if let Err(fatal) = self.step(Input::Propose { command }) {
                         return Stopped::FatalStorage(fatal);
                     }
+                }
+                Ok(Event::Membership(change, addr)) => {
+                    if let (MembershipChange::AddServer(id), Some(addr)) = (change, addr) {
+                        self.peer_addrs.insert(id, addr);
+                        // Start talking to the new server now, so it can catch
+                        // up as a learner before its configuration entry is
+                        // even appended.
+                        let mut wanted: Vec<(NodeId, SocketAddr)> = self
+                            .transport
+                            .peers()
+                            .filter_map(|peer| self.peer_addrs.get(&peer).map(|a| (peer, *a)))
+                            .collect();
+                        wanted.push((id, addr));
+                        self.transport.set_peers(&wanted);
+                    }
+                    if let Err(fatal) = self.step(Input::ChangeMembership { change }) {
+                        return Stopped::FatalStorage(fatal);
+                    }
+                }
+                Ok(Event::Describe(reply)) => {
+                    let _ = reply.send(NodeStatus {
+                        is_leader: self.node.is_leader(),
+                        voters: self.node.config().voters().iter().copied().collect(),
+                        commit_index: self.node.commit_index(),
+                    });
                 }
                 Err(RecvTimeoutError::Timeout) => {}
             }
@@ -421,19 +533,24 @@ impl<S: Storage, M: StateMachine> Driver<S, M> {
                     };
                     self.receive_snapshot_chunk(meta, offset, &data, done)?;
                 }
-                Effect::MembershipChanged { config } => {
-                    // Reconciling the live transport peer set with the new
-                    // configuration is wired up with the membership-change API;
-                    // for now just record it.
-                    log::info!(
-                        "node {}: configuration is now {:?}",
-                        self.config.id,
-                        config.voters(),
-                    );
-                }
+                Effect::MembershipChanged { config } => self.reconcile_transport(&config),
             }
         }
         Ok(())
+    }
+
+    /// Points the transport at exactly the other voters in `config`, using
+    /// known addresses. A voter with no known address (e.g. one a peer learned
+    /// of only through the committed configuration entry) is skipped until an
+    /// address is supplied.
+    fn reconcile_transport(&mut self, config: &ClusterConfig) {
+        let peers: Vec<(NodeId, SocketAddr)> = config
+            .voters()
+            .iter()
+            .filter(|&&voter| voter != self.config.id)
+            .filter_map(|voter| self.peer_addrs.get(voter).map(|addr| (*voter, *addr)))
+            .collect();
+        self.transport.set_peers(&peers);
     }
 
     /// Streams the node's current snapshot to `to` as `InstallSnapshot` chunks.
