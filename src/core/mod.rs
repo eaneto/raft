@@ -812,6 +812,19 @@ impl RaftNode {
         node
     }
 
+    /// Creates a server that is **not** in any bootstrap configuration: a
+    /// brand-new node joining an existing cluster. It stays passive — it never
+    /// starts an election — until a configuration entry that names it arrives
+    /// from the leader (thesis §4.2.1: a new server joins as a non-voting
+    /// learner).
+    #[must_use]
+    pub fn new_learner(id: NodeId) -> Self {
+        let mut node = Self::new(id, std::iter::empty());
+        node.base_config = ClusterConfig::new(std::iter::empty());
+        node.recompute_config();
+        node
+    }
+
     /// Rebuilds a server from persistent state recovered at startup (Figure 2:
     /// `currentTerm`, `votedFor`, `log`), optionally sitting behind a snapshot.
     ///
@@ -1520,7 +1533,10 @@ impl RaftNode {
     /// only ever calls [`Term::next`], and a failed election just leaves us a
     /// candidate at the higher term until the timer fires again.
     fn handle_election_timeout(&mut self) -> Vec<Effect> {
-        if self.is_leader() {
+        // A leader never re-elects, and a server absent from its own
+        // configuration (a not-yet-added learner, or one just removed) stays
+        // passive so it cannot disrupt the cluster it is joining or leaving.
+        if self.is_leader() || !self.config.contains(self.id) {
             return Vec::new();
         }
 
@@ -1802,8 +1818,12 @@ impl RaftNode {
     }
 
     /// Votes needed to win an election or commit an entry: a strict majority of
-    /// the active configuration.
+    /// the active configuration. An empty configuration (a learner) has no
+    /// reachable quorum.
     fn quorum(&self) -> usize {
+        if self.config.is_empty() {
+            return usize::MAX;
+        }
         self.cluster_size() / 2 + 1
     }
 
@@ -3409,6 +3429,25 @@ mod tests {
         // A fresh change can start again.
         let effects = n.step(change(MembershipChange::RemoveServer(NodeId::new(3))), NOW);
         assert!(!effects.is_empty());
+    }
+
+    #[test]
+    fn a_server_absent_from_its_configuration_stays_passive() {
+        // A brand-new learner: not in any configuration.
+        let mut n = RaftNode::new_learner(NodeId::new(4));
+        assert!(!n.config().contains(NodeId::new(4)));
+
+        let effects = n.step(Input::ElectionTimeout, NOW);
+        assert!(effects.is_empty());
+        assert!(n.is_follower());
+        assert_eq!(n.current_term(), Term::ZERO);
+
+        // Once a configuration entry names it, it participates normally.
+        n.log
+            .append(LogEntry::config(Term::new(1), config(&[1, 2, 3, 4])));
+        n.recompute_config();
+        drive(&mut n, Input::ElectionTimeout);
+        assert!(n.is_candidate());
     }
 
     #[test]

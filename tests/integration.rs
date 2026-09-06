@@ -235,3 +235,132 @@ fn a_single_node_compacts_its_log_and_reloads_from_the_snapshot() {
     );
     let _ = node2.shutdown();
 }
+
+/// Starts an `n`-node cluster over TCP with a shared address book; every node
+/// bootstraps with all `n` as voters. Returns the nodes and their state
+/// machines.
+fn start_cluster(n: usize) -> (Vec<Node>, Vec<SharedSm>, Vec<SocketAddr>, Vec<TempDir>) {
+    let ids: Vec<NodeId> = (1..=n as u64).map(NodeId::new).collect();
+    let addrs: Vec<SocketAddr> = (0..n).map(|_| free_addr()).collect();
+    let dirs: Vec<TempDir> = (0..n).map(|_| unwrap(tempfile::tempdir())).collect();
+    let sms: Vec<SharedSm> = (0..n).map(|_| SharedSm::new()).collect();
+
+    let mut nodes = Vec::new();
+    for i in 0..n {
+        let peers = (0..n)
+            .filter(|&j| j != i)
+            .map(|j| (ids[j], addrs[j]))
+            .collect();
+        let config = Config::new(ids[i], addrs[i], dirs[i].path())
+            .with_peers(peers)
+            .with_seed(i as u64 + 1);
+        nodes.push(unwrap(Node::start(
+            config,
+            unwrap(FileStorage::open(dirs[i].path())),
+            sms[i].clone(),
+        )));
+    }
+    (nodes, sms, addrs, dirs)
+}
+
+fn leader_index(nodes: &[Node]) -> Option<usize> {
+    nodes
+        .iter()
+        .position(|node| node.status().is_ok_and(|s| s.is_leader))
+}
+
+#[test]
+fn the_leader_removes_a_follower_from_the_cluster() {
+    let (nodes, _sms, _addrs, _dirs) = start_cluster(4);
+
+    assert!(
+        wait_until(Duration::from_secs(3), || leader_index(&nodes).is_some()),
+        "no leader elected",
+    );
+    let leader = unwrap(leader_index(&nodes).ok_or("no leader"));
+    let victim = (0..4).find(|&i| i != leader).unwrap_or(0);
+    let victim_id = NodeId::new(victim as u64 + 1);
+
+    assert!(nodes[leader].remove_server(victim_id).is_ok());
+
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            nodes[leader]
+                .status()
+                .is_ok_and(|s| s.voters.len() == 3 && !s.voters.contains(&victim_id))
+        }),
+        "leader configuration did not shrink: {:?}",
+        nodes[leader].status().map(|s| s.voters),
+    );
+
+    // The smaller cluster still commits.
+    let before = unwrap(nodes[leader].status()).commit_index.get();
+    assert!(
+        nodes[leader]
+            .propose(Bytes::from_static(b"after-remove"))
+            .is_ok()
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            unwrap(nodes[leader].status()).commit_index.get() > before
+        }),
+        "cluster stopped committing after the removal",
+    );
+
+    for node in nodes {
+        let _ = node.shutdown();
+    }
+}
+
+#[test]
+fn the_leader_adds_a_learner_that_catches_up_and_starts_voting() {
+    let (nodes, _sms, addrs, dirs) = start_cluster(3);
+
+    assert!(
+        wait_until(Duration::from_secs(3), || leader_index(&nodes).is_some()),
+        "no leader elected",
+    );
+    let leader = unwrap(leader_index(&nodes).ok_or("no leader"));
+
+    // A few committed entries for the newcomer to catch up on.
+    for k in 0..5 {
+        let _ = nodes[leader].propose(Bytes::from(format!("e{k}").into_bytes()));
+    }
+
+    // Stand up node 4 as a passive learner that knows the other three.
+    let new_id = NodeId::new(4);
+    let new_addr = free_addr();
+    let new_dir = unwrap(tempfile::tempdir());
+    let new_peers = (0..3)
+        .map(|j| (NodeId::new(j as u64 + 1), addrs[j]))
+        .collect();
+    let new_node = unwrap(Node::start(
+        Config::new(new_id, new_addr, new_dir.path())
+            .with_peers(new_peers)
+            .with_seed(99)
+            .joining_as_learner(),
+        unwrap(FileStorage::open(new_dir.path())),
+        SharedSm::new(),
+    ));
+
+    assert!(nodes[leader].add_server(new_id, new_addr).is_ok());
+
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            let leader_ok = nodes[leader]
+                .status()
+                .is_ok_and(|s| s.voters.len() == 4 && s.voters.contains(&new_id));
+            let learner_ok = new_node.status().is_ok_and(|s| s.voters.len() == 4);
+            leader_ok && learner_ok
+        }),
+        "the learner was not added to the configuration: leader={:?} learner={:?}",
+        nodes[leader].status().map(|s| s.voters),
+        new_node.status().map(|s| s.voters),
+    );
+
+    let _ = new_node.shutdown();
+    for node in nodes {
+        let _ = node.shutdown();
+    }
+    drop(dirs);
+}
