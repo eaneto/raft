@@ -27,7 +27,8 @@ use bytes::Bytes;
 mod message;
 
 pub use message::{
-    AppendEntriesArgs, AppendEntriesReply, Message, RequestVoteArgs, RequestVoteReply,
+    AppendEntriesArgs, AppendEntriesReply, InstallSnapshotArgs, InstallSnapshotReply, Message,
+    RequestVoteArgs, RequestVoteReply,
 };
 
 /// A Raft term: a logical clock that increases monotonically over the life of
@@ -466,6 +467,24 @@ pub enum Input {
     /// The periodic heartbeat interval elapsed. Acted on only while
     /// [`Role::Leader`].
     HeartbeatTick,
+    /// The driver has durably stored a snapshot received from the leader and
+    /// restored the state machine from it (the response to a run of
+    /// [`Effect::StoreSnapshotChunk`] ending with `done`). The core adopts the
+    /// snapshot: it compacts its log to `last_included_index`, advances
+    /// `commitIndex` / `lastApplied` there, and acknowledges the leader.
+    SnapshotInstalled {
+        /// The last log index the snapshot covers.
+        last_included_index: LogIndex,
+        /// Term of the entry at `last_included_index`.
+        last_included_term: Term,
+    },
+    /// The driver has durably stored a snapshot the state machine produced from
+    /// its own applied entries; the core may now drop the covered log prefix.
+    /// `up_to_index` is always `<= lastApplied`.
+    CompactLog {
+        /// The last log index the new snapshot covers.
+        up_to_index: LogIndex,
+    },
 }
 
 /// A side effect the core needs the driver to perform.
@@ -525,6 +544,35 @@ pub enum Effect {
     /// Restart the election timer with a fresh randomized duration (the driver
     /// owns the range and the seeded RNG).
     ResetElectionTimer,
+    /// Send the current snapshot to `to` as an `InstallSnapshot` chunk stream,
+    /// because `to`'s next entry has been compacted into it.
+    ///
+    /// The pure core does not hold the snapshot bytes — the driver does — so it
+    /// only names the recipient. The driver fills in `last_included_index`,
+    /// its term, and the chunks from whatever it last persisted.
+    SendSnapshot {
+        /// The follower to bring up to date.
+        to: NodeId,
+    },
+    /// Hand a received `InstallSnapshot` chunk to the driver to accumulate.
+    ///
+    /// The driver appends `data` at `offset` to its reassembly buffer; on the
+    /// `done` chunk it persists the whole snapshot, restores the state machine
+    /// from it, and feeds back [`Input::SnapshotInstalled`]. Nothing is
+    /// acknowledged to the leader until that callback, so a crash mid-transfer
+    /// cannot make the follower claim a snapshot it does not have.
+    StoreSnapshotChunk {
+        /// The last log index the snapshot covers.
+        last_included_index: LogIndex,
+        /// Term of the entry at `last_included_index`.
+        last_included_term: Term,
+        /// Byte offset of `data` within the complete snapshot.
+        offset: u64,
+        /// Snapshot bytes beginning at `offset`.
+        data: Vec<u8>,
+        /// Whether `data` reaches the end of the snapshot.
+        done: bool,
+    },
 }
 
 /// A single Raft server: the pure state machine.
@@ -549,6 +597,11 @@ pub struct RaftNode {
     commit_index: LogIndex,
     last_applied: LogIndex,
     role: Role,
+    /// The leader this node currently recognises for `current_term`, learned
+    /// from an accepted `AppendEntries` or `InstallSnapshot`. Used to address
+    /// the reply after the driver installs a received snapshot, and (later) to
+    /// redirect clients.
+    leader_id: Option<NodeId>,
 }
 
 impl RaftNode {
@@ -570,30 +623,40 @@ impl RaftNode {
             commit_index: LogIndex::ZERO,
             last_applied: LogIndex::ZERO,
             role: Role::Follower,
+            leader_id: None,
         }
     }
 
     /// Rebuilds a server from persistent state recovered at startup (Figure 2:
-    /// `currentTerm`, `votedFor`, `log`).
+    /// `currentTerm`, `votedFor`, `log`), optionally sitting behind a snapshot.
     ///
-    /// It comes up as a [`Role::Follower`] with `commitIndex` and `lastApplied`
-    /// at zero — both are volatile, so a restarted node re-learns its commit
-    /// point from the current leader and re-applies the committed prefix to a
-    /// fresh state machine (until snapshots arrive, that replay is the whole
-    /// recovery story). `peers` is filtered / sorted / deduped as in
-    /// [`RaftNode::new`].
+    /// It comes up as a [`Role::Follower`]. `snapshot` is `Some((index, term))`
+    /// when a snapshot was recovered: `entries` are then the log *after* that
+    /// index, and `commitIndex` / `lastApplied` start there because the driver
+    /// has already restored the state machine from the snapshot. Without a
+    /// snapshot both start at zero and the restarted node re-learns its commit
+    /// point from the leader and replays the committed prefix. `peers` is
+    /// filtered / sorted / deduped as in [`RaftNode::new`].
     #[must_use]
     pub fn from_state(
         id: NodeId,
         peers: impl IntoIterator<Item = NodeId>,
         current_term: Term,
         voted_for: Option<NodeId>,
-        log: Vec<LogEntry>,
+        snapshot: Option<(LogIndex, Term)>,
+        entries: Vec<LogEntry>,
     ) -> Self {
         let mut node = Self::new(id, peers);
         node.current_term = current_term;
         node.voted_for = voted_for;
-        node.log = Log::from_entries(log);
+        node.log = match snapshot {
+            Some((index, term)) => {
+                node.commit_index = index;
+                node.last_applied = index;
+                Log::from_snapshot(index, term, entries)
+            }
+            None => Log::from_entries(entries),
+        };
         node
     }
 
@@ -613,10 +676,19 @@ impl RaftNode {
                 Message::RequestVoteReply(reply) => self.handle_request_vote_reply(from, reply),
                 Message::AppendEntries(args) => self.handle_append_entries(&args),
                 Message::AppendEntriesReply(reply) => self.handle_append_entries_reply(from, reply),
+                Message::InstallSnapshot(args) => self.handle_install_snapshot(&args),
+                Message::InstallSnapshotReply(reply) => {
+                    self.handle_install_snapshot_reply(from, reply)
+                }
             },
             Input::ElectionTimeout => self.handle_election_timeout(),
             Input::HeartbeatTick => self.handle_heartbeat_tick(),
             Input::Propose { command } => self.handle_propose(command),
+            Input::SnapshotInstalled {
+                last_included_index,
+                last_included_term,
+            } => self.handle_snapshot_installed(last_included_index, last_included_term),
+            Input::CompactLog { up_to_index } => self.handle_compact_log(up_to_index),
         }
     }
 
@@ -707,6 +779,7 @@ impl RaftNode {
         if args.term > self.current_term || self.is_candidate() {
             self.become_follower(args.term);
         }
+        self.leader_id = Some(args.leader_id);
         self.persist_if_changed(before, &mut effects);
 
         // Receiver rule 2: the log must contain `prev_log_index` with a
@@ -825,9 +898,123 @@ impl RaftNode {
             self.maybe_advance_commit_index(&mut effects);
         } else {
             self.back_off(from);
-            effects.push(self.append_entries_to(from));
+            effects.push(self.replicate_to(from));
         }
         effects
+    }
+
+    /// Handles an incoming `InstallSnapshot` chunk (Figure 13, follower side).
+    ///
+    /// Term rules match `AppendEntries`: a chunk from an older term is rejected
+    /// and is not leader contact; a newer term (or the same term while still a
+    /// candidate) steps this node down. The chunk itself is handed to the
+    /// driver via [`Effect::StoreSnapshotChunk`]; the leader is not
+    /// acknowledged until the driver has the whole snapshot durable and calls
+    /// back [`Input::SnapshotInstalled`], so a crash mid-transfer cannot make
+    /// this node claim a snapshot it does not have. A snapshot this node has
+    /// already committed past is acknowledged at once without reinstalling.
+    fn handle_install_snapshot(&mut self, args: &InstallSnapshotArgs) -> Vec<Effect> {
+        let before = (self.current_term, self.voted_for);
+        let mut effects = Vec::new();
+
+        if args.term < self.current_term {
+            effects.push(self.install_snapshot_reply(args.leader_id, args.last_included_index));
+            return effects;
+        }
+
+        if args.term > self.current_term || self.is_candidate() {
+            self.become_follower(args.term);
+        }
+        self.leader_id = Some(args.leader_id);
+        self.persist_if_changed(before, &mut effects);
+
+        effects.push(Effect::ResetElectionTimer);
+
+        // Already have this prefix committed: keep our log and ack immediately.
+        if args.last_included_index <= self.commit_index {
+            effects.push(self.install_snapshot_reply(args.leader_id, args.last_included_index));
+            return effects;
+        }
+
+        effects.push(Effect::StoreSnapshotChunk {
+            last_included_index: args.last_included_index,
+            last_included_term: args.last_included_term,
+            offset: args.offset,
+            data: args.data.clone(),
+            done: args.done,
+        });
+        effects
+    }
+
+    /// Handles an `InstallSnapshotReply` from `from` (Figure 13, leader side).
+    ///
+    /// A newer term steps us down. Otherwise, while we still lead for the
+    /// reply's term, the follower now holds the snapshot through
+    /// `last_included_index`: record that as its `matchIndex`, which also pulls
+    /// its `nextIndex` past the compacted region so the next round is a normal
+    /// `AppendEntries`, and re-check whether that advances `commitIndex`.
+    fn handle_install_snapshot_reply(
+        &mut self,
+        from: NodeId,
+        reply: InstallSnapshotReply,
+    ) -> Vec<Effect> {
+        let before = (self.current_term, self.voted_for);
+        let mut effects = Vec::new();
+
+        if reply.term > self.current_term {
+            self.become_follower(reply.term);
+            self.persist_if_changed(before, &mut effects);
+            return effects;
+        }
+
+        if reply.term < self.current_term || !self.is_leader() {
+            return effects;
+        }
+
+        self.record_match(from, reply.last_included_index);
+        self.maybe_advance_commit_index(&mut effects);
+        effects
+    }
+
+    /// Handles [`Input::SnapshotInstalled`]: the driver has a snapshot from the
+    /// leader durable and has restored the state machine from it. Adopt it —
+    /// compact the log to `last_included_index`, move `commitIndex` /
+    /// `lastApplied` up to it — and acknowledge the leader (persist-before-reply:
+    /// this is the first point at which the snapshot is on stable storage).
+    fn handle_snapshot_installed(
+        &mut self,
+        last_included_index: LogIndex,
+        last_included_term: Term,
+    ) -> Vec<Effect> {
+        let mut effects = Vec::new();
+
+        self.log.compact(last_included_index, last_included_term);
+        self.commit_index = self.commit_index.max(last_included_index);
+        if self.last_applied < last_included_index {
+            self.last_applied = last_included_index;
+        }
+        // Normally a no-op: only runs if a concurrent AppendEntries had already
+        // pushed commitIndex past the snapshot.
+        self.apply_committed(&mut effects);
+
+        if let Some(leader) = self.leader_id {
+            effects.push(self.install_snapshot_reply(leader, last_included_index));
+        }
+        effects
+    }
+
+    /// Handles [`Input::CompactLog`]: the driver has durably snapshotted the
+    /// state machine through `up_to_index`, so drop that prefix of the log.
+    /// Bounded by `lastApplied` — never compact an entry that has not been
+    /// applied — and the term comes from the log, which still holds it.
+    fn handle_compact_log(&mut self, up_to_index: LogIndex) -> Vec<Effect> {
+        if up_to_index > self.log.snapshot_last_index()
+            && up_to_index <= self.last_applied
+            && let Some(term) = self.log.term_at(up_to_index)
+        {
+            self.log.compact(up_to_index, term);
+        }
+        Vec::new()
     }
 
     /// Records a successful ack: `match_index[peer]` only moves forward (a
@@ -970,11 +1157,14 @@ impl RaftNode {
     ///
     /// Clears `votedFor` only when the term actually advances, so a same-term
     /// step-down (e.g. a candidate conceding to a leader) needs no new fsync.
-    /// Callers pass a `term` that is `>=` the current one.
+    /// When the term advances the recognised leader is forgotten too; the
+    /// caller sets it again if this step-down was triggered by that leader's
+    /// own RPC. Callers pass a `term` that is `>=` the current one.
     fn become_follower(&mut self, term: Term) {
         if term > self.current_term {
             self.current_term = term;
             self.voted_for = None;
+            self.leader_id = None;
         }
         self.role = Role::Follower;
     }
@@ -983,6 +1173,7 @@ impl RaftNode {
     fn become_candidate(&mut self) {
         self.current_term = self.current_term.next();
         self.voted_for = Some(self.id);
+        self.leader_id = None;
         let mut votes_granted = BTreeSet::new();
         votes_granted.insert(self.id);
         self.role = Role::Candidate { votes_granted };
@@ -998,6 +1189,7 @@ impl RaftNode {
             .iter()
             .map(|&peer| (peer, LogIndex::ZERO))
             .collect();
+        self.leader_id = Some(self.id);
         self.role = Role::Leader {
             next_index,
             match_index,
@@ -1021,23 +1213,33 @@ impl RaftNode {
         self.replicate_to_peers()
     }
 
-    /// Sends every peer an `AppendEntries` carrying the entries it is missing
-    /// according to its `next_index`. With every peer caught up this is a batch
-    /// of empty heartbeats; after a fresh `Propose` it carries the new tail.
-    /// Used on winning an election, on `HeartbeatTick`, and on `Propose`.
+    /// Replicates to every peer: an `AppendEntries` carrying the entries it is
+    /// missing according to its `next_index`, or an [`Effect::SendSnapshot`]
+    /// when that entry has been compacted away. With every peer caught up this
+    /// is a batch of empty heartbeats; after a fresh `Propose` it carries the
+    /// new tail. Used on winning an election, on `HeartbeatTick`, and on
+    /// `Propose`.
     fn replicate_to_peers(&self) -> Vec<Effect> {
         self.peers
             .iter()
-            .map(|&peer| self.append_entries_to(peer))
+            .map(|&peer| self.replicate_to(peer))
             .collect()
     }
 
-    /// Builds the `AppendEntries` for one peer from its `next_index`: the entry
-    /// just before `next_index` is the §5.3 consistency-check anchor
-    /// (`prev_log_index` / `prev_log_term`), and everything from `next_index`
-    /// to the end of the log rides along as `entries`.
-    fn append_entries_to(&self, peer: NodeId) -> Effect {
+    /// Builds the replication effect for one peer.
+    ///
+    /// If the peer's `next_index` still points into the log, that is an
+    /// `AppendEntries`: the entry just before `next_index` is the §5.3
+    /// consistency-check anchor (`prev_log_index` / `prev_log_term`), and
+    /// everything from `next_index` to the end of the log rides along as
+    /// `entries`. If `next_index` has fallen to or below the compaction base,
+    /// the leader no longer has `prev_log_term`, so it sends the snapshot
+    /// instead ([`Effect::SendSnapshot`]).
+    fn replicate_to(&self, peer: NodeId) -> Effect {
         let next = self.next_index_for(peer);
+        if next <= self.log.snapshot_last_index() {
+            return Effect::SendSnapshot { to: peer };
+        }
         let prev_log_index = next.prev();
         let prev_log_term = self.log.term_at(prev_log_index).unwrap_or(Term::ZERO);
         Effect::SendRpc {
@@ -1119,6 +1321,22 @@ impl RaftNode {
         }
     }
 
+    /// Builds an `InstallSnapshotReply` effect addressed to `leader`, echoing
+    /// the `last_included_index` the follower now holds.
+    const fn install_snapshot_reply(
+        &self,
+        leader: NodeId,
+        last_included_index: LogIndex,
+    ) -> Effect {
+        Effect::SendRpc {
+            to: leader,
+            message: Message::InstallSnapshotReply(InstallSnapshotReply {
+                term: self.current_term,
+                last_included_index,
+            }),
+        }
+    }
+
     /// Number of servers in the cluster (peers plus self).
     const fn cluster_size(&self) -> usize {
         self.peers.len() + 1
@@ -1194,6 +1412,20 @@ impl RaftNode {
     pub const fn last_applied(&self) -> LogIndex {
         self.last_applied
     }
+
+    /// The index of the last entry folded into the most recent snapshot, or
+    /// [`LogIndex::ZERO`] if the log has never been compacted.
+    #[must_use]
+    pub const fn snapshot_last_index(&self) -> LogIndex {
+        self.log.snapshot_last_index()
+    }
+
+    /// The leader this node currently recognises for [`RaftNode::current_term`],
+    /// if it has heard from one since the term began.
+    #[must_use]
+    pub const fn leader_id(&self) -> Option<NodeId> {
+        self.leader_id
+    }
 }
 
 #[cfg(test)]
@@ -1201,8 +1433,9 @@ mod tests {
     use bytes::Bytes;
 
     use super::{
-        AppendEntriesArgs, AppendEntriesReply, Effect, Input, Log, LogEntry, LogIndex,
-        LogicalInstant, Message, NodeId, RaftNode, RequestVoteArgs, RequestVoteReply, Role, Term,
+        AppendEntriesArgs, AppendEntriesReply, Effect, Input, InstallSnapshotArgs,
+        InstallSnapshotReply, Log, LogEntry, LogIndex, LogicalInstant, Message, NodeId, RaftNode,
+        RequestVoteArgs, RequestVoteReply, Role, Term,
     };
 
     /// The core does not consult the clock under this timer model, so every
@@ -1309,6 +1542,38 @@ mod tests {
         Effect::SendRpc {
             to: NodeId::new(to),
             message,
+        }
+    }
+
+    fn install_snapshot(
+        term: u64,
+        leader: u64,
+        last_included_index: u64,
+        last_included_term: u64,
+        done: bool,
+    ) -> Message {
+        Message::InstallSnapshot(InstallSnapshotArgs {
+            term: Term::new(term),
+            leader_id: NodeId::new(leader),
+            last_included_index: LogIndex::new(last_included_index),
+            last_included_term: Term::new(last_included_term),
+            offset: 0,
+            data: b"snap".to_vec(),
+            done,
+        })
+    }
+
+    fn snapshot_reply_msg(term: u64, last_included_index: u64) -> Message {
+        Message::InstallSnapshotReply(InstallSnapshotReply {
+            term: Term::new(term),
+            last_included_index: LogIndex::new(last_included_index),
+        })
+    }
+
+    fn snapshot_reply(to: u64, term: u64, last_included_index: u64) -> Effect {
+        Effect::SendRpc {
+            to: NodeId::new(to),
+            message: snapshot_reply_msg(term, last_included_index),
         }
     }
 
@@ -2278,6 +2543,220 @@ mod tests {
                     command: Bytes::from_static(b"solo"),
                 },
             ],
+        );
+    }
+
+    // --- 8: snapshotting / InstallSnapshot ------------------------------------
+
+    /// Arranges `n` as leader for term 2 with a five-entry term-1 log, then
+    /// compacts it up to `up_to` so the compaction base is non-zero.
+    fn leader_with_compacted_log(up_to: u64) -> RaftNode {
+        let mut n = node(1, &[2, 3]);
+        for _ in 0..5 {
+            n.log.append(entry(1));
+        }
+        n.current_term = Term::new(1);
+        drive(&mut n, Input::ElectionTimeout); // term 2, candidate
+        drive(&mut n, deliver(2, vote_reply(2, true))); // leader, term 2
+        n.commit_index = LogIndex::new(5);
+        n.last_applied = LogIndex::new(5);
+        drive(
+            &mut n,
+            Input::CompactLog {
+                up_to_index: LogIndex::new(up_to),
+            },
+        );
+        assert_eq!(n.snapshot_last_index(), LogIndex::new(up_to));
+        n
+    }
+
+    #[test]
+    fn compact_log_input_trims_the_core_log_up_to_last_applied() {
+        let mut n = node(1, &[2, 3]);
+        for _ in 0..8 {
+            n.log.append(entry(1));
+        }
+        n.current_term = Term::new(1);
+        n.commit_index = LogIndex::new(5);
+        n.last_applied = LogIndex::new(5);
+
+        let effects = n.step(
+            Input::CompactLog {
+                up_to_index: LogIndex::new(5),
+            },
+            NOW,
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(n.snapshot_last_index(), LogIndex::new(5));
+        assert_eq!(n.log().get(LogIndex::new(5)), None); // folded away
+        assert_eq!(n.log().get(LogIndex::new(6)), Some(&entry(1)));
+        assert_eq!(n.log().last_index(), LogIndex::new(8));
+    }
+
+    #[test]
+    fn compact_log_past_last_applied_is_ignored() {
+        let mut n = node(1, &[2, 3]);
+        for _ in 0..8 {
+            n.log.append(entry(1));
+        }
+        n.current_term = Term::new(1);
+        n.last_applied = LogIndex::new(3);
+
+        drive(
+            &mut n,
+            Input::CompactLog {
+                up_to_index: LogIndex::new(5),
+            },
+        );
+
+        assert_eq!(n.snapshot_last_index(), LogIndex::ZERO);
+    }
+
+    #[test]
+    fn a_leader_sends_a_snapshot_once_a_peer_falls_behind_the_base() {
+        let mut n = leader_with_compacted_log(3); // base at index 3
+
+        // Peer 3 rejects: nextIndex walks 6 -> 5 -> 4 -> 3. At 3 (== base) the
+        // leader can no longer build prevLogTerm, so it sends the snapshot.
+        let mut last = Vec::new();
+        for _ in 0..3 {
+            last = n.step(deliver(3, ae_reply(2, false, 0)), NOW);
+        }
+        assert_eq!(last, vec![Effect::SendSnapshot { to: NodeId::new(3) }]);
+    }
+
+    #[test]
+    fn a_heartbeat_tick_sends_a_snapshot_to_a_peer_behind_the_base() {
+        let mut n = leader_with_compacted_log(3);
+        if let Role::Leader { next_index, .. } = &mut n.role {
+            next_index.insert(NodeId::new(3), LogIndex::new(1));
+        }
+
+        let effects = n.step(Input::HeartbeatTick, NOW);
+
+        assert!(effects.contains(&Effect::SendSnapshot { to: NodeId::new(3) }));
+    }
+
+    #[test]
+    fn an_install_snapshot_reply_advances_next_index_past_the_compacted_region() {
+        let mut n = leader_with_compacted_log(3);
+        if let Role::Leader { next_index, .. } = &mut n.role {
+            next_index.insert(NodeId::new(2), LogIndex::new(1));
+        }
+
+        drive(&mut n, deliver(2, snapshot_reply_msg(2, 4)));
+
+        if let Role::Leader {
+            next_index,
+            match_index,
+        } = n.role()
+        {
+            assert_eq!(next_index[&NodeId::new(2)], LogIndex::new(5));
+            assert_eq!(match_index[&NodeId::new(2)], LogIndex::new(4));
+        } else {
+            unreachable!("still a leader");
+        }
+    }
+
+    #[test]
+    fn install_snapshot_stores_the_chunk_and_defers_the_reply() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(1);
+
+        let effects = n.step(deliver(2, install_snapshot(2, 2, 5, 1, true)), NOW);
+
+        assert!(n.is_follower());
+        assert_eq!(n.current_term(), Term::new(2));
+        assert_eq!(n.leader_id(), Some(NodeId::new(2)));
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Persist {
+                    current_term: Term::new(2),
+                    voted_for: None,
+                },
+                Effect::ResetElectionTimer,
+                Effect::StoreSnapshotChunk {
+                    last_included_index: LogIndex::new(5),
+                    last_included_term: Term::new(1),
+                    offset: 0,
+                    data: b"snap".to_vec(),
+                    done: true,
+                },
+            ],
+        );
+        // No reply, and nothing adopted, until the driver confirms it durable.
+        assert_eq!(n.commit_index(), LogIndex::ZERO);
+        assert_eq!(n.snapshot_last_index(), LogIndex::ZERO);
+    }
+
+    #[test]
+    fn snapshot_installed_adopts_the_snapshot_and_acks_the_leader() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(1);
+        drive(&mut n, deliver(2, install_snapshot(2, 2, 5, 3, true)));
+
+        let effects = n.step(
+            Input::SnapshotInstalled {
+                last_included_index: LogIndex::new(5),
+                last_included_term: Term::new(3),
+            },
+            NOW,
+        );
+
+        assert_eq!(n.commit_index(), LogIndex::new(5));
+        assert_eq!(n.last_applied(), LogIndex::new(5));
+        assert_eq!(n.snapshot_last_index(), LogIndex::new(5));
+        assert_eq!(n.log().term_at(LogIndex::new(5)), Some(Term::new(3)));
+        assert_eq!(effects, vec![snapshot_reply(2, 2, 5)]);
+    }
+
+    #[test]
+    fn install_snapshot_from_a_stale_leader_is_rejected_and_is_not_contact() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(5);
+
+        let effects = n.step(deliver(2, install_snapshot(2, 2, 9, 2, true)), NOW);
+
+        assert_eq!(n.current_term(), Term::new(5));
+        assert_eq!(n.snapshot_last_index(), LogIndex::ZERO);
+        // Only the rejecting reply -- no ResetElectionTimer.
+        assert_eq!(effects, vec![snapshot_reply(2, 5, 9)]);
+    }
+
+    #[test]
+    fn install_snapshot_already_covered_by_commit_index_acks_without_storing() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(2);
+        for _ in 0..10 {
+            n.log.append(entry(1));
+        }
+        n.commit_index = LogIndex::new(10);
+
+        let effects = n.step(deliver(2, install_snapshot(2, 2, 5, 1, true)), NOW);
+
+        assert_eq!(
+            effects,
+            vec![Effect::ResetElectionTimer, snapshot_reply(2, 2, 5)],
+        );
+        assert_eq!(n.snapshot_last_index(), LogIndex::ZERO);
+    }
+
+    #[test]
+    fn an_install_snapshot_reply_from_a_newer_term_steps_the_leader_down() {
+        let mut n = leader_with_compacted_log(3);
+
+        let effects = n.step(deliver(2, snapshot_reply_msg(9, 3)), NOW);
+
+        assert!(n.is_follower());
+        assert_eq!(n.current_term(), Term::new(9));
+        assert_eq!(
+            effects,
+            vec![Effect::Persist {
+                current_term: Term::new(9),
+                voted_for: None,
+            }],
         );
     }
 }

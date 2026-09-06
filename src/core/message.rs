@@ -69,7 +69,45 @@ pub struct AppendEntriesReply {
     pub match_index: LogIndex,
 }
 
-/// A message between peers: one of the four in Figure 2.
+/// Arguments for the `InstallSnapshot` RPC (Figure 13), sent by the leader to a
+/// follower whose next entry has been compacted into the leader's snapshot.
+///
+/// The snapshot bytes are transferred as an ordered sequence of chunks; only
+/// the final chunk carries `done = true`. The follower reassembles them and,
+/// once it has the whole snapshot durable, replies exactly once.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InstallSnapshotArgs {
+    /// The leader's term.
+    pub term: Term,
+    /// The leader, so a follower can redirect clients to it.
+    pub leader_id: NodeId,
+    /// The snapshot replaces every log entry up to and including this index.
+    pub last_included_index: LogIndex,
+    /// Term of the entry at `last_included_index`.
+    pub last_included_term: Term,
+    /// Byte offset of `data` within the complete snapshot.
+    pub offset: u64,
+    /// Snapshot bytes beginning at `offset`.
+    pub data: Vec<u8>,
+    /// Whether `data` reaches the end of the snapshot.
+    pub done: bool,
+}
+
+/// Reply to an `InstallSnapshot` RPC (Figure 13).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InstallSnapshotReply {
+    /// The responder's `currentTerm`, so a stale leader can step down.
+    pub term: Term,
+    /// The `last_included_index` the follower installed, echoed from the
+    /// request. Figure 13's reply carries only the term because there the
+    /// leader remembers what it sent; here the pure core handles the reply
+    /// without having sent the chunks itself (the driver holds the bytes), so
+    /// the follower echoes the index and the leader sets `matchIndex` from it.
+    pub last_included_index: LogIndex,
+}
+
+/// A message between peers: the four RPCs of Figure 2 plus `InstallSnapshot`
+/// (Figure 13).
 ///
 /// The core emits these inside [`Effect::SendRpc`](super::Effect::SendRpc) and
 /// receives them inside [`Input::Deliver`](super::Input::Deliver).
@@ -83,4 +121,9 @@ pub enum Message {
     AppendEntries(AppendEntriesArgs),
     /// A response to [`Message::AppendEntries`].
     AppendEntriesReply(AppendEntriesReply),
+    /// One chunk of a leader's snapshot, for a follower too far behind to catch
+    /// up from the log alone.
+    InstallSnapshot(InstallSnapshotArgs),
+    /// A response to [`Message::InstallSnapshot`].
+    InstallSnapshotReply(InstallSnapshotReply),
 }
