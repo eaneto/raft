@@ -137,7 +137,9 @@ impl Sim {
                 }
                 // No durability model yet, and nothing is committed to apply
                 // until log replication.
-                Effect::Persist { .. } | Effect::ApplyToStateMachine { .. } => {}
+                Effect::Persist { .. }
+                | Effect::PersistLog { .. }
+                | Effect::ApplyToStateMachine { .. } => {}
             }
         }
 

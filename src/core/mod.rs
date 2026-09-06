@@ -234,6 +234,18 @@ impl Log {
         self.get(index).map(|entry| entry.term)
     }
 
+    /// The entries from `index` to the end of the log, as a slice.
+    ///
+    /// `index` is 1-based: [`LogIndex::ZERO`] or `LogIndex::new(1)` yields the
+    /// whole log, and an `index` at or past `last_index().next()` yields an
+    /// empty slice. Used to build the `entries` an `AppendEntries` carries and
+    /// the tail an [`Effect::PersistLog`] makes durable.
+    #[must_use]
+    pub fn entries_from(&self, index: LogIndex) -> &[LogEntry] {
+        let start = usize::try_from(index.get().saturating_sub(1)).unwrap_or(usize::MAX);
+        self.entries.get(start..).unwrap_or(&[])
+    }
+
     /// Appends one entry to the end of the log.
     ///
     /// This is the only way the log grows. A leader only ever appends to its
@@ -341,9 +353,9 @@ pub enum Input {
 ///
 /// The core never acts on the world itself; [`RaftNode::step`] returns these in
 /// the order they must happen and the driver executes them. In particular,
-/// every [`Effect::Persist`] must be durable before the driver sends any
-/// [`Effect::SendRpc`] that follows it in the same batch (persist-before-reply,
-/// §8).
+/// every [`Effect::Persist`] and [`Effect::PersistLog`] must be durable before
+/// the driver sends any [`Effect::SendRpc`] that follows it in the same batch
+/// (persist-before-reply, §8).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
     /// Send `message` to peer `to`.
@@ -362,6 +374,22 @@ pub enum Effect {
         current_term: Term,
         /// The vote to persist.
         voted_for: Option<NodeId>,
+    },
+    /// Make the log durable from `from_index` onward before continuing.
+    ///
+    /// `entries` is the log's contents from `from_index` (1-based) to its end,
+    /// in order. A leader append sets `from_index` to one past the previous
+    /// last index, so `entries` is just the new tail; a follower splice
+    /// (step 5b) may pass a lower `from_index` to overwrite conflicting
+    /// entries. `from_index` is always `>= LogIndex::new(1)`.
+    ///
+    /// Like [`Effect::Persist`], this must be durable before any
+    /// [`Effect::SendRpc`] later in the same batch (persist-before-reply, §8).
+    PersistLog {
+        /// 1-based index of the first entry in `entries`.
+        from_index: LogIndex,
+        /// The log from `from_index` to the end, in order.
+        entries: Vec<LogEntry>,
     },
     /// Apply the committed entry at `index` to the application state machine.
     /// Emitted one entry at a time, in index order (Applied-in-order, §9.10).
@@ -442,8 +470,7 @@ impl RaftNode {
             },
             Input::ElectionTimeout => self.handle_election_timeout(),
             Input::HeartbeatTick => self.handle_heartbeat_tick(),
-            // Filled in by log replication.
-            Input::Propose { .. } => Vec::new(),
+            Input::Propose { command } => self.handle_propose(command),
         }
     }
 
@@ -586,14 +613,45 @@ impl RaftNode {
         effects
     }
 
-    /// Handles the heartbeat interval elapsing: a leader re-broadcasts
-    /// `AppendEntries` to reassert authority; every other role ignores it.
+    /// Handles the heartbeat interval elapsing: a leader re-sends
+    /// `AppendEntries` to reassert authority (carrying any entries a peer has
+    /// yet to acknowledge); every other role ignores it.
     fn handle_heartbeat_tick(&self) -> Vec<Effect> {
         if self.is_leader() {
-            self.broadcast_append_entries()
+            self.replicate_to_peers()
         } else {
             Vec::new()
         }
+    }
+
+    /// Handles a client proposal (Figure 2, "Clients of Raft").
+    ///
+    /// Only a leader acts: it appends one entry for `command` at its current
+    /// term, makes the new tail durable with [`Effect::PersistLog`], then
+    /// sends every peer the entries it is missing. Any other role drops the
+    /// proposal for now — client redirect to the leader is a later step.
+    ///
+    /// The entry is **not** committed here. `commitIndex` advances only once a
+    /// current-term majority has stored the entry (§5.4.2), which is the
+    /// leader-side ack handling of the next step; until then a lone leader
+    /// makes no progress either.
+    fn handle_propose(&mut self, command: Bytes) -> Vec<Effect> {
+        if !self.is_leader() {
+            return Vec::new();
+        }
+
+        let from_index = self.log.last_index().next();
+        self.log.append(LogEntry {
+            term: self.current_term,
+            command,
+        });
+
+        let mut effects = vec![Effect::PersistLog {
+            from_index,
+            entries: self.log.entries_from(from_index).to_vec(),
+        }];
+        effects.extend(self.replicate_to_peers());
+        effects
     }
 
     /// Adopts `term` as `currentTerm` and reverts to [`Role::Follower`].
@@ -635,8 +693,9 @@ impl RaftNode {
     }
 
     /// If we are a candidate holding a quorum of votes, become leader and
-    /// return the initial empty `AppendEntries` heartbeats that stop peers from
-    /// starting their own elections.
+    /// return the initial `AppendEntries` to every peer — empty while the log
+    /// has nothing past their `next_index` — that stop peers from starting
+    /// their own elections.
     fn promote_if_quorum(&mut self) -> Vec<Effect> {
         let has_quorum = match &self.role {
             Role::Candidate { votes_granted } => votes_granted.len() >= self.quorum(),
@@ -647,30 +706,55 @@ impl RaftNode {
         }
 
         self.become_leader();
-        self.broadcast_append_entries()
+        self.replicate_to_peers()
     }
 
-    /// Sends an `AppendEntries` to every peer.
-    ///
-    /// For now the payload is always an empty heartbeat; log replication will
-    /// make it per-peer, carrying the entries from `next_index` onward.
-    fn broadcast_append_entries(&self) -> Vec<Effect> {
-        let prev_log_index = self.log.last_index();
-        let prev_log_term = self.log.last_term();
+    /// Sends every peer an `AppendEntries` carrying the entries it is missing
+    /// according to its `next_index`. With every peer caught up this is a batch
+    /// of empty heartbeats; after a fresh `Propose` it carries the new tail.
+    /// Used on winning an election, on `HeartbeatTick`, and on `Propose`.
+    fn replicate_to_peers(&self) -> Vec<Effect> {
         self.peers
             .iter()
-            .map(|&peer| Effect::SendRpc {
-                to: peer,
-                message: Message::AppendEntries(AppendEntriesArgs {
-                    term: self.current_term,
-                    leader_id: self.id,
-                    prev_log_index,
-                    prev_log_term,
-                    entries: Vec::new(),
-                    leader_commit: self.commit_index,
-                }),
-            })
+            .map(|&peer| self.append_entries_to(peer))
             .collect()
+    }
+
+    /// Builds the `AppendEntries` for one peer from its `next_index`: the entry
+    /// just before `next_index` is the §5.3 consistency-check anchor
+    /// (`prev_log_index` / `prev_log_term`), and everything from `next_index`
+    /// to the end of the log rides along as `entries`.
+    fn append_entries_to(&self, peer: NodeId) -> Effect {
+        let next = self.next_index_for(peer);
+        let prev_log_index = next.prev();
+        let prev_log_term = self.log.term_at(prev_log_index).unwrap_or(Term::ZERO);
+        Effect::SendRpc {
+            to: peer,
+            message: Message::AppendEntries(AppendEntriesArgs {
+                term: self.current_term,
+                leader_id: self.id,
+                prev_log_index,
+                prev_log_term,
+                entries: self.log.entries_from(next).to_vec(),
+                leader_commit: self.commit_index,
+            }),
+        }
+    }
+
+    /// This leader's `next_index` for `peer`.
+    ///
+    /// [`RaftNode::become_leader`] seeds one entry per peer, so on the leader
+    /// path the map always contains `peer`. The fallback — one past the last
+    /// log index, the value `become_leader` itself uses — keeps the function
+    /// total for any off-path caller a future step might add.
+    fn next_index_for(&self, peer: NodeId) -> LogIndex {
+        match &self.role {
+            Role::Leader { next_index, .. } => next_index
+                .get(&peer)
+                .copied()
+                .unwrap_or_else(|| self.log.last_index().next()),
+            Role::Follower | Role::Candidate { .. } => self.log.last_index().next(),
+        }
     }
 
     /// The §5.4.1 "up-to-date" test: the candidate's last log entry is newer by
@@ -852,10 +936,40 @@ mod tests {
         }
     }
 
+    fn append_entries(
+        term: u64,
+        leader: u64,
+        prev_log_index: u64,
+        prev_log_term: u64,
+        entries: Vec<LogEntry>,
+    ) -> Message {
+        Message::AppendEntries(AppendEntriesArgs {
+            term: Term::new(term),
+            leader_id: NodeId::new(leader),
+            prev_log_index: LogIndex::new(prev_log_index),
+            prev_log_term: Term::new(prev_log_term),
+            entries,
+            leader_commit: LogIndex::ZERO,
+        })
+    }
+
+    fn send(to: u64, message: Message) -> Effect {
+        Effect::SendRpc {
+            to: NodeId::new(to),
+            message,
+        }
+    }
+
     fn deliver(from: u64, message: Message) -> Input {
         Input::Deliver {
             from: NodeId::new(from),
             message,
+        }
+    }
+
+    fn propose(command: &'static [u8]) -> Input {
+        Input::Propose {
+            command: Bytes::from_static(command),
         }
     }
 
@@ -964,6 +1078,24 @@ mod tests {
 
         log.truncate_after(LogIndex::new(9));
         assert_eq!(log.len(), 1);
+    }
+
+    #[test]
+    fn entries_from_returns_the_tail_slice() {
+        let empty: &[LogEntry] = &[];
+
+        let mut log = Log::new();
+        assert_eq!(log.entries_from(LogIndex::new(1)), empty);
+
+        log.append(entry(1));
+        log.append(entry(2));
+        log.append(entry(3));
+
+        assert_eq!(log.entries_from(LogIndex::ZERO).len(), 3);
+        assert_eq!(log.entries_from(LogIndex::new(1)).len(), 3);
+        assert_eq!(log.entries_from(LogIndex::new(3)), &[entry(3)]);
+        assert_eq!(log.entries_from(LogIndex::new(4)), empty);
+        assert_eq!(log.entries_from(LogIndex::new(99)), empty);
     }
 
     #[test]
@@ -1312,5 +1444,106 @@ mod tests {
 
         assert!(n.step(Input::HeartbeatTick, NOW).is_empty());
         assert!(n.is_follower());
+    }
+
+    #[test]
+    fn propose_on_a_non_leader_is_dropped() {
+        let mut n = node(1, &[2, 3]);
+
+        assert!(n.step(propose(b"cmd"), NOW).is_empty());
+        assert!(n.log().is_empty());
+        assert!(n.is_follower());
+
+        drive(&mut n, Input::ElectionTimeout); // candidate
+        assert!(n.step(propose(b"cmd"), NOW).is_empty());
+        assert!(n.log().is_empty());
+    }
+
+    #[test]
+    fn propose_on_a_leader_appends_persists_then_replicates() {
+        let mut n = node(1, &[2, 3]);
+        drive(&mut n, Input::ElectionTimeout);
+        drive(&mut n, deliver(2, vote_reply(1, true)));
+        assert!(n.is_leader());
+
+        let effects = n.step(propose(b"cmd"), NOW);
+
+        assert_eq!(n.log().len(), 1);
+        assert_eq!(n.log().get(LogIndex::new(1)), Some(&entry(1)));
+
+        let tail = vec![entry(1)];
+        assert_eq!(
+            effects,
+            vec![
+                Effect::PersistLog {
+                    from_index: LogIndex::new(1),
+                    entries: tail.clone(),
+                },
+                send(2, append_entries(1, 1, 0, 0, tail.clone())),
+                send(3, append_entries(1, 1, 0, 0, tail)),
+            ],
+        );
+    }
+
+    #[test]
+    fn persist_log_precedes_the_replicating_send_rpcs() {
+        let mut n = node(1, &[2, 3]);
+        drive(&mut n, Input::ElectionTimeout);
+        drive(&mut n, deliver(2, vote_reply(1, true)));
+
+        let effects = n.step(propose(b"cmd"), NOW);
+
+        let persist_at = effects
+            .iter()
+            .position(|e| matches!(e, Effect::PersistLog { .. }));
+        let first_send = effects
+            .iter()
+            .position(|e| matches!(e, Effect::SendRpc { .. }));
+        assert_eq!(persist_at, Some(0));
+        assert!(persist_at < first_send);
+    }
+
+    #[test]
+    fn a_second_proposal_replicates_the_whole_unacked_tail() {
+        let mut n = node(1, &[2, 3]);
+        drive(&mut n, Input::ElectionTimeout);
+        drive(&mut n, deliver(2, vote_reply(1, true)));
+
+        drive(&mut n, propose(b"cmd"));
+        let effects = n.step(propose(b"cmd"), NOW);
+
+        // No ack handling yet, so `next_index` for both peers is still 1: the
+        // PersistLog covers only the new entry, but the AppendEntries carries
+        // the whole uncommitted tail.
+        assert_eq!(n.log().len(), 2);
+        assert_eq!(
+            effects,
+            vec![
+                Effect::PersistLog {
+                    from_index: LogIndex::new(2),
+                    entries: vec![entry(1)],
+                },
+                send(2, append_entries(1, 1, 0, 0, vec![entry(1), entry(1)])),
+                send(3, append_entries(1, 1, 0, 0, vec![entry(1), entry(1)])),
+            ],
+        );
+    }
+
+    #[test]
+    fn heartbeat_tick_carries_entries_a_peer_has_not_acked() {
+        let mut n = node(1, &[2, 3]);
+        drive(&mut n, Input::ElectionTimeout);
+        drive(&mut n, deliver(2, vote_reply(1, true)));
+        drive(&mut n, propose(b"cmd"));
+
+        let effects = n.step(Input::HeartbeatTick, NOW);
+
+        assert_eq!(
+            effects,
+            vec![
+                send(2, append_entries(1, 1, 0, 0, vec![entry(1)])),
+                send(3, append_entries(1, 1, 0, 0, vec![entry(1)])),
+            ],
+        );
     }
 }
