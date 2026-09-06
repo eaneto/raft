@@ -276,11 +276,14 @@ impl<S: Storage, M: StateMachine> Driver<S, M> {
         };
 
         let peer_ids = config.peers.iter().map(|(id, _)| *id);
+        // Snapshot restore is wired up with the storage snapshot support; until
+        // then a recovered node always replays its whole log.
         let node = RaftNode::from_state(
             config.id,
             peer_ids,
             state.current_term,
             state.voted_for,
+            None,
             state.entries,
         );
 
@@ -353,6 +356,17 @@ impl<S: Storage, M: StateMachine> Driver<S, M> {
                 Effect::ResetElectionTimer => {
                     self.election_deadline =
                         Some(Instant::now() + random_timeout(&mut self.rng, &self.config));
+                }
+                Effect::SendSnapshot { .. } | Effect::StoreSnapshotChunk { .. } => {
+                    // Serving and receiving snapshots is wired up together with
+                    // the storage snapshot format and the state-machine
+                    // snapshot/restore hooks. Until then the core never emits
+                    // these: nothing compacts the log, so no peer is ever
+                    // behind the (always-zero) compaction base.
+                    log::error!(
+                        "node {}: snapshot effect before snapshot support is wired up",
+                        self.config.id,
+                    );
                 }
             }
         }

@@ -231,8 +231,17 @@ impl Sim {
                     );
                     self.applied[i].push((index.get(), command));
                 }
-                // No durability model in the simulator yet (that is step 6).
+                // The simulator has no durability model, so persistence
+                // effects are dropped.
                 Effect::Persist { .. } | Effect::PersistLog { .. } => {}
+                // Snapshot coverage lands with its own harness support; until
+                // then nothing compacts a log, so the core never emits these.
+                Effect::SendSnapshot { .. } | Effect::StoreSnapshotChunk { .. } => {
+                    unreachable!(
+                        "seed={}: snapshot effect before snapshot support",
+                        self.seed
+                    )
+                }
             }
         }
 
