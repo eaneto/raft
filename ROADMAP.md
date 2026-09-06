@@ -105,14 +105,21 @@ this file just tracks the sequence of small steps and what's done.
       → transport reconciliation. Sim + TCP integration coverage. Removed-node
       disruption pre-vote is Phase 2. — `8f632cc..30c0225`
 
+- [x] **Property-based tests** (`proptest`). `tests/harness/mod.rs` extracts the
+      `Sim` harness so `tests/simulation.rs` (curated seed batteries) and
+      `tests/proptest.rs` (random schedules) share it. `proptest.rs` generates
+      cluster sizes 3–5 and `Op` schedules (propose / tick / partition / heal /
+      add-learner), runs them through `Sim` — which asserts every safety
+      property after each step — then heals and asserts convergence. `just
+      proptest` runs 2048 cases. Wipes / voter removals stay in the curated
+      batteries (they can exceed the fault budget under a partition). —
+      `bf3f021..863105a`
+
 ## Next
 
-- [ ] **Property-based tests** (`proptest`). Random cluster sizes + event
-      schedules; assert the safety properties after every step; shrink to a
-      minimal failing schedule.
-- [ ] **Retire the prototype.** Bring `src/raft.rs` / `src/command.rs` up to
-      standard one module at a time (dropping its `#[allow(...)]` in `src/lib.rs`
-      in the same change), or delete each once the new code supersedes it.
+- [ ] **Retire the prototype.** Delete `src/raft.rs` / `src/command.rs` (the
+      new core + storage + transport + node supersede them) and drop their
+      `#[allow(...)]` markers and the unused `clap` dependency.
 
 ## Phase 2 (only once the above is solid and simulation-tested)
 
