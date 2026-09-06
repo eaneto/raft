@@ -39,6 +39,23 @@ impl StateMachine for SharedSm {
             guard.push(command.clone());
         }
     }
+
+    fn snapshot(&self) -> Bytes {
+        let commands: Vec<Vec<u8>> = match self.0.lock() {
+            Ok(guard) => guard.iter().map(|c| c.to_vec()).collect(),
+            Err(poisoned) => poisoned.into_inner().iter().map(|c| c.to_vec()).collect(),
+        };
+        Bytes::from(bincode::serialize(&commands).unwrap_or_default())
+    }
+
+    fn restore(&mut self, snapshot: &Bytes) {
+        let commands: Vec<Vec<u8>> = bincode::deserialize(snapshot).unwrap_or_default();
+        let restored: Vec<Bytes> = commands.into_iter().map(Bytes::from).collect();
+        match self.0.lock() {
+            Ok(mut guard) => *guard = restored,
+            Err(poisoned) => *poisoned.into_inner() = restored,
+        }
+    }
 }
 
 #[track_caller]
