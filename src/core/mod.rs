@@ -564,6 +564,27 @@ enum ChangePhase {
 /// abandoned. See [`ChangePhase::CatchingUp`].
 const CATCH_UP_TICKS: u32 = 40;
 
+/// Recovers the single-server change that turns `before` into `after`, or
+/// `None` if they differ by more than one server (which single-server changes
+/// never produce).
+fn diff_configs(before: &ClusterConfig, after: &ClusterConfig) -> Option<MembershipChange> {
+    let added: Vec<NodeId> = after
+        .voters()
+        .difference(before.voters())
+        .copied()
+        .collect();
+    let removed: Vec<NodeId> = before
+        .voters()
+        .difference(after.voters())
+        .copied()
+        .collect();
+    match (added.as_slice(), removed.as_slice()) {
+        ([id], []) => Some(MembershipChange::AddServer(*id)),
+        ([], [id]) => Some(MembershipChange::RemoveServer(*id)),
+        _ => None,
+    }
+}
+
 /// A point on the driver's logical timeline, in milliseconds from an arbitrary
 /// epoch.
 ///
@@ -1419,8 +1440,8 @@ impl RaftNode {
     /// §4.2.2).
     fn check_config_committed(&mut self, effects: &mut Vec<Effect>) {
         let Some(PendingChange {
+            change,
             phase: ChangePhase::Committing { config_index },
-            ..
         }) = &self.pending_change
         else {
             return;
@@ -1428,7 +1449,19 @@ impl RaftNode {
         if *config_index > self.commit_index {
             return;
         }
+        let change = *change;
         self.pending_change = None;
+        // Now that a removal is durable everywhere it matters, stop replicating
+        // to the removed peer.
+        if let MembershipChange::RemoveServer(id) = change
+            && let Role::Leader {
+                next_index,
+                match_index,
+            } = &mut self.role
+        {
+            next_index.remove(&id);
+            match_index.remove(&id);
+        }
         effects.push(Effect::MembershipChanged {
             config: self.config.clone(),
         });
@@ -1443,13 +1476,24 @@ impl RaftNode {
     /// voting (a removed peer), keeps a promoted learner's, and seeds any new
     /// voter.
     fn sync_replication_maps(&mut self) {
-        let keep: BTreeSet<NodeId> = self
+        let mut keep: BTreeSet<NodeId> = self
             .config
             .voters()
             .iter()
             .copied()
             .filter(|&voter| voter != self.id)
             .collect();
+        // Keep replicating to a peer being removed until the removal commits,
+        // so it learns it is no longer in the cluster (and does not sit there
+        // timing out and disrupting elections).
+        if let Some(PendingChange {
+            change: MembershipChange::RemoveServer(id),
+            phase: ChangePhase::Committing { .. },
+        }) = &self.pending_change
+            && *id != self.id
+        {
+            keep.insert(*id);
+        }
         let next = self.log.last_index().next();
         if let Role::Leader {
             next_index,
@@ -1662,6 +1706,57 @@ impl RaftNode {
             next_index,
             match_index,
         };
+        self.adopt_pending_config_change();
+    }
+
+    /// If the log ends with an uncommitted configuration entry, a previous
+    /// leader started a membership change that this one must finish. Rebuild
+    /// the pending change and keep replicating to the affected server (a
+    /// removed peer or a just-promoted learner) so it learns of the change and
+    /// stops disrupting elections.
+    fn adopt_pending_config_change(&mut self) {
+        let config_index = self.latest_config_index();
+        if config_index.get() == 0 || config_index <= self.commit_index {
+            return;
+        }
+        let previous = self.config_before(config_index);
+        let Some(change) = diff_configs(&previous, &self.config) else {
+            return;
+        };
+        let affected = match change {
+            MembershipChange::AddServer(id) | MembershipChange::RemoveServer(id) => id,
+        };
+        if affected != self.id {
+            let next = self.log.last_index().next();
+            if let Role::Leader {
+                next_index,
+                match_index,
+            } = &mut self.role
+            {
+                next_index.entry(affected).or_insert(next);
+                match_index.entry(affected).or_insert(LogIndex::ZERO);
+            }
+        }
+        self.pending_change = Some(PendingChange {
+            change,
+            phase: ChangePhase::Committing { config_index },
+        });
+    }
+
+    /// The configuration in force just before `config_index`: the previous
+    /// configuration entry in the log, or `base_config` if there is none.
+    fn config_before(&self, config_index: LogIndex) -> ClusterConfig {
+        let base = self.log.snapshot_last_index().get();
+        self.log
+            .entries_from(LogIndex::new(1))
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(pos, entry)| {
+                entry.as_config().is_some() && base + *pos as u64 + 1 < config_index.get()
+            })
+            .and_then(|(_, entry)| entry.as_config().cloned())
+            .unwrap_or_else(|| self.base_config.clone())
     }
 
     /// If we are a candidate holding a quorum of votes, become leader and
@@ -3429,6 +3524,45 @@ mod tests {
         // A fresh change can start again.
         let effects = n.step(change(MembershipChange::RemoveServer(NodeId::new(3))), NOW);
         assert!(!effects.is_empty());
+    }
+
+    #[test]
+    fn a_new_leader_adopts_an_uncommitted_configuration_change() {
+        // Node 1 leads {1,2,3}, appends RemoveServer(3), then loses leadership
+        // before the entry commits. A follower elected next must finish it.
+        let mut a = three_node_leader();
+        drive(
+            &mut a,
+            change(MembershipChange::RemoveServer(NodeId::new(3))),
+        );
+        let log = a.log().entries_from(LogIndex::new(1)).to_vec();
+        let term = a.current_term();
+
+        let mut b = node(2, &[1, 3]);
+        b.current_term = term;
+        for entry in log {
+            b.log.append(entry);
+        }
+        b.recompute_config();
+        // It has the config entry but has not committed it.
+        assert_eq!(b.config().len(), 2);
+        assert!(b.pending_change.is_none());
+
+        b.become_leader();
+
+        // The new leader picks the change back up and keeps talking to node 3.
+        assert!(matches!(
+            b.pending_change,
+            Some(super::PendingChange {
+                change: MembershipChange::RemoveServer(id),
+                ..
+            }) if id == NodeId::new(3)
+        ));
+        if let Role::Leader { next_index, .. } = b.role() {
+            assert!(next_index.contains_key(&NodeId::new(3)));
+        } else {
+            unreachable!("still leader");
+        }
     }
 
     #[test]

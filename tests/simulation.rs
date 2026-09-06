@@ -17,7 +17,8 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use raft::core::{
-    Effect, Input, InstallSnapshotArgs, LogIndex, LogicalInstant, Message, NodeId, RaftNode, Term,
+    Effect, Input, InstallSnapshotArgs, LogIndex, LogicalInstant, MembershipChange, Message,
+    NodeId, RaftNode, Term,
 };
 
 // Timer and network constants, in logical milliseconds. The heartbeat period
@@ -244,11 +245,13 @@ impl Sim {
                     self.election_deadline[i] = self.arm_election();
                 }
                 Effect::ApplyToStateMachine { index, command } => {
-                    let expected = self.applied[i].len() as u64 + 1;
-                    assert_eq!(
-                        index.get(),
-                        expected,
-                        "seed={}: node {i} applied index {} out of order (expected {expected})",
+                    // Configuration entries advance lastApplied without an apply
+                    // effect, so applied indices may skip -- but never repeat or
+                    // go backwards.
+                    let last_seen = self.applied[i].last().map_or(0, |(idx, _)| *idx);
+                    assert!(
+                        index.get() > last_seen,
+                        "seed={}: node {i} applied index {} out of order (after {last_seen})",
                         self.seed,
                         index.get(),
                     );
@@ -291,12 +294,18 @@ impl Sim {
         }
         self.maybe_compact(i);
 
-        // A leader runs no election timer; every other role has one armed. The
-        // core emits no explicit "stop timer", so reconcile against the role.
+        // A leader runs no election timer; a voter has one armed; a server not
+        // in its own configuration (a learner, or one just removed) is passive.
+        // The core emits no explicit "stop timer", so reconcile against role
+        // and membership.
         if self.nodes[i].is_leader() {
             self.election_deadline[i] = NEVER;
-        } else if self.election_deadline[i] == NEVER {
-            self.election_deadline[i] = self.arm_election();
+        } else if self.nodes[i].config().contains(self.ids[i]) {
+            if self.election_deadline[i] == NEVER || self.election_deadline[i] <= self.now {
+                self.election_deadline[i] = self.arm_election();
+            }
+        } else {
+            self.election_deadline[i] = NEVER;
         }
     }
 
@@ -426,6 +435,65 @@ impl Sim {
         self.prev_applied[i] = 0;
         self.election_deadline[i] = self.arm_election();
         self.heartbeat_deadline[i] = self.now + HEARTBEAT_PERIOD;
+    }
+
+    /// Brings a brand-new passive learner online and asks the sole leader to
+    /// add it. All the per-node parallel state grows by one.
+    fn add_server(&mut self, new_id: u64) {
+        let id = NodeId::new(new_id);
+        self.ids.push(id);
+        self.nodes.push(RaftNode::new_learner(id));
+        self.election_deadline.push(NEVER); // passive until it joins
+        self.heartbeat_deadline.push(self.now + HEARTBEAT_PERIOD);
+        self.groups.push(0);
+        self.applied.push(Vec::new());
+        self.snapshot.push(None);
+        self.prev_commit.push(0);
+        self.prev_applied.push(0);
+
+        let leader = self.sole_leader();
+        assert!(
+            leader.is_some(),
+            "seed={}: no leader to add through",
+            self.seed
+        );
+        self.step(
+            leader.unwrap_or(0),
+            Input::ChangeMembership {
+                change: MembershipChange::AddServer(id),
+            },
+        );
+        self.check_invariants();
+    }
+
+    /// Asks the sole leader to remove the server with id `victim_id`.
+    fn remove_server(&mut self, victim_id: u64) {
+        let leader = self.sole_leader();
+        assert!(
+            leader.is_some(),
+            "seed={}: no leader to remove through",
+            self.seed,
+        );
+        self.step(
+            leader.unwrap_or(0),
+            Input::ChangeMembership {
+                change: MembershipChange::RemoveServer(NodeId::new(victim_id)),
+            },
+        );
+        self.check_invariants();
+    }
+
+    /// Whether every currently-connected node that considers itself a voter
+    /// agrees `id` is (or is not) a voter. Nodes cut off by a partition are
+    /// skipped: without pre-vote (Phase 2) a removed node that never hears the
+    /// change keeps its stale view.
+    fn all_agree_member(&self, id: u64, expected: bool) -> bool {
+        let id = NodeId::new(id);
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|(i, node)| self.groups[*i] == 0 && node.config().contains(node.id()))
+            .all(|(_, node)| node.config().contains(id) == expected)
     }
 
     fn leaders(&self) -> Vec<usize> {
@@ -1242,5 +1310,219 @@ fn assert_lagging_follower_caught_up_by_snapshot(seed: u64) {
 fn a_lagging_follower_is_caught_up_by_a_snapshot() {
     for seed in seeds(&[1, 2, 3, 42, 1_000, 0x5EED, 7]) {
         assert_lagging_follower_caught_up_by_snapshot(seed);
+    }
+}
+
+// --- 9: single-server membership changes -------------------------------------
+
+const JITTER5: Net = Net {
+    drop_permille: 0,
+    dup_permille: 0,
+    jitter: 5,
+    repartition_every: 0,
+};
+
+/// A server added by the leader catches up as a passive learner, joins the
+/// configuration on every node, and then the four-node cluster keeps
+/// committing with everyone's applied sequence in agreement.
+fn assert_added_server_catches_up_and_votes(seed: u64) {
+    let mut sim = Sim::new(3, seed).with_net(JITTER5);
+    let leader = sim.run_until_leader(5_000);
+    for k in 0..4 {
+        sim.propose_at(leader, format!("pre-{k}").as_bytes());
+        sim.run_until(sim.now + 200);
+    }
+
+    sim.add_server(4);
+    let deadline = sim.now + 15_000;
+    while sim.now < deadline && !sim.all_agree_member(4, true) {
+        sim.run_until(sim.now + HEARTBEAT_PERIOD);
+    }
+    assert!(
+        sim.all_agree_member(4, true),
+        "seed={seed}: node 4 was not added to the configuration",
+    );
+
+    // The four-node cluster keeps making progress.
+    for k in 0..4 {
+        let current = sim.run_until_leader(8_000);
+        sim.propose_at(current, format!("post-{k}").as_bytes());
+        sim.run_until(sim.now + 300);
+    }
+    let reference = sim.applied_commands(0);
+    assert!(
+        reference.len() >= 8,
+        "seed={seed}: progress stalled after the add"
+    );
+    for i in 0..sim.nodes.len() {
+        let common = sim.applied_commands(i).len().min(reference.len());
+        assert_eq!(
+            sim.applied_commands(i)[..common],
+            reference[..common],
+            "seed={seed}: node {i} diverged after the add",
+        );
+    }
+}
+
+#[test]
+fn a_server_added_by_the_leader_catches_up_and_votes() {
+    for seed in seeds(&[1, 2, 3, 42, 1_000, 0x5EED]) {
+        assert_added_server_catches_up_and_votes(seed);
+    }
+}
+
+/// A server that is already partitioned away is removed: the connected
+/// majority recomputes its configuration and keeps committing as a smaller
+/// cluster. (The isolated node keeps its stale view until pre-vote, Phase 2.)
+fn assert_removed_server_stops_counting(seed: u64) {
+    let node_count = 5;
+    let mut sim = Sim::new(node_count, seed).with_net(JITTER5);
+    let leader = sim.run_until_leader(5_000);
+    sim.propose_at(leader, b"c0");
+    sim.run_until(sim.now + 300);
+
+    // Isolate a follower, then remove it.
+    let victim = (0..node_count).find(|&i| i != leader).unwrap_or(4);
+    let mut groups = vec![0usize; node_count];
+    groups[victim] = 1;
+    sim.set_groups(groups);
+    sim.run_until(sim.now + 400);
+
+    let _ = sim.run_until_leader(5_000);
+    sim.remove_server(sim.ids[victim].get());
+    let deadline = sim.now + 12_000;
+    while sim.now < deadline && !sim.all_agree_member(sim.ids[victim].get(), false) {
+        sim.run_until(sim.now + HEARTBEAT_PERIOD);
+    }
+    assert!(
+        sim.all_agree_member(sim.ids[victim].get(), false),
+        "seed={seed}: the connected majority did not drop the removed node",
+    );
+
+    // The four-node cluster keeps committing.
+    let l = sim.run_until_leader(5_000);
+    let before = sim.nodes[l].commit_index().get();
+    for k in 0..3 {
+        let current = sim.run_until_leader(5_000);
+        sim.propose_at(current, format!("c{k}").as_bytes());
+        sim.run_until(sim.now + 400);
+    }
+    let l = sim.run_until_leader(5_000);
+    let after = sim.nodes[l].commit_index().get();
+    assert!(
+        after > before,
+        "seed={seed}: the shrunk cluster stopped committing ({before} -> {after})",
+    );
+}
+
+#[test]
+fn a_removed_server_stops_counting_toward_quorum() {
+    for seed in seeds(&[1, 2, 3, 42, 1_000, 0x5EED]) {
+        assert_removed_server_stops_counting(seed);
+    }
+}
+
+/// A leader that removes itself steps down once the change commits, and a new
+/// leader emerges among the rest with the applied sequences still consistent.
+fn assert_leader_removing_itself_steps_down(seed: u64) {
+    let mut sim = Sim::new(3, seed).with_net(JITTER5);
+    let old = sim.run_until_leader(5_000);
+    sim.propose_at(old, b"x");
+    sim.run_until(sim.now + 300);
+
+    sim.remove_server(sim.ids[old].get());
+    sim.run_until(sim.now + 6_000);
+    assert!(
+        !sim.nodes[old].is_leader(),
+        "seed={seed}: the self-removed leader did not step down",
+    );
+
+    let fresh = sim.run_until_leader(8_000);
+    assert_ne!(fresh, old, "seed={seed}: the removed node is leading again");
+    sim.propose_at(fresh, b"y");
+    sim.run_until(sim.now + 2_000);
+
+    let reference = sim.applied_commands(fresh);
+    assert!(reference.len() >= 2, "seed={seed}: progress stalled");
+    for i in 0..sim.nodes.len() {
+        let common = sim.applied_commands(i).len().min(reference.len());
+        assert_eq!(
+            sim.applied_commands(i)[..common],
+            reference[..common],
+            "seed={seed}: node {i} diverged after the self-removal",
+        );
+    }
+}
+
+#[test]
+fn a_leader_that_removes_itself_steps_down() {
+    for seed in seeds(&[1, 2, 3, 42, 1_000, 0x5EED]) {
+        assert_leader_removing_itself_steps_down(seed);
+    }
+}
+
+/// Only one membership change runs at a time: a second request while the first
+/// is uncommitted is ignored.
+fn assert_one_change_at_a_time(seed: u64) {
+    let mut sim = Sim::new(3, seed).with_net(JITTER5);
+    let leader = sim.run_until_leader(5_000);
+    sim.propose_at(leader, b"x");
+    sim.run_until(sim.now + 200);
+
+    sim.add_server(4);
+    // Immediately try to remove node 3 while the add is still in flight.
+    sim.remove_server(3);
+    sim.run_until(sim.now + 12_000);
+
+    assert!(
+        sim.all_agree_member(3, true),
+        "seed={seed}: node 3 was removed despite a pending add",
+    );
+    assert!(
+        sim.all_agree_member(4, true),
+        "seed={seed}: the add did not complete",
+    );
+}
+
+#[test]
+fn only_one_membership_change_runs_at_a_time() {
+    for seed in seeds(&[1, 2, 3, 42, 1_000]) {
+        assert_one_change_at_a_time(seed);
+    }
+}
+
+/// An `AddServer` whose new server is unreachable is abandoned after the
+/// catch-up budget, leaving the cluster untouched.
+fn assert_catch_up_aborts_for_an_unreachable_server(seed: u64) {
+    let mut sim = Sim::new(3, seed).with_net(JITTER5);
+    let leader = sim.run_until_leader(5_000);
+    sim.propose_at(leader, b"x");
+    sim.run_until(sim.now + 200);
+
+    // Bring node 4 up but cut it off from everyone before the add.
+    sim.add_server(4);
+    let mut groups = vec![0usize; sim.nodes.len()];
+    groups[3] = 1;
+    sim.set_groups(groups);
+
+    sim.run_until(sim.now + 20_000);
+
+    assert!(
+        sim.all_agree_member(4, false),
+        "seed={seed}: an unreachable server was still added",
+    );
+    let current = sim.run_until_leader(5_000);
+    sim.propose_at(current, b"y");
+    sim.run_until(sim.now + 1_000);
+    assert!(
+        sim.nodes[current].commit_index().get() >= 2,
+        "seed={seed}: the cluster stalled after an aborted add",
+    );
+}
+
+#[test]
+fn a_catch_up_against_an_unreachable_server_aborts() {
+    for seed in seeds(&[1, 2, 3, 42, 1_000]) {
+        assert_catch_up_aborts_for_an_unreachable_server(seed);
     }
 }
