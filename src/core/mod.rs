@@ -19,6 +19,7 @@
 //! returns the [`Effect`]s the driver must carry out. Nothing in here performs
 //! IO, reads a real clock, spawns a thread, or draws randomness.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use bytes::Bytes;
@@ -252,21 +253,33 @@ impl Log {
     }
 }
 
-/// The role a server plays in the current term (paper §5.1).
+/// The role a server plays in the current term (paper §5.1), together with the
+/// volatile state that only makes sense in that role.
 ///
 /// A server is always in exactly one of these. It starts as [`Role::Follower`],
 /// becomes a [`Role::Candidate`] when its election timer fires, and becomes
-/// [`Role::Leader`] on winning an election.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// [`Role::Leader`] on winning an election. Keeping the per-role bookkeeping
+/// inside the variant means a follower simply has no `match_index` to get wrong.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Role {
     /// Passive: responds to leaders and candidates, and starts an election if
     /// it stops hearing from a leader.
     Follower,
     /// Actively soliciting votes for its own term.
-    Candidate,
+    Candidate {
+        /// Servers that have granted a vote this term, including this one. A
+        /// [`BTreeSet`] so the count is order-independent.
+        votes_granted: BTreeSet<NodeId>,
+    },
     /// Won the election for the current term; replicates the log and sends
-    /// heartbeats.
-    Leader,
+    /// heartbeats. Both maps are keyed by peer id and reinitialised on
+    /// election (Figure 2, "Volatile state on leaders").
+    Leader {
+        /// For each peer, the index of the next log entry to send it.
+        next_index: BTreeMap<NodeId, LogIndex>,
+        /// For each peer, the highest log index known to be replicated on it.
+        match_index: BTreeMap<NodeId, LogIndex>,
+    },
 }
 
 /// A point on the driver's logical timeline, in milliseconds from an arbitrary
@@ -412,16 +425,236 @@ impl RaftNode {
     /// Advances the state machine by one input and returns the effects the
     /// driver must perform, in order.
     ///
-    /// `now` is the driver's current [`LogicalInstant`]; the core compares
-    /// timeouts against it but never reads a clock of its own.
+    /// `now` is the driver's current [`LogicalInstant`]. This timer model keeps
+    /// election deadlines in the driver, so the core does not consult `now`
+    /// yet; it stays in the signature for the features that will (pre-vote, the
+    /// leader-disruption fix).
     #[must_use]
     pub fn step(&mut self, input: Input, now: LogicalInstant) -> Vec<Effect> {
-        // Skeleton: the boundary is in place but no input does anything yet.
-        // Leader election will handle `Deliver(RequestVote*)` and
-        // `ElectionTimeout`; log replication will handle `Deliver(AppendEntries*)`,
-        // `HeartbeatTick`, and `Propose`.
-        let _ = (input, now);
-        Vec::new()
+        let _ = now;
+        match input {
+            Input::Deliver { from, message } => match message {
+                Message::RequestVote(args) => self.handle_request_vote(args),
+                Message::RequestVoteReply(reply) => self.handle_request_vote_reply(from, reply),
+                // AppendEntries send/receive lands in the replication steps.
+                Message::AppendEntries(_) | Message::AppendEntriesReply(_) => Vec::new(),
+            },
+            Input::ElectionTimeout => self.handle_election_timeout(),
+            // Filled in by the heartbeat step and log replication.
+            Input::Propose { .. } | Input::HeartbeatTick => Vec::new(),
+        }
+    }
+
+    /// Handles an incoming `RequestVote` (Figure 2).
+    ///
+    /// Steps down first if the candidate's term is newer, rejects outright if
+    /// it is older, then grants the vote only when this server has not already
+    /// voted for someone else this term and the candidate's log is at least as
+    /// up-to-date as ours (§5.4.1). Any change to `currentTerm` / `votedFor` is
+    /// emitted as [`Effect::Persist`] before the reply (persist-before-reply).
+    fn handle_request_vote(&mut self, args: RequestVoteArgs) -> Vec<Effect> {
+        let before = (self.current_term, self.voted_for);
+        let mut effects = Vec::new();
+
+        if args.term > self.current_term {
+            self.become_follower(args.term);
+        }
+
+        if args.term < self.current_term {
+            effects.push(self.request_vote_reply(args.candidate_id, false));
+            return effects;
+        }
+
+        let voted_elsewhere = matches!(self.voted_for, Some(id) if id != args.candidate_id);
+        let granted = !voted_elsewhere
+            && self.candidate_log_is_up_to_date(args.last_log_index, args.last_log_term);
+        if granted {
+            self.voted_for = Some(args.candidate_id);
+        }
+
+        self.persist_if_changed(before, &mut effects);
+        if granted {
+            // Granting a vote counts as hearing from a viable leader-to-be.
+            effects.push(Effect::ResetElectionTimer);
+        }
+        effects.push(self.request_vote_reply(args.candidate_id, granted));
+        effects
+    }
+
+    /// Handles a `RequestVoteReply` while we are (or were) a candidate.
+    ///
+    /// A reply carrying a newer term makes us a follower. Otherwise, a granted
+    /// vote for our current term is tallied, and reaching a quorum promotes us
+    /// to leader.
+    fn handle_request_vote_reply(&mut self, from: NodeId, reply: RequestVoteReply) -> Vec<Effect> {
+        let before = (self.current_term, self.voted_for);
+        let mut effects = Vec::new();
+
+        if reply.term > self.current_term {
+            self.become_follower(reply.term);
+            self.persist_if_changed(before, &mut effects);
+            return effects;
+        }
+
+        if reply.term < self.current_term {
+            return effects;
+        }
+
+        if reply.vote_granted {
+            if let Role::Candidate { votes_granted } = &mut self.role {
+                votes_granted.insert(from);
+            }
+            effects.extend(self.promote_if_quorum());
+        }
+        effects
+    }
+
+    /// Handles the election timer firing: a follower or candidate starts a new
+    /// election for `currentTerm + 1` (paper §5.2).
+    ///
+    /// Term monotonicity holds by construction — [`RaftNode::become_candidate`]
+    /// only ever calls [`Term::next`], and a failed election just leaves us a
+    /// candidate at the higher term until the timer fires again.
+    fn handle_election_timeout(&mut self) -> Vec<Effect> {
+        if self.is_leader() {
+            return Vec::new();
+        }
+
+        self.become_candidate();
+
+        let mut effects = Vec::new();
+        // currentTerm and votedFor both just changed; make them durable before
+        // asking anyone for a vote.
+        effects.push(Effect::Persist {
+            current_term: self.current_term,
+            voted_for: self.voted_for,
+        });
+        let last_log_index = self.log.last_index();
+        let last_log_term = self.log.last_term();
+        for &peer in &self.peers {
+            effects.push(Effect::SendRpc {
+                to: peer,
+                message: Message::RequestVote(RequestVoteArgs {
+                    term: self.current_term,
+                    candidate_id: self.id,
+                    last_log_index,
+                    last_log_term,
+                }),
+            });
+        }
+        effects.push(Effect::ResetElectionTimer);
+        // A single-node cluster reaches quorum on its own vote right away.
+        effects.extend(self.promote_if_quorum());
+        effects
+    }
+
+    /// Adopts `term` as `currentTerm` and reverts to [`Role::Follower`].
+    ///
+    /// Clears `votedFor` only when the term actually advances, so a same-term
+    /// step-down (e.g. a candidate conceding to a leader) needs no new fsync.
+    /// Callers pass a `term` that is `>=` the current one.
+    fn become_follower(&mut self, term: Term) {
+        if term > self.current_term {
+            self.current_term = term;
+            self.voted_for = None;
+        }
+        self.role = Role::Follower;
+    }
+
+    /// Starts a candidacy: bump the term, vote for self, record that one vote.
+    fn become_candidate(&mut self) {
+        self.current_term = self.current_term.next();
+        self.voted_for = Some(self.id);
+        let mut votes_granted = BTreeSet::new();
+        votes_granted.insert(self.id);
+        self.role = Role::Candidate { votes_granted };
+    }
+
+    /// Becomes leader for the current term and reinitialises the per-peer
+    /// replication bookkeeping (Figure 2).
+    fn become_leader(&mut self) {
+        let next = self.log.last_index().next();
+        let next_index = self.peers.iter().map(|&peer| (peer, next)).collect();
+        let match_index = self
+            .peers
+            .iter()
+            .map(|&peer| (peer, LogIndex::ZERO))
+            .collect();
+        self.role = Role::Leader {
+            next_index,
+            match_index,
+        };
+    }
+
+    /// If we are a candidate holding a quorum of votes, become leader and
+    /// return the initial empty `AppendEntries` heartbeats that stop peers from
+    /// starting their own elections.
+    fn promote_if_quorum(&mut self) -> Vec<Effect> {
+        let has_quorum = match &self.role {
+            Role::Candidate { votes_granted } => votes_granted.len() >= self.quorum(),
+            Role::Follower | Role::Leader { .. } => false,
+        };
+        if !has_quorum {
+            return Vec::new();
+        }
+
+        self.become_leader();
+        let prev_log_index = self.log.last_index();
+        let prev_log_term = self.log.last_term();
+        self.peers
+            .iter()
+            .map(|&peer| Effect::SendRpc {
+                to: peer,
+                message: Message::AppendEntries(AppendEntriesArgs {
+                    term: self.current_term,
+                    leader_id: self.id,
+                    prev_log_index,
+                    prev_log_term,
+                    entries: Vec::new(),
+                    leader_commit: self.commit_index,
+                }),
+            })
+            .collect()
+    }
+
+    /// The §5.4.1 "up-to-date" test: the candidate's last log entry is newer by
+    /// term, or the same term and at least as long.
+    fn candidate_log_is_up_to_date(&self, last_log_index: LogIndex, last_log_term: Term) -> bool {
+        let our_term = self.log.last_term();
+        last_log_term > our_term
+            || (last_log_term == our_term && last_log_index >= self.log.last_index())
+    }
+
+    /// Pushes an [`Effect::Persist`] iff `currentTerm` or `votedFor` differs
+    /// from `before`. Call it before pushing any reply that depends on them.
+    fn persist_if_changed(&self, before: (Term, Option<NodeId>), effects: &mut Vec<Effect>) {
+        if (self.current_term, self.voted_for) != before {
+            effects.push(Effect::Persist {
+                current_term: self.current_term,
+                voted_for: self.voted_for,
+            });
+        }
+    }
+
+    /// Builds a `RequestVoteReply` effect addressed to `candidate`.
+    const fn request_vote_reply(&self, candidate: NodeId, vote_granted: bool) -> Effect {
+        Effect::SendRpc {
+            to: candidate,
+            message: Message::RequestVoteReply(RequestVoteReply {
+                term: self.current_term,
+                vote_granted,
+            }),
+        }
+    }
+
+    /// Number of servers in the cluster (peers plus self).
+    const fn cluster_size(&self) -> usize {
+        self.peers.len() + 1
+    }
+
+    /// Votes needed to win an election or commit an entry: a strict majority.
+    const fn quorum(&self) -> usize {
+        self.cluster_size() / 2 + 1
     }
 
     /// This server's id.
@@ -436,10 +669,28 @@ impl RaftNode {
         &self.peers
     }
 
-    /// The current role.
+    /// The current role and its per-role volatile state.
     #[must_use]
-    pub const fn role(&self) -> Role {
-        self.role
+    pub const fn role(&self) -> &Role {
+        &self.role
+    }
+
+    /// Whether this server is currently a follower.
+    #[must_use]
+    pub const fn is_follower(&self) -> bool {
+        matches!(self.role, Role::Follower)
+    }
+
+    /// Whether this server is currently a candidate.
+    #[must_use]
+    pub const fn is_candidate(&self) -> bool {
+        matches!(self.role, Role::Candidate { .. })
+    }
+
+    /// Whether this server is currently the leader.
+    #[must_use]
+    pub const fn is_leader(&self) -> bool {
+        matches!(self.role, Role::Leader { .. })
     }
 
     /// The current term.
@@ -478,15 +729,52 @@ mod tests {
     use bytes::Bytes;
 
     use super::{
-        Input, Log, LogEntry, LogIndex, LogicalInstant, Message, NodeId, RaftNode, RequestVoteArgs,
-        Role, Term,
+        AppendEntriesArgs, Effect, Input, Log, LogEntry, LogIndex, LogicalInstant, Message, NodeId,
+        RaftNode, RequestVoteArgs, RequestVoteReply, Role, Term,
     };
+
+    /// The core does not consult the clock under this timer model, so every
+    /// test steps at the same instant.
+    const NOW: LogicalInstant = LogicalInstant::START;
 
     fn entry(term: u64) -> LogEntry {
         LogEntry {
             term: Term::new(term),
             command: Bytes::from_static(b"cmd"),
         }
+    }
+
+    fn node(id: u64, peers: &[u64]) -> RaftNode {
+        RaftNode::new(NodeId::new(id), peers.iter().copied().map(NodeId::new))
+    }
+
+    fn request_vote(term: u64, candidate: u64, last_log_index: u64, last_log_term: u64) -> Message {
+        Message::RequestVote(RequestVoteArgs {
+            term: Term::new(term),
+            candidate_id: NodeId::new(candidate),
+            last_log_index: LogIndex::new(last_log_index),
+            last_log_term: Term::new(last_log_term),
+        })
+    }
+
+    fn vote_reply(term: u64, granted: bool) -> Message {
+        Message::RequestVoteReply(RequestVoteReply {
+            term: Term::new(term),
+            vote_granted: granted,
+        })
+    }
+
+    fn deliver(from: u64, message: Message) -> Input {
+        Input::Deliver {
+            from: NodeId::new(from),
+            message,
+        }
+    }
+
+    /// Steps the node for its side effects on state, discarding the effects.
+    /// Used to arrange a node into a role before the call under test.
+    fn drive(n: &mut RaftNode, input: Input) {
+        let _ = n.step(input, NOW);
     }
 
     #[test]
@@ -594,7 +882,7 @@ mod tests {
     fn new_node_is_a_follower_at_term_zero_with_an_empty_log() {
         let node = RaftNode::new(NodeId::new(1), [NodeId::new(2), NodeId::new(3)]);
         assert_eq!(node.id(), NodeId::new(1));
-        assert_eq!(node.role(), Role::Follower);
+        assert!(node.is_follower());
         assert_eq!(node.current_term(), Term::ZERO);
         assert_eq!(node.voted_for(), None);
         assert!(node.log().is_empty());
@@ -617,41 +905,212 @@ mod tests {
     }
 
     #[test]
-    fn step_is_a_no_op_for_every_input_in_the_skeleton() {
-        let mut node = RaftNode::new(NodeId::new(1), [NodeId::new(2), NodeId::new(3)]);
-        let now = LogicalInstant::START;
+    fn election_timeout_starts_a_candidacy_and_solicits_votes() {
+        let mut n = node(1, &[2, 3]);
 
-        assert!(node.step(Input::ElectionTimeout, now).is_empty());
-        assert!(node.step(Input::HeartbeatTick, now).is_empty());
-        assert!(
-            node.step(
-                Input::Propose {
-                    command: Bytes::from_static(b"x"),
+        let effects = n.step(Input::ElectionTimeout, NOW);
+
+        assert!(n.is_candidate());
+        assert_eq!(n.current_term(), Term::new(1));
+        assert_eq!(n.voted_for(), Some(NodeId::new(1)));
+        assert!(matches!(
+            n.role(),
+            Role::Candidate { votes_granted } if votes_granted.len() == 1
+        ));
+
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Persist {
+                    current_term: Term::new(1),
+                    voted_for: Some(NodeId::new(1)),
                 },
-                now,
-            )
-            .is_empty()
-        );
-
-        let vote = Message::RequestVote(RequestVoteArgs {
-            term: Term::new(1),
-            candidate_id: NodeId::new(2),
-            last_log_index: LogIndex::ZERO,
-            last_log_term: Term::ZERO,
-        });
-        assert!(
-            node.step(
-                Input::Deliver {
-                    from: NodeId::new(2),
-                    message: vote,
+                Effect::SendRpc {
+                    to: NodeId::new(2),
+                    message: request_vote(1, 1, 0, 0),
                 },
-                now,
-            )
-            .is_empty()
+                Effect::SendRpc {
+                    to: NodeId::new(3),
+                    message: request_vote(1, 1, 0, 0),
+                },
+                Effect::ResetElectionTimer,
+            ],
         );
+    }
 
-        // State is untouched.
-        assert_eq!(node.current_term(), Term::ZERO);
-        assert_eq!(node.role(), Role::Follower);
+    #[test]
+    fn a_failed_election_leaves_the_term_raised_not_rolled_back() {
+        let mut n = node(1, &[2, 3]);
+
+        drive(&mut n, Input::ElectionTimeout);
+        drive(&mut n, Input::ElectionTimeout);
+
+        assert_eq!(n.current_term(), Term::new(2));
+        assert!(n.is_candidate());
+    }
+
+    #[test]
+    fn single_node_cluster_elects_itself_immediately() {
+        let mut n = node(1, &[]);
+
+        let effects = n.step(Input::ElectionTimeout, NOW);
+
+        assert!(n.is_leader());
+        assert_eq!(n.current_term(), Term::new(1));
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Persist {
+                    current_term: Term::new(1),
+                    voted_for: Some(NodeId::new(1)),
+                },
+                Effect::ResetElectionTimer,
+            ],
+        );
+    }
+
+    #[test]
+    fn candidate_wins_on_a_quorum_and_sends_heartbeats() {
+        let mut n = node(1, &[2, 3]);
+        drive(&mut n, Input::ElectionTimeout);
+
+        let effects = n.step(deliver(2, vote_reply(1, true)), NOW);
+
+        assert!(n.is_leader());
+        let heartbeat = |to: u64| Effect::SendRpc {
+            to: NodeId::new(to),
+            message: Message::AppendEntries(AppendEntriesArgs {
+                term: Term::new(1),
+                leader_id: NodeId::new(1),
+                prev_log_index: LogIndex::ZERO,
+                prev_log_term: Term::ZERO,
+                entries: Vec::new(),
+                leader_commit: LogIndex::ZERO,
+            }),
+        };
+        assert_eq!(effects, vec![heartbeat(2), heartbeat(3)]);
+    }
+
+    #[test]
+    fn votes_arriving_after_the_win_are_ignored() {
+        let mut n = node(1, &[2, 3]);
+        drive(&mut n, Input::ElectionTimeout);
+        drive(&mut n, deliver(2, vote_reply(1, true)));
+        assert!(n.is_leader());
+
+        let effects = n.step(deliver(3, vote_reply(1, true)), NOW);
+
+        assert!(effects.is_empty());
+        assert!(n.is_leader());
+    }
+
+    #[test]
+    fn vote_is_granted_to_an_up_to_date_candidate_in_a_newer_term() {
+        let mut n = node(1, &[2, 3]);
+
+        let effects = n.step(deliver(2, request_vote(3, 2, 0, 0)), NOW);
+
+        assert!(n.is_follower());
+        assert_eq!(n.current_term(), Term::new(3));
+        assert_eq!(n.voted_for(), Some(NodeId::new(2)));
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Persist {
+                    current_term: Term::new(3),
+                    voted_for: Some(NodeId::new(2)),
+                },
+                Effect::ResetElectionTimer,
+                Effect::SendRpc {
+                    to: NodeId::new(2),
+                    message: vote_reply(3, true),
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn vote_is_denied_for_a_stale_term_without_touching_state() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(5);
+
+        let effects = n.step(deliver(2, request_vote(1, 2, 0, 0)), NOW);
+
+        assert_eq!(n.current_term(), Term::new(5));
+        assert_eq!(n.voted_for(), None);
+        assert_eq!(
+            effects,
+            vec![Effect::SendRpc {
+                to: NodeId::new(2),
+                message: vote_reply(5, false),
+            }],
+        );
+    }
+
+    #[test]
+    fn vote_is_denied_when_already_cast_for_another_candidate_this_term() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(2);
+        n.voted_for = Some(NodeId::new(2));
+
+        let effects = n.step(deliver(3, request_vote(2, 3, 0, 0)), NOW);
+
+        assert_eq!(n.voted_for(), Some(NodeId::new(2)));
+        assert_eq!(
+            effects,
+            vec![Effect::SendRpc {
+                to: NodeId::new(3),
+                message: vote_reply(2, false),
+            }],
+        );
+    }
+
+    #[test]
+    fn a_newer_term_steps_us_down_even_when_the_vote_is_denied() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(1);
+        n.log.append(entry(1)); // our last entry: index 1, term 1
+
+        // Candidate 2 is in term 4 but its log is empty, so it is not
+        // up-to-date: deny the vote, but still adopt the newer term.
+        let effects = n.step(deliver(2, request_vote(4, 2, 0, 0)), NOW);
+
+        assert!(n.is_follower());
+        assert_eq!(n.current_term(), Term::new(4));
+        assert_eq!(n.voted_for(), None);
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Persist {
+                    current_term: Term::new(4),
+                    voted_for: None,
+                },
+                Effect::SendRpc {
+                    to: NodeId::new(2),
+                    message: vote_reply(4, false),
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn a_reply_with_a_newer_term_makes_a_leader_step_down() {
+        let mut n = node(1, &[2, 3]);
+        drive(&mut n, Input::ElectionTimeout);
+        drive(&mut n, deliver(2, vote_reply(1, true)));
+        assert!(n.is_leader());
+
+        let effects = n.step(deliver(3, vote_reply(6, false)), NOW);
+
+        assert!(n.is_follower());
+        assert_eq!(n.current_term(), Term::new(6));
+        assert_eq!(n.voted_for(), None);
+        assert_eq!(
+            effects,
+            vec![Effect::Persist {
+                current_term: Term::new(6),
+                voted_for: None,
+            }],
+        );
     }
 }
