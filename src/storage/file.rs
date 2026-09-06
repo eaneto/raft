@@ -244,16 +244,26 @@ impl FileStorage {
         let data_len = u64::from_le_bytes([
             body[16], body[17], body[18], body[19], body[20], body[21], body[22], body[23],
         ]);
-        let data = usize::try_from(data_len)
-            .ok()
-            .and_then(|len| body.get(24..)?.get(..len))
+        let data_len = usize::try_from(data_len).map_err(|_| Error::Corrupt {
+            detail: "snapshot data length does not fit in memory".to_string(),
+        })?;
+        let data = body
+            .get(24..)
+            .and_then(|rest| rest.get(..data_len))
             .ok_or_else(|| Error::Corrupt {
                 detail: "snapshot data is shorter than its length prefix".to_string(),
             })?;
+        let after_data = body.get(24 + data_len..).ok_or_else(|| Error::Corrupt {
+            detail: "snapshot is missing its configuration".to_string(),
+        })?;
+        let config = decode_voters(after_data).ok_or_else(|| Error::Corrupt {
+            detail: "snapshot configuration is malformed".to_string(),
+        })?;
         Ok(Some(Snapshot {
             meta: SnapshotMeta {
                 last_included_index: LogIndex::new(index),
                 last_included_term: Term::new(term),
+                config,
             },
             data: Bytes::copy_from_slice(data),
         }))
@@ -430,7 +440,7 @@ impl Storage for FileStorage {
         //    has reached the disk.
         let tmp = self.dir.join(SNAPSHOT_TMP);
         let final_path = self.dir.join(SNAPSHOT_FILE);
-        let record = encode_snapshot(meta, data);
+        let record = encode_snapshot(&meta, data);
         {
             let mut file = OpenOptions::new()
                 .write(true)
@@ -561,18 +571,41 @@ fn encode_metadata(current_term: Term, voted_for: Option<NodeId>) -> [u8; META_L
 }
 
 /// `[u32 LE crc32c of the rest][u64 LE last_included_index][u64 LE
-/// last_included_term][u64 LE data length][data]`.
-fn encode_snapshot(meta: SnapshotMeta, data: &[u8]) -> Vec<u8> {
+/// last_included_term][u64 LE data length][data][u32 LE voter count][u64 LE
+/// voter id]*count`.
+fn encode_snapshot(meta: &SnapshotMeta, data: &[u8]) -> Vec<u8> {
     let mut body = Vec::with_capacity(SNAPSHOT_HEAD_LEN - 4 + data.len());
     body.extend_from_slice(&meta.last_included_index.get().to_le_bytes());
     body.extend_from_slice(&meta.last_included_term.get().to_le_bytes());
     body.extend_from_slice(&(data.len() as u64).to_le_bytes());
     body.extend_from_slice(data);
+    let count = u32::try_from(meta.config.voters().len()).unwrap_or(u32::MAX);
+    body.extend_from_slice(&count.to_le_bytes());
+    for id in meta.config.voters() {
+        body.extend_from_slice(&id.get().to_le_bytes());
+    }
 
     let mut out = Vec::with_capacity(4 + body.len());
     out.extend_from_slice(&crc32c(&body).to_le_bytes());
     out.extend_from_slice(&body);
     out
+}
+
+/// Decodes `[u32 LE count][u64 LE id]*count` into a [`ClusterConfig`].
+fn decode_voters(bytes: &[u8]) -> Option<ClusterConfig> {
+    let count = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?) as usize;
+    let ids = bytes.get(4..)?;
+    if ids.len() != count * 8 {
+        return None;
+    }
+    let mut voters = Vec::with_capacity(count);
+    for k in 0..count {
+        let start = k * 8;
+        voters.push(NodeId::new(u64::from_le_bytes(
+            ids.get(start..start + 8)?.try_into().ok()?,
+        )));
+    }
+    Some(ClusterConfig::new(voters))
 }
 
 /// One metadata copy as read from disk.
@@ -739,6 +772,7 @@ mod tests {
         SnapshotMeta {
             last_included_index: LogIndex::new(index),
             last_included_term: Term::new(term),
+            config: ClusterConfig::new([NodeId::new(1), NodeId::new(2), NodeId::new(3)]),
         }
     }
 
@@ -1031,7 +1065,7 @@ mod tests {
         // never rewritten, so it still holds all four records with header 1.
         ok(fs::write(
             dir.path().join("snapshot"),
-            encode_snapshot(snap_meta(2, 1), b"recovered"),
+            encode_snapshot(&snap_meta(2, 1), b"recovered"),
         )
         .map_err(|source| Error::Io {
             path: dir.path().join("snapshot"),

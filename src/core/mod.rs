@@ -628,6 +628,8 @@ pub enum Input {
         last_included_index: LogIndex,
         /// Term of the entry at `last_included_index`.
         last_included_term: Term,
+        /// The configuration in force at `last_included_index`.
+        config: ClusterConfig,
     },
     /// The driver has durably stored a snapshot the state machine produced from
     /// its own applied entries; the core may now drop the covered log prefix.
@@ -724,6 +726,8 @@ pub enum Effect {
         last_included_index: LogIndex,
         /// Term of the entry at `last_included_index`.
         last_included_term: Term,
+        /// The configuration in force at `last_included_index`.
+        config: ClusterConfig,
         /// Byte offset of `data` within the complete snapshot.
         offset: u64,
         /// Snapshot bytes beginning at `offset`.
@@ -828,16 +832,17 @@ impl RaftNode {
         peers: impl IntoIterator<Item = NodeId>,
         current_term: Term,
         voted_for: Option<NodeId>,
-        snapshot: Option<(LogIndex, Term)>,
+        snapshot: Option<(LogIndex, Term, ClusterConfig)>,
         entries: Vec<LogEntry>,
     ) -> Self {
         let mut node = Self::new(id, peers);
         node.current_term = current_term;
         node.voted_for = voted_for;
         node.log = match snapshot {
-            Some((index, term)) => {
+            Some((index, term, config)) => {
                 node.commit_index = index;
                 node.last_applied = index;
+                node.base_config = config;
                 Log::from_snapshot(index, term, entries)
             }
             None => Log::from_entries(entries),
@@ -894,7 +899,8 @@ impl RaftNode {
             Input::SnapshotInstalled {
                 last_included_index,
                 last_included_term,
-            } => self.handle_snapshot_installed(last_included_index, last_included_term),
+                config,
+            } => self.handle_snapshot_installed(last_included_index, last_included_term, config),
             Input::CompactLog { up_to_index } => self.handle_compact_log(up_to_index),
             Input::ChangeMembership { change } => self.handle_change_membership(change),
         }
@@ -1161,6 +1167,7 @@ impl RaftNode {
         effects.push(Effect::StoreSnapshotChunk {
             last_included_index: args.last_included_index,
             last_included_term: args.last_included_term,
+            config: args.config.clone(),
             offset: args.offset,
             data: args.data.clone(),
             done: args.done,
@@ -1207,10 +1214,14 @@ impl RaftNode {
         &mut self,
         last_included_index: LogIndex,
         last_included_term: Term,
+        config: ClusterConfig,
     ) -> Vec<Effect> {
         let mut effects = Vec::new();
 
         self.log.compact(last_included_index, last_included_term);
+        // The snapshot's configuration becomes the floor once its entries are
+        // gone from the log.
+        self.base_config = config;
         self.recompute_config();
         self.commit_index = self.commit_index.max(last_included_index);
         if self.last_applied < last_included_index {
@@ -2007,6 +2018,7 @@ mod tests {
             leader_id: NodeId::new(leader),
             last_included_index: LogIndex::new(last_included_index),
             last_included_term: Term::new(last_included_term),
+            config: config(&[1, 2, 3]),
             offset: 0,
             data: b"snap".to_vec(),
             done,
@@ -3130,6 +3142,7 @@ mod tests {
                 Effect::StoreSnapshotChunk {
                     last_included_index: LogIndex::new(5),
                     last_included_term: Term::new(1),
+                    config: config(&[1, 2, 3]),
                     offset: 0,
                     data: b"snap".to_vec(),
                     done: true,
@@ -3151,6 +3164,7 @@ mod tests {
             Input::SnapshotInstalled {
                 last_included_index: LogIndex::new(5),
                 last_included_term: Term::new(3),
+                config: config(&[1, 2, 3, 4]),
             },
             NOW,
         );
@@ -3159,6 +3173,8 @@ mod tests {
         assert_eq!(n.last_applied(), LogIndex::new(5));
         assert_eq!(n.snapshot_last_index(), LogIndex::new(5));
         assert_eq!(n.log().term_at(LogIndex::new(5)), Some(Term::new(3)));
+        // The snapshot's configuration is adopted.
+        assert_eq!(n.config(), &config(&[1, 2, 3, 4]));
         assert_eq!(effects, vec![snapshot_reply(2, 2, 5)]);
     }
 

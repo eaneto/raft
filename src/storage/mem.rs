@@ -182,13 +182,14 @@ mod tests {
     use bytes::Bytes;
 
     use super::{MemStorage, SyncFault};
-    use crate::core::{LogEntry, LogIndex, NodeId, Term};
+    use crate::core::{ClusterConfig, LogEntry, LogIndex, NodeId, Term};
     use crate::storage::{Error, PersistentState, SnapshotMeta, Storage};
 
     fn snap_meta(index: u64, term: u64) -> SnapshotMeta {
         SnapshotMeta {
             last_included_index: LogIndex::new(index),
             last_included_term: Term::new(term),
+            config: ClusterConfig::new([NodeId::new(1), NodeId::new(2), NodeId::new(3)]),
         }
     }
 

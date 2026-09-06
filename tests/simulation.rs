@@ -269,6 +269,7 @@ impl Sim {
                 Effect::StoreSnapshotChunk {
                     last_included_index,
                     last_included_term,
+                    config,
                     data,
                     ..
                 } => {
@@ -279,6 +280,7 @@ impl Sim {
                     followups.push(Input::SnapshotInstalled {
                         last_included_index,
                         last_included_term,
+                        config,
                     });
                 }
             }
@@ -309,6 +311,7 @@ impl Sim {
             leader_id: self.nodes[i].id(),
             last_included_index: LogIndex::new(last_index),
             last_included_term: Term::new(last_term),
+            config: self.nodes[i].config().clone(),
             offset: 0,
             data: encode_applied(&prefix),
             done: true,
