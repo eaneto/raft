@@ -14,11 +14,20 @@
 //! spawns no threads, and draws no randomness.
 //!
 //! On top of the identifiers sit [`LogEntry`] and [`Log`], the replicated log
-//! and its 1-based indexing.
+//! and its 1-based indexing. [`RaftNode::step`] is the core's whole public
+//! surface: it takes an [`Input`] plus the current [`LogicalInstant`] and
+//! returns the [`Effect`]s the driver must carry out. Nothing in here performs
+//! IO, reads a real clock, spawns a thread, or draws randomness.
 
 use std::fmt;
 
 use bytes::Bytes;
+
+mod message;
+
+pub use message::{
+    AppendEntriesArgs, AppendEntriesReply, Message, RequestVoteArgs, RequestVoteReply,
+};
 
 /// A Raft term: a logical clock that increases monotonically over the life of
 /// the cluster.
@@ -243,11 +252,235 @@ impl Log {
     }
 }
 
+/// The role a server plays in the current term (paper §5.1).
+///
+/// A server is always in exactly one of these. It starts as [`Role::Follower`],
+/// becomes a [`Role::Candidate`] when its election timer fires, and becomes
+/// [`Role::Leader`] on winning an election.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// Passive: responds to leaders and candidates, and starts an election if
+    /// it stops hearing from a leader.
+    Follower,
+    /// Actively soliciting votes for its own term.
+    Candidate,
+    /// Won the election for the current term; replicates the log and sends
+    /// heartbeats.
+    Leader,
+}
+
+/// A point on the driver's logical timeline, in milliseconds from an arbitrary
+/// epoch.
+///
+/// The core never reads a real clock: the driver stamps every [`RaftNode::step`]
+/// call with the current instant, and the core only ever *compares* instants.
+/// The unit and epoch are the driver's business.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LogicalInstant(u64);
+
+impl LogicalInstant {
+    /// The zero instant, for tests and for a freshly started driver.
+    pub const START: Self = Self(0);
+
+    /// Builds an instant from a millisecond count.
+    #[must_use]
+    pub const fn from_millis(millis: u64) -> Self {
+        Self(millis)
+    }
+
+    /// The millisecond count.
+    #[must_use]
+    pub const fn as_millis(self) -> u64 {
+        self.0
+    }
+}
+
+/// Something that drives the core forward: a peer message, a client request, or
+/// a timer firing.
+///
+/// The driver builds these from real IO and hands them to [`RaftNode::step`]
+/// one at a time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Input {
+    /// A [`Message`] received from `from`. The sender is carried here rather
+    /// than in the message so the Figure 2 reply types need no sender field.
+    Deliver {
+        /// The peer the message was received from.
+        from: NodeId,
+        /// The message itself.
+        message: Message,
+    },
+    /// A client asks the cluster to append and eventually commit a command.
+    /// Only a leader acts on it; other roles reject or redirect (a later step).
+    Propose {
+        /// The opaque command bytes.
+        command: Bytes,
+    },
+    /// The election timer expired: no leader contact within the randomized
+    /// window the driver chose. A follower or candidate starts a new election.
+    ElectionTimeout,
+    /// The periodic heartbeat interval elapsed. Acted on only while
+    /// [`Role::Leader`].
+    HeartbeatTick,
+}
+
+/// A side effect the core needs the driver to perform.
+///
+/// The core never acts on the world itself; [`RaftNode::step`] returns these in
+/// the order they must happen and the driver executes them. In particular,
+/// every [`Effect::Persist`] must be durable before the driver sends any
+/// [`Effect::SendRpc`] that follows it in the same batch (persist-before-reply,
+/// §8).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Effect {
+    /// Send `message` to peer `to`.
+    SendRpc {
+        /// The destination peer.
+        to: NodeId,
+        /// The message to send.
+        message: Message,
+    },
+    /// Flush the persistent state to stable storage before continuing.
+    ///
+    /// The payload is the paper's "persistent state on all servers" minus the
+    /// log; log durability gets its own effect in the storage step.
+    Persist {
+        /// The term to persist.
+        current_term: Term,
+        /// The vote to persist.
+        voted_for: Option<NodeId>,
+    },
+    /// Apply the committed entry at `index` to the application state machine.
+    /// Emitted one entry at a time, in index order (Applied-in-order, §9.10).
+    ApplyToStateMachine {
+        /// Index of the entry to apply.
+        index: LogIndex,
+        /// The entry's command bytes.
+        command: Bytes,
+    },
+    /// Restart the election timer with a fresh randomized duration (the driver
+    /// owns the range and the seeded RNG).
+    ResetElectionTimer,
+}
+
+/// A single Raft server: the pure state machine.
+///
+/// All behaviour flows through [`RaftNode::step`]. The struct holds only the
+/// state from Figure 2; the driver holds the clock, RNG, storage, transport,
+/// and timers.
+#[derive(Clone, Debug)]
+pub struct RaftNode {
+    id: NodeId,
+    /// Other servers in the cluster, sorted and deduplicated so that iteration
+    /// order never influences behaviour.
+    peers: Vec<NodeId>,
+
+    // Persistent state (Figure 2) — the driver must have these durable before
+    // replying to an RPC that depends on them.
+    current_term: Term,
+    voted_for: Option<NodeId>,
+    log: Log,
+
+    // Volatile state (Figure 2).
+    commit_index: LogIndex,
+    last_applied: LogIndex,
+    role: Role,
+}
+
+impl RaftNode {
+    /// Creates a fresh follower: term 0, no vote, empty log, nothing committed.
+    ///
+    /// `peers` is the set of *other* servers; `id` is removed from it if
+    /// present, and the rest is sorted and deduplicated.
+    #[must_use]
+    pub fn new(id: NodeId, peers: impl IntoIterator<Item = NodeId>) -> Self {
+        let mut peers: Vec<NodeId> = peers.into_iter().filter(|peer| *peer != id).collect();
+        peers.sort_unstable();
+        peers.dedup();
+        Self {
+            id,
+            peers,
+            current_term: Term::ZERO,
+            voted_for: None,
+            log: Log::new(),
+            commit_index: LogIndex::ZERO,
+            last_applied: LogIndex::ZERO,
+            role: Role::Follower,
+        }
+    }
+
+    /// Advances the state machine by one input and returns the effects the
+    /// driver must perform, in order.
+    ///
+    /// `now` is the driver's current [`LogicalInstant`]; the core compares
+    /// timeouts against it but never reads a clock of its own.
+    #[must_use]
+    pub fn step(&mut self, input: Input, now: LogicalInstant) -> Vec<Effect> {
+        // Skeleton: the boundary is in place but no input does anything yet.
+        // Leader election will handle `Deliver(RequestVote*)` and
+        // `ElectionTimeout`; log replication will handle `Deliver(AppendEntries*)`,
+        // `HeartbeatTick`, and `Propose`.
+        let _ = (input, now);
+        Vec::new()
+    }
+
+    /// This server's id.
+    #[must_use]
+    pub const fn id(&self) -> NodeId {
+        self.id
+    }
+
+    /// The other servers in the cluster, sorted.
+    #[must_use]
+    pub fn peers(&self) -> &[NodeId] {
+        &self.peers
+    }
+
+    /// The current role.
+    #[must_use]
+    pub const fn role(&self) -> Role {
+        self.role
+    }
+
+    /// The current term.
+    #[must_use]
+    pub const fn current_term(&self) -> Term {
+        self.current_term
+    }
+
+    /// The candidate this server has voted for in the current term, if any.
+    #[must_use]
+    pub const fn voted_for(&self) -> Option<NodeId> {
+        self.voted_for
+    }
+
+    /// The replicated log.
+    #[must_use]
+    pub const fn log(&self) -> &Log {
+        &self.log
+    }
+
+    /// The highest log index known to be committed.
+    #[must_use]
+    pub const fn commit_index(&self) -> LogIndex {
+        self.commit_index
+    }
+
+    /// The highest log index applied to the application state machine.
+    #[must_use]
+    pub const fn last_applied(&self) -> LogIndex {
+        self.last_applied
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
 
-    use super::{Log, LogEntry, LogIndex, NodeId, Term};
+    use super::{
+        Input, Log, LogEntry, LogIndex, LogicalInstant, Message, NodeId, RaftNode, RequestVoteArgs,
+        Role, Term,
+    };
 
     fn entry(term: u64) -> LogEntry {
         LogEntry {
@@ -355,5 +588,70 @@ mod tests {
 
         log.truncate_after(LogIndex::new(9));
         assert_eq!(log.len(), 1);
+    }
+
+    #[test]
+    fn new_node_is_a_follower_at_term_zero_with_an_empty_log() {
+        let node = RaftNode::new(NodeId::new(1), [NodeId::new(2), NodeId::new(3)]);
+        assert_eq!(node.id(), NodeId::new(1));
+        assert_eq!(node.role(), Role::Follower);
+        assert_eq!(node.current_term(), Term::ZERO);
+        assert_eq!(node.voted_for(), None);
+        assert!(node.log().is_empty());
+        assert_eq!(node.commit_index(), LogIndex::ZERO);
+        assert_eq!(node.last_applied(), LogIndex::ZERO);
+    }
+
+    #[test]
+    fn new_node_drops_self_from_peers_then_sorts_and_dedups() {
+        let node = RaftNode::new(
+            NodeId::new(2),
+            [
+                NodeId::new(3),
+                NodeId::new(2),
+                NodeId::new(1),
+                NodeId::new(3),
+            ],
+        );
+        assert_eq!(node.peers(), [NodeId::new(1), NodeId::new(3)]);
+    }
+
+    #[test]
+    fn step_is_a_no_op_for_every_input_in_the_skeleton() {
+        let mut node = RaftNode::new(NodeId::new(1), [NodeId::new(2), NodeId::new(3)]);
+        let now = LogicalInstant::START;
+
+        assert!(node.step(Input::ElectionTimeout, now).is_empty());
+        assert!(node.step(Input::HeartbeatTick, now).is_empty());
+        assert!(
+            node.step(
+                Input::Propose {
+                    command: Bytes::from_static(b"x"),
+                },
+                now,
+            )
+            .is_empty()
+        );
+
+        let vote = Message::RequestVote(RequestVoteArgs {
+            term: Term::new(1),
+            candidate_id: NodeId::new(2),
+            last_log_index: LogIndex::ZERO,
+            last_log_term: Term::ZERO,
+        });
+        assert!(
+            node.step(
+                Input::Deliver {
+                    from: NodeId::new(2),
+                    message: vote,
+                },
+                now,
+            )
+            .is_empty()
+        );
+
+        // State is untouched.
+        assert_eq!(node.current_term(), Term::ZERO);
+        assert_eq!(node.role(), Role::Follower);
     }
 }
