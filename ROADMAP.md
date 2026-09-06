@@ -19,7 +19,8 @@ this file just tracks the sequence of small steps and what's done.
 | Command payload | `bytes::Bytes` — opaque, core stays non-generic |
 | `Role` | enum carrying per-role state: `Candidate { votes_granted }`, `Leader { next_index, match_index }` |
 | Timers | driver owns them; core emits `Effect::ResetElectionTimer`, receives `Input::ElectionTimeout` / `HeartbeatTick` |
-| `Effect::Persist` | `{ current_term, voted_for }` for now — log persistence shape TBD in step 5 |
+| `Effect::Persist` | `{ current_term, voted_for }` — metadata only |
+| `Effect::PersistLog` | `{ from_index, entries }` — a delta: the log from `from_index` (1-based) onward, in full. Append sets `from_index` past the old tail; a follower splice can step it back over conflicts |
 | Message sender | `Input::Deliver { from, .. }` carries it, so Figure 2 reply structs stay sender-free |
 | Sim harness | lean, inline in `tests/simulation.rs`; grow in place |
 
@@ -31,14 +32,13 @@ this file just tracks the sequence of small steps and what's done.
 - [x] **4a. Election: `RequestVote` + candidacy** (term rules, §5.4.1 up-to-date, one vote/term, persist-before-reply, win → heartbeats) — `a32f718`
 - [x] **4b-i. `AppendEntries` receiver + `HeartbeatTick`** (term/role rules, §5.3 log-match check, timer reset on contact; no append yet) — `f996472`
 - [x] **4b-ii. Simulation: one stable leader** (lean harness; 3- and 5-node, seed battery) — `59f38c3`
+- [x] **5a. Leader append & replicate** (`Propose` on a leader appends at the
+      current term, emits `Effect::PersistLog` for the new tail, replicates via a
+      unified `append_entries_to(peer)` built from `next_index`; no ack handling
+      or commit yet — those are 5b) — `039b6f1`
 
 ## Next
 
-- [ ] **5a. Leader append & replicate.** `Propose` on a leader appends to its log,
-      emits a log-durability `Persist`, broadcasts per-peer `AppendEntries` built
-      from `next_index`.
-      - Design Q: what `Effect::Persist` carries once the log is durable
-        (whole-log snapshot vs. append/truncate deltas).
 - [ ] **5b. Follower splice + leader ack handling.** Receiver rules 3–5 (truncate
       conflicts, append, advance `commitIndex` from `leaderCommit`).
       `AppendEntriesReply` updates `match_index` / `next_index`, backs off on
