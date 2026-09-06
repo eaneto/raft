@@ -10,7 +10,7 @@
 //! which the transport always knows, so the messages stay faithful to the
 //! paper.
 
-use super::{LogEntry, LogIndex, NodeId, Term};
+use super::{ClusterConfig, LogEntry, LogIndex, NodeId, Term};
 
 /// Arguments for the `RequestVote` RPC (Figure 2), sent by a candidate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -85,6 +85,10 @@ pub struct InstallSnapshotArgs {
     pub last_included_index: LogIndex,
     /// Term of the entry at `last_included_index`.
     pub last_included_term: Term,
+    /// The cluster configuration in force at `last_included_index`, so a
+    /// follower that installs this snapshot keeps its membership even after
+    /// every configuration entry has been compacted away.
+    pub config: ClusterConfig,
     /// Byte offset of `data` within the complete snapshot.
     pub offset: u64,
     /// Snapshot bytes beginning at `offset`.

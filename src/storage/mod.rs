@@ -51,15 +51,19 @@ use std::path::PathBuf;
 
 use bytes::Bytes;
 
-use crate::core::{LogEntry, LogIndex, NodeId, Term};
+use crate::core::{ClusterConfig, LogEntry, LogIndex, NodeId, Term};
 
 /// Where in the log a snapshot was taken.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SnapshotMeta {
     /// The snapshot represents every log entry up to and including this index.
     pub last_included_index: LogIndex,
     /// Term of the entry at `last_included_index`.
     pub last_included_term: Term,
+    /// The cluster configuration in force at `last_included_index`, so a node
+    /// restored from or catching up via this snapshot knows its membership
+    /// even after every configuration entry has been compacted away.
+    pub config: ClusterConfig,
 }
 
 /// A snapshot recovered from storage: its position in the log and the opaque

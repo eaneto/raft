@@ -314,9 +314,13 @@ impl<S: Storage, M: StateMachine> Driver<S, M> {
             state_machine.restore(&snap.data);
             (snap.meta, snap.data)
         });
-        let snapshot_base = snapshot
-            .as_ref()
-            .map(|(meta, _)| (meta.last_included_index, meta.last_included_term));
+        let snapshot_base = snapshot.as_ref().map(|(meta, _)| {
+            (
+                meta.last_included_index,
+                meta.last_included_term,
+                meta.config.clone(),
+            )
+        });
 
         let peer_ids = config.peers.iter().map(|(id, _)| *id);
         let node = RaftNode::from_state(
@@ -405,6 +409,7 @@ impl<S: Storage, M: StateMachine> Driver<S, M> {
                 Effect::StoreSnapshotChunk {
                     last_included_index,
                     last_included_term,
+                    config,
                     offset,
                     data,
                     done,
@@ -412,6 +417,7 @@ impl<S: Storage, M: StateMachine> Driver<S, M> {
                     let meta = SnapshotMeta {
                         last_included_index,
                         last_included_term,
+                        config,
                     };
                     self.receive_snapshot_chunk(meta, offset, &data, done)?;
                 }
@@ -452,6 +458,7 @@ impl<S: Storage, M: StateMachine> Driver<S, M> {
                     leader_id: self.config.id,
                     last_included_index: meta.last_included_index,
                     last_included_term: meta.last_included_term,
+                    config: meta.config.clone(),
                     offset: offset as u64,
                     data: data[offset..end].to_vec(),
                     done,
@@ -497,13 +504,20 @@ impl<S: Storage, M: StateMachine> Driver<S, M> {
         }
 
         if done && let Some(inc) = self.incoming_snapshot.take() {
-            self.storage.persist_snapshot(inc.meta, &inc.buf)?;
-            let bytes = Bytes::from(inc.buf);
+            let IncomingSnapshot { meta, buf } = inc;
+            self.storage.persist_snapshot(meta.clone(), &buf)?;
+            let bytes = Bytes::from(buf);
             self.state_machine.restore(&bytes);
-            self.snapshot = Some((inc.meta, bytes));
+            let SnapshotMeta {
+                last_included_index,
+                last_included_term,
+                config,
+            } = meta.clone();
+            self.snapshot = Some((meta, bytes));
             return self.step(Input::SnapshotInstalled {
-                last_included_index: inc.meta.last_included_index,
-                last_included_term: inc.meta.last_included_term,
+                last_included_index,
+                last_included_term,
+                config,
             });
         }
         Ok(())
@@ -527,9 +541,10 @@ impl<S: Storage, M: StateMachine> Driver<S, M> {
         let meta = SnapshotMeta {
             last_included_index: last_applied,
             last_included_term: term,
+            config: self.node.config().clone(),
         };
         let data = self.state_machine.snapshot();
-        self.storage.persist_snapshot(meta, &data)?;
+        self.storage.persist_snapshot(meta.clone(), &data)?;
         self.snapshot = Some((meta, data));
         self.step(Input::CompactLog {
             up_to_index: last_applied,
