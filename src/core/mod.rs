@@ -177,40 +177,102 @@ pub struct LogEntry {
 /// Indices are **1-based**, matching the paper: the first entry is at
 /// `LogIndex::new(1)`, and [`LogIndex::ZERO`] means "before the first entry"
 /// (the `prevLogIndex` of an `AppendEntries` that carries the whole log, and
-/// the starting `commitIndex` / `lastApplied`). All the index-to-position
-/// arithmetic lives here so the rest of the core reads like Figure 2.
+/// the starting `commitIndex` / `lastApplied`).
+///
+/// After a snapshot, the entries up to and including some index are dropped and
+/// replaced by that snapshot. The log then keeps a **compaction base** — the
+/// index and term of the last entry the snapshot covers — and its in-memory
+/// [`Vec`] holds only the entries *after* it. All the index-to-position
+/// arithmetic, base included, lives here so the rest of the core reads like
+/// Figure 2 and never has to think about the offset.
 ///
 /// This is an in-memory view only; durability is the storage layer's job.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Log {
+    /// Index of the last entry covered by the most recent snapshot, or
+    /// [`LogIndex::ZERO`] when the log has never been compacted. The first
+    /// in-memory entry sits at `snapshot_last_index + 1`.
+    snapshot_last_index: LogIndex,
+    /// Term of the entry at `snapshot_last_index`; [`Term::ZERO`] when nothing
+    /// has been compacted. Answers the `AppendEntries` consistency check when a
+    /// leader's `prevLogIndex` lands exactly on the snapshot boundary.
+    snapshot_last_term: Term,
+    /// The entries after the compaction base, index `snapshot_last_index + 1`
+    /// first.
     entries: Vec<LogEntry>,
 }
 
+impl Default for Log {
+    fn default() -> Self {
+        Self {
+            snapshot_last_index: LogIndex::ZERO,
+            snapshot_last_term: Term::ZERO,
+            entries: Vec::new(),
+        }
+    }
+}
+
 impl Log {
-    /// An empty log.
+    /// An empty, never-compacted log.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// A log holding `entries`, index 1 first. Used by the driver to restore a
-    /// log recovered from storage.
+    /// A never-compacted log holding `entries`, index 1 first. Used by the
+    /// driver to restore a log recovered from storage.
     #[must_use]
     pub const fn from_entries(entries: Vec<LogEntry>) -> Self {
-        Self { entries }
+        Self {
+            snapshot_last_index: LogIndex::ZERO,
+            snapshot_last_term: Term::ZERO,
+            entries,
+        }
     }
 
-    /// Whether the log holds no entries.
+    /// A log restored behind a snapshot: `entries` (index
+    /// `snapshot_last_index + 1` first) sit on top of a snapshot whose last
+    /// covered entry is `(snapshot_last_index, snapshot_last_term)`.
+    #[must_use]
+    pub const fn from_snapshot(
+        snapshot_last_index: LogIndex,
+        snapshot_last_term: Term,
+        entries: Vec<LogEntry>,
+    ) -> Self {
+        Self {
+            snapshot_last_index,
+            snapshot_last_term,
+            entries,
+        }
+    }
+
+    /// Whether the log represents no entries at all — never compacted and with
+    /// nothing appended.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.is_empty() && self.snapshot_last_index.get() == 0
     }
 
-    /// The number of entries in the log.
+    /// The highest index the log logically holds, counting entries folded into
+    /// the snapshot. [`LogIndex::ZERO`] for a log that represents nothing.
     #[must_use]
     pub const fn len(&self) -> u64 {
         // usize -> u64 cannot lose bits on any platform Raft runs on.
-        self.entries.len() as u64
+        self.snapshot_last_index.get() + self.entries.len() as u64
+    }
+
+    /// The index of the compaction base: the last entry the most recent
+    /// snapshot covers, or [`LogIndex::ZERO`] if the log has never been
+    /// compacted.
+    #[must_use]
+    pub const fn snapshot_last_index(&self) -> LogIndex {
+        self.snapshot_last_index
+    }
+
+    /// The term of the entry at [`Log::snapshot_last_index`].
+    #[must_use]
+    pub const fn snapshot_last_term(&self) -> Term {
+        self.snapshot_last_term
     }
 
     /// The index of the last entry, or [`LogIndex::ZERO`] if the log is empty.
@@ -219,43 +281,57 @@ impl Log {
         LogIndex::new(self.len())
     }
 
-    /// The term of the last entry, or [`Term::ZERO`] if the log is empty.
+    /// The term of the last entry: the last in-memory entry's, or the
+    /// compaction base's when nothing sits above the snapshot, or
+    /// [`Term::ZERO`] for an empty log.
     #[must_use]
     pub fn last_term(&self) -> Term {
-        self.entries.last().map_or(Term::ZERO, |entry| entry.term)
+        self.entries
+            .last()
+            .map_or(self.snapshot_last_term, |entry| entry.term)
     }
 
-    /// The entry at `index`, or `None` if `index` is [`LogIndex::ZERO`] or past
-    /// the end of the log.
+    /// The entry at `index`, or `None` if `index` is [`LogIndex::ZERO`], has
+    /// been compacted into the snapshot, or is past the end of the log.
     #[must_use]
     pub fn get(&self, index: LogIndex) -> Option<&LogEntry> {
-        let one_based = index.get();
-        if one_based == 0 {
-            return None;
-        }
-        let position = usize::try_from(one_based - 1).ok()?;
+        let position = index
+            .get()
+            .checked_sub(self.snapshot_last_index.get() + 1)?;
+        let position = usize::try_from(position).ok()?;
         self.entries.get(position)
     }
 
-    /// The term of the entry at `index`, or `None` if there is no such entry.
+    /// The term of the entry at `index`, or `None` if there is no such entry
+    /// the log can still answer for.
     ///
     /// Used for the `AppendEntries` consistency check: a follower accepts new
     /// entries only when `term_at(prevLogIndex)` equals the leader's
-    /// `prevLogTerm`.
+    /// `prevLogTerm`. `term_at(snapshot_last_index)` returns the compaction
+    /// base's term; a `prevLogIndex` strictly inside the snapshot returns
+    /// `None`, which fails the check and makes the leader fall back to
+    /// `InstallSnapshot`.
     #[must_use]
     pub fn term_at(&self, index: LogIndex) -> Option<Term> {
+        if index.get() != 0 && index == self.snapshot_last_index {
+            return Some(self.snapshot_last_term);
+        }
         self.get(index).map(|entry| entry.term)
     }
 
-    /// The entries from `index` to the end of the log, as a slice.
+    /// The in-memory entries from `index` to the end of the log, as a slice.
     ///
-    /// `index` is 1-based: [`LogIndex::ZERO`] or `LogIndex::new(1)` yields the
-    /// whole log, and an `index` at or past `last_index().next()` yields an
-    /// empty slice. Used to build the `entries` an `AppendEntries` carries and
-    /// the tail an [`Effect::PersistLog`] makes durable.
+    /// `index` is a global 1-based index: anything at or below
+    /// `snapshot_last_index + 1` yields every in-memory entry, and an `index`
+    /// past the end yields an empty slice. Used to build the `entries` an
+    /// `AppendEntries` carries and the tail an [`Effect::PersistLog`] makes
+    /// durable.
     #[must_use]
     pub fn entries_from(&self, index: LogIndex) -> &[LogEntry] {
-        let start = usize::try_from(index.get().saturating_sub(1)).unwrap_or(usize::MAX);
+        let start = index
+            .get()
+            .saturating_sub(self.snapshot_last_index.get() + 1);
+        let start = usize::try_from(start).unwrap_or(usize::MAX);
         self.entries.get(start..).unwrap_or(&[])
     }
 
@@ -269,12 +345,41 @@ impl Log {
 
     /// Drops every entry after `index`, keeping entries `1..=index`.
     ///
-    /// `truncate_after(LogIndex::ZERO)` empties the log. An `index` at or past
-    /// the current end is a no-op.
+    /// `index` must be at or above the compaction base; the snapshot itself is
+    /// never truncated. `truncate_after(snapshot_last_index)` drops every
+    /// in-memory entry. An `index` at or past the current end is a no-op.
     pub fn truncate_after(&mut self, index: LogIndex) {
-        if let Ok(keep) = usize::try_from(index.get()) {
+        debug_assert!(
+            index.get() >= self.snapshot_last_index.get(),
+            "truncate_after({}) is below the compaction base {}",
+            index,
+            self.snapshot_last_index,
+        );
+        let keep = index.get().saturating_sub(self.snapshot_last_index.get());
+        if let Ok(keep) = usize::try_from(keep) {
             self.entries.truncate(keep);
         }
+    }
+
+    /// Compacts the log up to and including `up_to_index`, whose term is
+    /// `up_to_term`: those entries are now represented by a snapshot, so drop
+    /// them and move the compaction base forward.
+    ///
+    /// A no-op if `up_to_index` is at or below the current base. If it is past
+    /// the last in-memory entry (installing a snapshot that is ahead of our
+    /// whole log) every in-memory entry is dropped and the base jumps to
+    /// `up_to_index`.
+    pub fn compact(&mut self, up_to_index: LogIndex, up_to_term: Term) {
+        if up_to_index.get() <= self.snapshot_last_index.get() {
+            return;
+        }
+        let drop = up_to_index.get() - self.snapshot_last_index.get();
+        let drop = usize::try_from(drop)
+            .unwrap_or(usize::MAX)
+            .min(self.entries.len());
+        self.entries.drain(..drop);
+        self.snapshot_last_index = up_to_index;
+        self.snapshot_last_term = up_to_term;
     }
 }
 
@@ -1343,6 +1448,102 @@ mod tests {
         assert_eq!(log.entries_from(LogIndex::new(3)), &[entry(3)]);
         assert_eq!(log.entries_from(LogIndex::new(4)), empty);
         assert_eq!(log.entries_from(LogIndex::new(99)), empty);
+    }
+
+    #[test]
+    fn compact_moves_the_base_and_keeps_the_suffix() {
+        let mut log = Log::new();
+        log.append(entry(1)); // index 1
+        log.append(entry(2)); // index 2
+        log.append(entry(3)); // index 3
+        log.append(entry(4)); // index 4
+
+        log.compact(LogIndex::new(2), Term::new(2));
+
+        // Indices are unchanged; the first two entries are now the snapshot.
+        assert_eq!(log.snapshot_last_index(), LogIndex::new(2));
+        assert_eq!(log.snapshot_last_term(), Term::new(2));
+        assert_eq!(log.last_index(), LogIndex::new(4));
+        assert_eq!(log.len(), 4);
+        assert!(!log.is_empty());
+
+        assert_eq!(log.get(LogIndex::new(1)), None); // compacted away
+        assert_eq!(log.get(LogIndex::new(2)), None);
+        assert_eq!(log.get(LogIndex::new(3)), Some(&entry(3)));
+        assert_eq!(log.get(LogIndex::new(4)), Some(&entry(4)));
+
+        // The base answers for its own index; a hole inside the snapshot does not.
+        assert_eq!(log.term_at(LogIndex::new(2)), Some(Term::new(2)));
+        assert_eq!(log.term_at(LogIndex::new(1)), None);
+        assert_eq!(log.term_at(LogIndex::new(3)), Some(Term::new(3)));
+
+        assert_eq!(log.entries_from(LogIndex::new(1)), &[entry(3), entry(4)]);
+        assert_eq!(log.entries_from(LogIndex::new(3)), &[entry(3), entry(4)]);
+        assert_eq!(log.entries_from(LogIndex::new(4)), &[entry(4)]);
+    }
+
+    #[test]
+    fn compact_past_the_whole_log_drops_every_entry() {
+        let mut log = Log::new();
+        log.append(entry(1));
+        log.append(entry(2));
+
+        log.compact(LogIndex::new(5), Term::new(4));
+
+        assert_eq!(log.snapshot_last_index(), LogIndex::new(5));
+        assert_eq!(log.last_index(), LogIndex::new(5));
+        assert_eq!(log.last_term(), Term::new(4));
+        assert_eq!(log.entries_from(LogIndex::new(1)), &[] as &[LogEntry]);
+        assert_eq!(log.term_at(LogIndex::new(5)), Some(Term::new(4)));
+
+        // Appending resumes at base + 1.
+        log.append(entry(6));
+        assert_eq!(log.get(LogIndex::new(6)), Some(&entry(6)));
+        assert_eq!(log.last_index(), LogIndex::new(6));
+    }
+
+    #[test]
+    fn compact_at_or_below_the_base_is_a_no_op() {
+        let mut log = Log::new();
+        log.append(entry(1));
+        log.append(entry(2));
+        log.append(entry(3));
+        log.compact(LogIndex::new(2), Term::new(2));
+
+        log.compact(LogIndex::new(1), Term::new(1));
+        log.compact(LogIndex::new(2), Term::new(2));
+
+        assert_eq!(log.snapshot_last_index(), LogIndex::new(2));
+        assert_eq!(log.entries_from(LogIndex::new(1)), &[entry(3)]);
+    }
+
+    #[test]
+    fn truncate_after_is_relative_to_the_compaction_base() {
+        let mut log = Log::new();
+        for term in 1..=5 {
+            log.append(entry(term));
+        }
+        log.compact(LogIndex::new(3), Term::new(3));
+
+        log.truncate_after(LogIndex::new(4));
+        assert_eq!(log.last_index(), LogIndex::new(4));
+        assert_eq!(log.entries_from(LogIndex::new(1)), &[entry(4)]);
+
+        // Down to the base drops every in-memory entry but keeps the snapshot.
+        log.truncate_after(LogIndex::new(3));
+        assert!(log.entries_from(LogIndex::new(1)).is_empty());
+        assert_eq!(log.last_index(), LogIndex::new(3));
+        assert_eq!(log.last_term(), Term::new(3));
+    }
+
+    #[test]
+    fn from_snapshot_restores_the_base_and_the_tail() {
+        let log = Log::from_snapshot(LogIndex::new(10), Term::new(4), vec![entry(5), entry(5)]);
+        assert_eq!(log.snapshot_last_index(), LogIndex::new(10));
+        assert_eq!(log.last_index(), LogIndex::new(12));
+        assert_eq!(log.get(LogIndex::new(11)), Some(&entry(5)));
+        assert_eq!(log.term_at(LogIndex::new(10)), Some(Term::new(4)));
+        assert_eq!(log.term_at(LogIndex::new(9)), None);
     }
 
     #[test]
