@@ -22,6 +22,8 @@ this file just tracks the sequence of small steps and what's done.
 | `Effect::Persist` | `{ current_term, voted_for }` — metadata only |
 | `Effect::PersistLog` | `{ from_index, entries }` — a delta: the log from `from_index` (1-based) onward, in full. Append sets `from_index` past the old tail; a follower splice can step it back over conflicts |
 | Message sender | `Input::Deliver { from, .. }` carries it, so Figure 2 reply structs stay sender-free |
+| `AppendEntriesReply` | carries `match_index` (follower's `prev_log_index + entries.len()` on success) so the leader can set `matchIndex` — matches `mmatchIndex` in the TLA+ spec |
+| Commit-time apply | core emits `Effect::ApplyToStateMachine` and owns `last_applied`; failed `AppendEntries` triggers an immediate single-decrement retry |
 | Sim harness | lean, inline in `tests/simulation.rs`; grow in place |
 
 ## Done
@@ -36,14 +38,16 @@ this file just tracks the sequence of small steps and what's done.
       current term, emits `Effect::PersistLog` for the new tail, replicates via a
       unified `append_entries_to(peer)` built from `next_index`; no ack handling
       or commit yet — those are 5b) — `039b6f1`
+- [x] **5b. Follower splice + leader ack handling** (receiver rules 2–5:
+      conflict-only truncate + append + `commitIndex` from `leaderCommit`;
+      `AppendEntriesReply` gains `match_index`, drives `next_index`/`match_index`,
+      backs off + retries on failure; leader commits on a **current-term**
+      majority (§5.4.2); `ApplyToStateMachine` emitted in index order. Sim:
+      reliable-network replication/commit test over the seed batteries) —
+      `99eba96`
 
 ## Next
 
-- [ ] **5b. Follower splice + leader ack handling.** Receiver rules 3–5 (truncate
-      conflicts, append, advance `commitIndex` from `leaderCommit`).
-      `AppendEntriesReply` updates `match_index` / `next_index`, backs off on
-      failure, advances the leader's `commitIndex` only on a **current-term**
-      majority (§5.4.2). Emit `ApplyToStateMachine` as `commitIndex` moves.
 - [ ] **5c. Simulation: unreliable network.** Extend the harness with loss /
       reorder / duplicate / partition / heal. Assert Log Matching, Leader
       Completeness, State Machine Safety, and `commitIndex` / `lastApplied`
