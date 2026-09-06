@@ -16,7 +16,9 @@ use bytes::Bytes;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use raft::core::{Effect, Input, LogIndex, LogicalInstant, Message, NodeId, RaftNode};
+use raft::core::{
+    Effect, Input, InstallSnapshotArgs, LogIndex, LogicalInstant, Message, NodeId, RaftNode, Term,
+};
 
 // Timer and network constants, in logical milliseconds. The heartbeat period
 // sits comfortably below the election-timeout floor, so a healthy leader is
@@ -53,6 +55,10 @@ const RELIABLE: Net = Net {
     repartition_every: 0,
 };
 
+/// A node's snapshot in the harness: `(last_index, last_term, applied-prefix)`.
+/// The applied prefix stands in for real serialized state-machine bytes.
+type SimSnapshot = (u64, u64, Vec<(u64, Bytes)>);
+
 /// A message in flight on the simulated network.
 struct Envelope {
     deliver_at: u64,
@@ -76,8 +82,15 @@ struct Sim {
     groups: Vec<usize>,
     next_net_change: u64,
     /// Per node, the `(index, command)` pairs the core told it to apply, in
-    /// order. `step` asserts index order as it fills this.
+    /// order. `step` asserts index order as it fills this. Also stands in for
+    /// the state-machine state: a snapshot is a prefix of this list.
     applied: Vec<Vec<(u64, Bytes)>>,
+    /// Compact a node's log once `lastApplied` runs this many entries past its
+    /// last snapshot. `None` disables compaction (the default).
+    snapshot_threshold: Option<u64>,
+    /// Per node, the snapshot it currently holds. Mirrors the driver's cached
+    /// snapshot, and is what a `SendSnapshot` effect streams to a follower.
+    snapshot: Vec<Option<SimSnapshot>>,
     rng: StdRng,
 
     // --- invariant bookkeeping (Raft safety properties) ---
@@ -114,6 +127,8 @@ impl Sim {
             groups: vec![0; node_count],
             next_net_change: NEVER,
             applied: vec![Vec::new(); node_count],
+            snapshot_threshold: None,
+            snapshot: vec![None; node_count],
             rng,
             prev_commit: vec![0; node_count],
             prev_applied: vec![0; node_count],
@@ -131,6 +146,13 @@ impl Sim {
         } else {
             NEVER
         };
+        self
+    }
+
+    /// Compacts every node's log once `lastApplied` reaches `threshold` entries
+    /// past its last snapshot. Chainable after [`Sim::new`].
+    const fn with_snapshot_threshold(mut self, threshold: u64) -> Self {
+        self.snapshot_threshold = Some(threshold);
         self
     }
 
@@ -214,6 +236,7 @@ impl Sim {
     /// Steps node `i` with `input` and routes the effects it returns.
     fn step(&mut self, i: usize, input: Input) {
         let effects = self.nodes[i].step(input, LogicalInstant::from_millis(self.now));
+        let mut followups: Vec<Input> = Vec::new();
         for effect in effects {
             match effect {
                 Effect::SendRpc { to, message } => self.send(i, to, message),
@@ -234,16 +257,34 @@ impl Sim {
                 // The simulator has no durability model, so persistence
                 // effects are dropped.
                 Effect::Persist { .. } | Effect::PersistLog { .. } => {}
-                // Snapshot coverage lands with its own harness support; until
-                // then nothing compacts a log, so the core never emits these.
-                Effect::SendSnapshot { .. } | Effect::StoreSnapshotChunk { .. } => {
-                    unreachable!(
-                        "seed={}: snapshot effect before snapshot support",
-                        self.seed
-                    )
+                // The leader streams its whole snapshot as one `InstallSnapshot`
+                // message (offset 0, done); the network can still drop it.
+                Effect::SendSnapshot { to } => self.send_snapshot(i, to),
+                // Every chunk the harness produces is terminal: restore the
+                // "state machine" from the applied prefix it carries and tell
+                // the core so it adopts the snapshot and acks the leader.
+                Effect::StoreSnapshotChunk {
+                    last_included_index,
+                    last_included_term,
+                    data,
+                    ..
+                } => {
+                    let prefix = decode_applied(&data);
+                    self.applied[i].clone_from(&prefix);
+                    self.snapshot[i] =
+                        Some((last_included_index.get(), last_included_term.get(), prefix));
+                    followups.push(Input::SnapshotInstalled {
+                        last_included_index,
+                        last_included_term,
+                    });
                 }
             }
         }
+
+        for followup in followups {
+            self.step(i, followup);
+        }
+        self.maybe_compact(i);
 
         // A leader runs no election timer; every other role has one armed. The
         // core emits no explicit "stop timer", so reconcile against the role.
@@ -252,6 +293,53 @@ impl Sim {
         } else if self.election_deadline[i] == NEVER {
             self.election_deadline[i] = self.arm_election();
         }
+    }
+
+    /// Streams node `i`'s snapshot to `to` as a single `InstallSnapshot`
+    /// message (the harness does not model chunk boundaries).
+    fn send_snapshot(&mut self, i: usize, to: NodeId) {
+        let Some((last_index, last_term, prefix)) = self.snapshot[i].clone() else {
+            return; // the leader has nothing to serve yet
+        };
+        let message = Message::InstallSnapshot(InstallSnapshotArgs {
+            term: self.nodes[i].current_term(),
+            leader_id: self.nodes[i].id(),
+            last_included_index: LogIndex::new(last_index),
+            last_included_term: Term::new(last_term),
+            offset: 0,
+            data: encode_applied(&prefix),
+            done: true,
+        });
+        self.send(i, to, message);
+    }
+
+    /// Mirrors the driver's compaction trigger: once node `i` has applied
+    /// `snapshot_threshold` entries past its last snapshot, snapshot the
+    /// applied prefix and have the core drop the covered log.
+    fn maybe_compact(&mut self, i: usize) {
+        let Some(threshold) = self.snapshot_threshold else {
+            return;
+        };
+        let last_applied = self.nodes[i].last_applied();
+        let base = self.nodes[i].snapshot_last_index().get();
+        if last_applied.get().saturating_sub(base) < threshold.max(1) {
+            return;
+        }
+        let Some(term) = self.nodes[i].log().term_at(last_applied) else {
+            return;
+        };
+        let prefix: Vec<(u64, Bytes)> = self.applied[i]
+            .iter()
+            .take_while(|(idx, _)| *idx <= last_applied.get())
+            .cloned()
+            .collect();
+        self.snapshot[i] = Some((last_applied.get(), term.get(), prefix));
+        let _ = self.nodes[i].step(
+            Input::CompactLog {
+                up_to_index: last_applied,
+            },
+            LogicalInstant::from_millis(self.now),
+        );
     }
 
     /// Queues a message on the network, applying drop / jitter / duplication.
@@ -327,6 +415,7 @@ impl Sim {
         let peers = self.ids.iter().copied().filter(|&id| id != self.ids[i]);
         self.nodes[i] = RaftNode::new(self.ids[i], peers);
         self.applied[i].clear();
+        self.snapshot[i] = None;
         self.prev_commit[i] = 0;
         self.prev_applied[i] = 0;
         self.election_deadline[i] = self.arm_election();
@@ -404,12 +493,22 @@ impl Sim {
         self.applied[i].iter().map(|(_, cmd)| cmd.clone()).collect()
     }
 
-    fn log_terms_and_commands(&self, i: usize) -> Vec<(u64, Bytes)> {
+    /// Node `i`'s in-memory log entries as `(global index, term, command)`.
+    /// After compaction the first entry sits at `snapshot_last_index + 1`.
+    fn log_entries(&self, i: usize) -> Vec<(u64, u64, Bytes)> {
+        let base = self.nodes[i].log().snapshot_last_index().get();
         self.nodes[i]
             .log()
             .entries_from(LogIndex::new(1))
             .iter()
-            .map(|entry| (entry.term.get(), entry.command.clone()))
+            .enumerate()
+            .map(|(pos, entry)| {
+                (
+                    base + pos as u64 + 1,
+                    entry.term.get(),
+                    entry.command.clone(),
+                )
+            })
             .collect()
     }
 
@@ -480,8 +579,9 @@ impl Sim {
         for i in 0..self.nodes.len() {
             let commit_term = self.nodes[i].current_term().get();
             let commit = self.nodes[i].commit_index().get();
-            for (pos, (term, command)) in self.log_terms_and_commands(i).into_iter().enumerate() {
-                let idx = pos as u64 + 1;
+            // Entries folded into this node's snapshot are committed by
+            // definition; their agreement was checked before they were compacted.
+            for (idx, term, command) in self.log_entries(i) {
                 if idx > commit {
                     break;
                 }
@@ -508,18 +608,23 @@ impl Sim {
                 continue;
             }
             let leader_term = self.nodes[i].current_term().get();
-            let log = self.log_terms_and_commands(i);
+            let base = self.nodes[i].log().snapshot_last_index().get();
+            let log = self.log_entries(i);
             for (&idx, (term, command, commit_term)) in &self.committed {
                 if *commit_term > leader_term {
                     continue;
                 }
-                let pos = usize::try_from(idx - 1).unwrap_or(usize::MAX);
-                let held = log.get(pos);
+                // A committed entry folded into the leader's own snapshot is
+                // held by definition.
+                if idx <= base {
+                    continue;
+                }
+                let held = log.iter().find(|(g, ..)| *g == idx);
                 assert!(
                     held.is_some(),
                     "seed={seed}: leader {i} (term {leader_term}) is missing committed entry {idx}",
                 );
-                if let Some((held_term, held_command)) = held {
+                if let Some((_, held_term, held_command)) = held {
                     assert!(
                         held_term == term && held_command == command,
                         "seed={seed}: leader {i} entry {idx} differs from what was committed there",
@@ -544,29 +649,61 @@ impl Sim {
         }
     }
 
-    /// §9.3: Log Matching. Past the longest identical prefix of two logs, no
-    /// shared index may carry the same term.
+    /// §9.3: Log Matching. Over the range both nodes still hold in memory, past
+    /// the longest identical prefix no shared index may carry the same term.
+    /// (Anything below either node's compaction base was checked before it was
+    /// compacted.)
     fn check_log_matching(&self) {
         let seed = self.seed;
         for left in 0..self.nodes.len() {
             for right in (left + 1)..self.nodes.len() {
-                let log_l = self.nodes[left].log().entries_from(LogIndex::new(1));
-                let log_r = self.nodes[right].log().entries_from(LogIndex::new(1));
-                let common = log_l.len().min(log_r.len());
-                let mut prefix = 0;
-                while prefix < common && log_l[prefix] == log_r[prefix] {
-                    prefix += 1;
-                }
-                for k in prefix..common {
+                let log_l = self.log_entries(left);
+                let log_r = self.log_entries(right);
+                let base_l = self.nodes[left].log().snapshot_last_index().get();
+                let base_r = self.nodes[right].log().snapshot_last_index().get();
+                let lo = base_l.max(base_r) + 1;
+                let hi = log_l
+                    .last()
+                    .map_or(0, |(g, ..)| *g)
+                    .min(log_r.last().map_or(0, |(g, ..)| *g));
+
+                let at = |log: &[(u64, u64, Bytes)], g: u64| {
+                    log.iter()
+                        .find(|(gg, ..)| *gg == g)
+                        .map(|(_, t, c)| (*t, c.clone()))
+                };
+                let mut still_matching = true;
+                for g in lo..=hi {
+                    let (Some(l), Some(r)) = (at(&log_l, g), at(&log_r, g)) else {
+                        continue;
+                    };
+                    if still_matching && l == r {
+                        continue;
+                    }
+                    still_matching = false;
                     assert!(
-                        log_l[k].term != log_r[k].term,
-                        "seed={seed}: Log Matching broke at index {} between nodes {left} and {right}",
-                        k + 1,
+                        l.0 != r.0,
+                        "seed={seed}: Log Matching broke at index {g} between nodes {left} and {right}",
                     );
                 }
             }
         }
     }
+}
+
+/// Serializes an applied prefix so it can ride inside an `InstallSnapshot`
+/// message's `data`, standing in for real state-machine bytes.
+fn encode_applied(prefix: &[(u64, Bytes)]) -> Vec<u8> {
+    let owned: Vec<(u64, Vec<u8>)> = prefix.iter().map(|(i, c)| (*i, c.to_vec())).collect();
+    bincode::serialize(&owned).unwrap_or_default()
+}
+
+fn decode_applied(data: &[u8]) -> Vec<(u64, Bytes)> {
+    let owned: Vec<(u64, Vec<u8>)> = bincode::deserialize(data).unwrap_or_default();
+    owned
+        .into_iter()
+        .map(|(i, c)| (i, Bytes::from(c)))
+        .collect()
 }
 
 fn assert_converges_to_one_stable_leader(node_count: usize, seed: u64) {
@@ -992,5 +1129,112 @@ fn assert_wiped_follower_recovers(seed: u64) {
 fn a_wiped_follower_rejoins_and_catches_up() {
     for seed in seeds(&[1, 2, 3, 42, 1_000, 0x5EED, 7, 99]) {
         assert_wiped_follower_recovers(seed);
+    }
+}
+
+// --- 8: snapshotting -----------------------------------------------------------
+
+/// With a low compaction threshold, a healthy cluster keeps committing while
+/// every node repeatedly snapshots and drops the covered log prefix; the
+/// applied sequences stay identical throughout (`check_invariants` runs after
+/// every step).
+fn assert_cluster_compacts_and_stays_consistent(node_count: usize, seed: u64) {
+    let mut sim = Sim::new(node_count, seed).with_snapshot_threshold(4);
+
+    sim.run_until_leader(5_000);
+    let commands: Vec<Vec<u8>> = (0..20).map(|k| format!("op-{k}").into_bytes()).collect();
+    for command in &commands {
+        let leader = sim.run_until_leader(5_000);
+        sim.propose_at(leader, command);
+        sim.run_until(sim.now + 250);
+    }
+    sim.run_until(sim.now + 2_000);
+
+    let want: Vec<Bytes> = commands.iter().map(|c| Bytes::copy_from_slice(c)).collect();
+    for i in 0..node_count {
+        assert!(
+            sim.nodes[i].snapshot_last_index().get() > 0,
+            "seed={seed}: node {i} never compacted its log",
+        );
+        assert_eq!(
+            sim.applied_commands(i),
+            want,
+            "seed={seed}: node {i} applied the wrong sequence after compaction",
+        );
+    }
+}
+
+#[test]
+fn three_and_five_node_clusters_compact_and_stay_consistent() {
+    for seed in seeds(&[1, 2, 42, 1_000, 0x5EED]) {
+        assert_cluster_compacts_and_stays_consistent(3, seed);
+        assert_cluster_compacts_and_stays_consistent(5, seed);
+    }
+}
+
+/// A follower partitioned away while the leader compacts past the end of that
+/// follower's log can only be caught up by `InstallSnapshot`: its `nextIndex`
+/// falls below the leader's compaction base. After the heal it converges.
+fn assert_lagging_follower_caught_up_by_snapshot(seed: u64) {
+    let node_count = 5;
+    let net = Net {
+        drop_permille: 0,
+        dup_permille: 0,
+        jitter: 5,
+        repartition_every: 0,
+    };
+    let mut sim = Sim::new(node_count, seed)
+        .with_net(net)
+        .with_snapshot_threshold(3);
+
+    let leader = sim.run_until_leader(5_000);
+    sim.propose_at(leader, b"pre");
+    sim.run_until(sim.now + 400);
+
+    // Cut one follower off from the other four.
+    let victim = (leader + 2) % node_count;
+    assert!(!sim.nodes[victim].is_leader());
+    let mut groups = vec![0usize; node_count];
+    groups[victim] = 1;
+    sim.set_groups(groups);
+
+    // The majority keeps committing; the leader compacts well past where the
+    // isolated follower's log stops.
+    for k in 0..12 {
+        let current = sim.run_until_leader(5_000);
+        sim.propose_at(current, format!("x-{k}").as_bytes());
+        sim.run_until(sim.now + 250);
+    }
+    let base = sim
+        .leader_in_group(0)
+        .map_or(0, |l| sim.nodes[l].snapshot_last_index().get());
+    assert!(
+        base > sim.nodes[victim].log().last_index().get(),
+        "seed={seed}: leader base {base} did not overtake the isolated follower",
+    );
+
+    // Heal and settle: the follower must be repaired by a snapshot.
+    sim.set_groups(vec![0; node_count]);
+    sim.run_until(sim.now + 10_000);
+
+    assert!(
+        sim.nodes[victim].snapshot_last_index().get() > 0,
+        "seed={seed}: the lagging follower was not caught up by a snapshot",
+    );
+    let reference = sim.applied_commands(0);
+    assert!(reference.len() >= 13, "seed={seed}: too little committed");
+    for i in 0..node_count {
+        assert_eq!(
+            sim.applied_commands(i),
+            reference,
+            "seed={seed}: node {i} did not converge after the snapshot catch-up",
+        );
+    }
+}
+
+#[test]
+fn a_lagging_follower_is_caught_up_by_a_snapshot() {
+    for seed in seeds(&[1, 2, 3, 42, 1_000, 0x5EED, 7]) {
+        assert_lagging_follower_caught_up_by_snapshot(seed);
     }
 }
