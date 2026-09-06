@@ -45,13 +45,14 @@ this file just tracks the sequence of small steps and what's done.
       majority (§5.4.2); `ApplyToStateMachine` emitted in index order. Sim:
       reliable-network replication/commit test over the seed batteries) —
       `99eba96`
+- [x] **5c. Simulation: unreliable network** (`Net` fault config: drop / dup /
+      jitter-reorder / periodic random partition; `check_invariants` runs after
+      every step enforcing §9.1/§9.3/§9.4/§9.5 + commitIndex/lastApplied
+      monotonicity; tests for loss, chaotic delivery, partition+heal, and
+      continuous chaos over seed batteries) — `e0bec45`
 
 ## Next
 
-- [ ] **5c. Simulation: unreliable network.** Extend the harness with loss /
-      reorder / duplicate / partition / heal. Assert Log Matching, Leader
-      Completeness, State Machine Safety, and `commitIndex` / `lastApplied`
-      monotonicity across seeds.
 - [ ] **6. Storage layer** (`src/storage/`). Trait + real impl + simulated impl.
       Checksummed, recoverable log (length-prefixed + CRC32C, torn tail expected);
       redundant `currentTerm` / `votedFor` in two fsync'd files; `fsync` failure is
