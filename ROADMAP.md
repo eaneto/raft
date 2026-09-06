@@ -25,6 +25,10 @@ this file just tracks the sequence of small steps and what's done.
 | `AppendEntriesReply` | carries `match_index` (follower's `prev_log_index + entries.len()` on success) so the leader can set `matchIndex` — matches `mmatchIndex` in the TLA+ spec |
 | Commit-time apply | core emits `Effect::ApplyToStateMachine` and owns `last_applied`; failed `AppendEntries` triggers an immediate single-decrement retry |
 | Sim harness | lean, inline in `tests/simulation.rs`; grow in place |
+| Snapshot payload | metadata (`last_included_index` / term) lives in the pure core; the bytes are the `StateMachine`'s, held and persisted by the driver. `Log` carries a compaction base and rebases all index arithmetic |
+| `InstallSnapshot` | chunked wire format (`offset` + `done`); the reply echoes `last_included_index` so the core can set `matchIndex` without having sent the chunks. Effects `SendSnapshot { to }` / `StoreSnapshotChunk`; inputs `SnapshotInstalled` / `CompactLog` |
+| Compaction trigger | driver-owned: `Config::snapshot_threshold` entries past the last snapshot; core just trims on `CompactLog` |
+| Log-file layout | 8-byte start-index header so recovery can place records after compaction; snapshot written (tmp → rename → dir fsync) **before** the log prefix is dropped, so a crash between leaves a trimmable head, never a gap |
 
 ## Done
 
@@ -67,10 +71,23 @@ this file just tracks the sequence of small steps and what's done.
       `RaftNode::from_state` / `Log::from_entries` + `serde` derives on the wire
       types. Integration tests over real TCP (3-node replication; restart reloads
       the log). — `8d37968`
+- [x] **8. Snapshotting / log compaction + `InstallSnapshot`** (paper §7,
+      thesis §5). `Log` gains a compaction base and rebased index arithmetic
+      (`compact` / `from_snapshot`). Core: `InstallSnapshot` receiver, effects
+      `SendSnapshot` / `StoreSnapshotChunk`, inputs `SnapshotInstalled` /
+      `CompactLog`, leader falls back to a snapshot when a peer drops below the
+      base, `leader_id` tracking. Storage: `persist_snapshot` with a
+      tmp→rename→dir-fsync snapshot file and a log-prefix rewrite behind an
+      8-byte start-index header; `MemStorage` mirrors it under fsync-fault
+      injection. `StateMachine::snapshot` / `restore`. Driver: `Config`
+      snapshot knobs, chunk streaming + reassembly, threshold-driven
+      `maybe_compact`, restore-from-snapshot on startup. Sim: whole-snapshot
+      round-trip, offset-aware invariants, compaction + lagging-follower
+      catch-up seed batteries. Also a docs pass making every module rustdoc
+      self-contained (no `AGENTS.md` cross-references). — `2fc0644..2bfe542`
 
 ## Next
 
-- [ ] **8. Snapshotting / log compaction** + `InstallSnapshot` (paper §7, thesis §5).
 - [ ] **9. Cluster membership changes** — prefer single-server (thesis §4); record
       the decision when starting.
 - [ ] **Property-based tests** (`proptest`). Random cluster sizes + event
