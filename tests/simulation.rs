@@ -255,8 +255,11 @@ impl Sim {
                     self.applied[i].push((index.get(), command));
                 }
                 // The simulator has no durability model, so persistence
-                // effects are dropped.
-                Effect::Persist { .. } | Effect::PersistLog { .. } => {}
+                // effects are dropped; membership is read straight off the
+                // nodes, so the announcement is informational.
+                Effect::Persist { .. }
+                | Effect::PersistLog { .. }
+                | Effect::MembershipChanged { .. } => {}
                 // The leader streams its whole snapshot as one `InstallSnapshot`
                 // message (offset 0, done); the network can still drop it.
                 Effect::SendSnapshot { to } => self.send_snapshot(i, to),

@@ -512,7 +512,9 @@ pub enum Role {
     },
     /// Won the election for the current term; replicates the log and sends
     /// heartbeats. Both maps are keyed by peer id and reinitialised on
-    /// election (Figure 2, "Volatile state on leaders").
+    /// election (Figure 2, "Volatile state on leaders"). While a server is
+    /// being added they also carry an entry for that non-voting learner, which
+    /// [`RaftNode::config`] does not yet list.
     Leader {
         /// For each peer, the index of the next log entry to send it.
         next_index: BTreeMap<NodeId, LogIndex>,
@@ -520,6 +522,47 @@ pub enum Role {
         match_index: BTreeMap<NodeId, LogIndex>,
     },
 }
+
+/// A single-server membership change (thesis §4): one server added or removed
+/// per configuration entry. Joint consensus is deliberately not used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MembershipChange {
+    /// Add `NodeId` as a voter, after it catches up as a non-voting learner.
+    AddServer(NodeId),
+    /// Remove `NodeId` from the configuration.
+    RemoveServer(NodeId),
+}
+
+/// The leader's progress on the one membership change it has in flight.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingChange {
+    change: MembershipChange,
+    phase: ChangePhase,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ChangePhase {
+    /// An `AddServer` is replicating to the new server before its configuration
+    /// entry is appended. The round completes when the server's `matchIndex`
+    /// reaches `round_target`; `ticks_left` heartbeats remain before the add is
+    /// abandoned.
+    ///
+    /// DEVIATION: thesis §4.2.1 bounds catch-up by replication rounds each
+    /// shorter than an election timeout. The pure core has no clock, so it
+    /// counts heartbeat ticks instead.
+    CatchingUp {
+        round_target: LogIndex,
+        ticks_left: u32,
+    },
+    /// The configuration entry is in the log at `config_index`, waiting to
+    /// commit. On commit the change is done (and if it removed this leader, it
+    /// steps down — thesis §4.2.2).
+    Committing { config_index: LogIndex },
+}
+
+/// Heartbeat ticks a new server has to catch up in before an `AddServer` is
+/// abandoned. See [`ChangePhase::CatchingUp`].
+const CATCH_UP_TICKS: u32 = 40;
 
 /// A point on the driver's logical timeline, in milliseconds from an arbitrary
 /// epoch.
@@ -592,6 +635,13 @@ pub enum Input {
     CompactLog {
         /// The last log index the new snapshot covers.
         up_to_index: LogIndex,
+    },
+    /// An administrator asks the leader to add or remove one server. Ignored by
+    /// any other role, and by a leader that already has a change in flight or a
+    /// still-uncommitted configuration entry.
+    ChangeMembership {
+        /// The change to make.
+        change: MembershipChange,
     },
 }
 
@@ -681,6 +731,13 @@ pub enum Effect {
         /// Whether `data` reaches the end of the snapshot.
         done: bool,
     },
+    /// The active cluster configuration changed (a new one was appended, or one
+    /// committed). The driver reconciles its transport connections to match,
+    /// and a UI can observe membership.
+    MembershipChanged {
+        /// The configuration now in force.
+        config: ClusterConfig,
+    },
 }
 
 /// A single Raft server: the pure state machine.
@@ -718,6 +775,9 @@ pub struct RaftNode {
     /// the reply after the driver installs a received snapshot, and (later) to
     /// redirect clients.
     leader_id: Option<NodeId>,
+    /// While this node leads and has a membership change under way, its
+    /// progress on it. At most one change is in flight at a time.
+    pending_change: Option<PendingChange>,
 }
 
 impl RaftNode {
@@ -742,6 +802,7 @@ impl RaftNode {
             last_applied: LogIndex::ZERO,
             role: Role::Follower,
             leader_id: None,
+            pending_change: None,
         };
         node.recompute_config();
         node
@@ -835,6 +896,7 @@ impl RaftNode {
                 last_included_term,
             } => self.handle_snapshot_installed(last_included_index, last_included_term),
             Input::CompactLog { up_to_index } => self.handle_compact_log(up_to_index),
+            Input::ChangeMembership { change } => self.handle_change_membership(change),
         }
     }
 
@@ -946,7 +1008,13 @@ impl RaftNode {
         // Receiver rules 3 & 4: splice in the entries that differ.
         if let Some(from_index) = self.splice_entries(args.prev_log_index, &args.entries) {
             // A spliced-in or truncated-away `Config` entry changes membership.
+            let old_config = self.config.clone();
             self.recompute_config();
+            if self.config != old_config {
+                effects.push(Effect::MembershipChanged {
+                    config: self.config.clone(),
+                });
+            }
             effects.push(Effect::PersistLog {
                 from_index,
                 entries: self.log.entries_from(from_index).to_vec(),
@@ -1049,6 +1117,7 @@ impl RaftNode {
         if reply.success {
             self.record_match(from, reply.match_index);
             self.maybe_advance_commit_index(&mut effects);
+            self.advance_catch_up(from, &mut effects);
         } else {
             self.back_off(from);
             effects.push(self.replicate_to(from));
@@ -1172,6 +1241,206 @@ impl RaftNode {
         Vec::new()
     }
 
+    /// Handles [`Input::ChangeMembership`] (thesis §4). A no-op unless this
+    /// server leads, has no change already in flight, and the latest
+    /// configuration entry is committed. `RemoveServer` appends the new
+    /// configuration at once; `AddServer` first replicates to the new server
+    /// as a non-voting learner (see [`ChangePhase::CatchingUp`]).
+    fn handle_change_membership(&mut self, change: MembershipChange) -> Vec<Effect> {
+        if !self.is_leader()
+            || self.pending_change.is_some()
+            || self.latest_config_index() > self.commit_index
+        {
+            return Vec::new();
+        }
+
+        match change {
+            MembershipChange::AddServer(id) => {
+                if id == self.id || self.config.contains(id) {
+                    return Vec::new();
+                }
+                let next = self.log.last_index().next();
+                if let Role::Leader {
+                    next_index,
+                    match_index,
+                } = &mut self.role
+                {
+                    next_index.insert(id, next);
+                    match_index.insert(id, LogIndex::ZERO);
+                }
+                self.pending_change = Some(PendingChange {
+                    change,
+                    phase: ChangePhase::CatchingUp {
+                        round_target: self.log.last_index(),
+                        ticks_left: CATCH_UP_TICKS,
+                    },
+                });
+                vec![self.replicate_to(id)]
+            }
+            MembershipChange::RemoveServer(id) => {
+                if !self.config.contains(id) {
+                    return Vec::new();
+                }
+                let new_config = self.config.without(id);
+                self.append_config(change, new_config)
+            }
+        }
+    }
+
+    /// The index of the last configuration entry in the log, or the compaction
+    /// base (whose configuration is `base_config`) if there is none in memory.
+    fn latest_config_index(&self) -> LogIndex {
+        let base = self.log.snapshot_last_index().get();
+        match self
+            .log
+            .entries_from(LogIndex::new(1))
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, entry)| entry.as_config().is_some())
+        {
+            Some((pos, _)) => LogIndex::new(base + pos as u64 + 1),
+            None => self.log.snapshot_last_index(),
+        }
+    }
+
+    /// Appends `new_config` as a configuration entry, replicates it, and marks
+    /// the change as waiting to commit. Shared by `RemoveServer` and by the
+    /// promotion of a caught-up `AddServer` learner.
+    fn append_config(
+        &mut self,
+        change: MembershipChange,
+        new_config: ClusterConfig,
+    ) -> Vec<Effect> {
+        let from_index = self.log.last_index().next();
+        self.log
+            .append(LogEntry::config(self.current_term, new_config.clone()));
+        let config_index = self.log.last_index();
+        self.recompute_config();
+        self.sync_replication_maps();
+        self.pending_change = Some(PendingChange {
+            change,
+            phase: ChangePhase::Committing { config_index },
+        });
+
+        let mut effects = vec![
+            Effect::PersistLog {
+                from_index,
+                entries: self.log.entries_from(from_index).to_vec(),
+            },
+            Effect::MembershipChanged { config: new_config },
+        ];
+        effects.extend(self.replicate_to_peers());
+        self.maybe_advance_commit_index(&mut effects);
+        effects
+    }
+
+    /// Advances a pending `AddServer`'s catch-up when the new server acks. When
+    /// its `matchIndex` reaches the current log end, it is promoted (its
+    /// configuration entry is appended); if a round completes but the log has
+    /// grown, another round starts.
+    fn advance_catch_up(&mut self, from: NodeId, effects: &mut Vec<Effect>) {
+        let Some(PendingChange {
+            change: MembershipChange::AddServer(id),
+            phase: ChangePhase::CatchingUp { round_target, .. },
+        }) = &self.pending_change
+        else {
+            return;
+        };
+        let (id, round_target) = (*id, *round_target);
+        if from != id {
+            return;
+        }
+        let matched = match &self.role {
+            Role::Leader { match_index, .. } => {
+                match_index.get(&id).copied().unwrap_or(LogIndex::ZERO)
+            }
+            _ => return,
+        };
+        if matched < round_target {
+            return;
+        }
+
+        if matched >= self.log.last_index() {
+            let new_config = self.config.with_added(id);
+            effects.extend(self.append_config(MembershipChange::AddServer(id), new_config));
+        } else if let Some(PendingChange {
+            phase: ChangePhase::CatchingUp { round_target, .. },
+            ..
+        }) = &mut self.pending_change
+        {
+            *round_target = self.log.last_index();
+        }
+    }
+
+    /// Abandons a stuck `AddServer`: drops the pending change and the learner's
+    /// replication state.
+    fn abort_catch_up(&mut self) {
+        if let Some(PendingChange {
+            change: MembershipChange::AddServer(id),
+            ..
+        }) = self.pending_change.take()
+            && let Role::Leader {
+                next_index,
+                match_index,
+            } = &mut self.role
+        {
+            next_index.remove(&id);
+            match_index.remove(&id);
+        }
+    }
+
+    /// On commit of a pending configuration entry: clear the change, and if the
+    /// new configuration no longer includes this leader, step it down (thesis
+    /// §4.2.2).
+    fn check_config_committed(&mut self, effects: &mut Vec<Effect>) {
+        let Some(PendingChange {
+            phase: ChangePhase::Committing { config_index },
+            ..
+        }) = &self.pending_change
+        else {
+            return;
+        };
+        if *config_index > self.commit_index {
+            return;
+        }
+        self.pending_change = None;
+        effects.push(Effect::MembershipChanged {
+            config: self.config.clone(),
+        });
+        if !self.config.contains(self.id) && self.is_leader() {
+            self.leader_id = None;
+            self.role = Role::Follower;
+        }
+    }
+
+    /// Reconciles the leader's `next_index` / `match_index` with the current
+    /// configuration after it changes: drops entries for servers no longer
+    /// voting (a removed peer), keeps a promoted learner's, and seeds any new
+    /// voter.
+    fn sync_replication_maps(&mut self) {
+        let keep: BTreeSet<NodeId> = self
+            .config
+            .voters()
+            .iter()
+            .copied()
+            .filter(|&voter| voter != self.id)
+            .collect();
+        let next = self.log.last_index().next();
+        if let Role::Leader {
+            next_index,
+            match_index,
+        } = &mut self.role
+        {
+            next_index.retain(|peer, _| keep.contains(peer));
+            match_index.retain(|peer, _| keep.contains(peer));
+            for &voter in &keep {
+                next_index.entry(voter).or_insert(next);
+                match_index.entry(voter).or_insert(LogIndex::ZERO);
+            }
+        }
+    }
+
     /// Records a successful ack: `match_index[peer]` only moves forward (a
     /// reordered older ack cannot pull it back) and `next_index[peer]` follows.
     fn record_match(&mut self, peer: NodeId, matched: LogIndex) {
@@ -1210,9 +1479,14 @@ impl RaftNode {
             let Role::Leader { match_index, .. } = &self.role else {
                 return;
             };
-            // Every server's match point: each peer's, plus our own log end.
-            let mut matched: Vec<LogIndex> = match_index.values().copied().collect();
-            matched.push(self.log.last_index());
+            // Only voters count: a still-catching-up learner has a
+            // `match_index` entry but is not in the configuration.
+            let mut matched: Vec<LogIndex> = match_index
+                .iter()
+                .filter(|(peer, _)| self.config.contains(**peer))
+                .map(|(_, index)| *index)
+                .collect();
+            matched.push(self.log.last_index()); // our own log end
             matched.sort_unstable_by_key(|&index| std::cmp::Reverse(index));
             // Sorted high -> low, position `quorum - 1` is the largest index
             // that at least `quorum` servers hold.
@@ -1224,6 +1498,7 @@ impl RaftNode {
         {
             self.commit_index = majority_matched;
             self.apply_committed(effects);
+            self.check_config_committed(effects);
         }
     }
 
@@ -1267,14 +1542,25 @@ impl RaftNode {
     }
 
     /// Handles the heartbeat interval elapsing: a leader re-sends
-    /// `AppendEntries` to reassert authority (carrying any entries a peer has
-    /// yet to acknowledge); every other role ignores it.
-    fn handle_heartbeat_tick(&self) -> Vec<Effect> {
-        if self.is_leader() {
-            self.replicate_to_peers()
-        } else {
-            Vec::new()
+    /// `AppendEntries` to reassert authority (carrying any entries a peer, or a
+    /// catching-up learner, has yet to acknowledge); every other role ignores
+    /// it. Each tick also spends one of a pending `AddServer`'s catch-up
+    /// budget, abandoning it if the new server never keeps up.
+    fn handle_heartbeat_tick(&mut self) -> Vec<Effect> {
+        if !self.is_leader() {
+            return Vec::new();
         }
+        if let Some(PendingChange {
+            phase: ChangePhase::CatchingUp { ticks_left, .. },
+            ..
+        }) = &mut self.pending_change
+        {
+            *ticks_left = ticks_left.saturating_sub(1);
+            if *ticks_left == 0 {
+                self.abort_catch_up();
+            }
+        }
+        self.replicate_to_peers()
     }
 
     /// Handles a client proposal (Figure 2, "Clients of Raft").
@@ -1319,6 +1605,7 @@ impl RaftNode {
             self.voted_for = None;
             self.leader_id = None;
         }
+        self.pending_change = None;
         self.role = Role::Follower;
     }
 
@@ -1327,6 +1614,7 @@ impl RaftNode {
         self.current_term = self.current_term.next();
         self.voted_for = Some(self.id);
         self.leader_id = None;
+        self.pending_change = None;
         let mut votes_granted = BTreeSet::new();
         votes_granted.insert(self.id);
         self.role = Role::Candidate { votes_granted };
@@ -1373,10 +1661,17 @@ impl RaftNode {
     /// new tail. Used on winning an election, on `HeartbeatTick`, and on
     /// `Propose`.
     fn replicate_to_peers(&self) -> Vec<Effect> {
-        self.peers
-            .iter()
-            .map(|&peer| self.replicate_to(peer))
-            .collect()
+        match &self.role {
+            Role::Leader { next_index, .. } => {
+                // Voters plus any catching-up learner (which has a `next_index`
+                // entry but is not yet in the configuration).
+                next_index
+                    .keys()
+                    .map(|&peer| self.replicate_to(peer))
+                    .collect()
+            }
+            Role::Follower | Role::Candidate { .. } => Vec::new(),
+        }
     }
 
     /// Builds the replication effect for one peer.
@@ -1594,9 +1889,9 @@ mod tests {
     use bytes::Bytes;
 
     use super::{
-        AppendEntriesArgs, AppendEntriesReply, ClusterConfig, Effect, Input, InstallSnapshotArgs,
-        InstallSnapshotReply, Log, LogEntry, LogIndex, LogicalInstant, Message, NodeId, RaftNode,
-        RequestVoteArgs, RequestVoteReply, Role, Term,
+        AppendEntriesArgs, AppendEntriesReply, CATCH_UP_TICKS, ClusterConfig, Effect, Input,
+        InstallSnapshotArgs, InstallSnapshotReply, Log, LogEntry, LogIndex, LogicalInstant,
+        MembershipChange, Message, NodeId, RaftNode, RequestVoteArgs, RequestVoteReply, Role, Term,
     };
 
     /// The core does not consult the clock under this timer model, so every
@@ -2971,6 +3266,151 @@ mod tests {
         n.log.truncate_after(LogIndex::ZERO);
         n.recompute_config();
         assert_eq!(n.config(), &config(&[1, 2, 3]));
+    }
+
+    // --- 10: single-server membership changes -----------------------------
+
+    /// A three-node leader for term 2 with one committed command at index 1.
+    fn three_node_leader() -> RaftNode {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(1);
+        drive(&mut n, Input::ElectionTimeout); // term 2, candidate
+        drive(&mut n, deliver(2, vote_reply(2, true))); // leader, term 2
+        drive(&mut n, propose(b"c0"));
+        drive(&mut n, deliver(2, ae_reply(2, true, 1))); // commit index 1
+        assert_eq!(n.commit_index(), LogIndex::new(1));
+        n
+    }
+
+    fn change(c: MembershipChange) -> Input {
+        Input::ChangeMembership { change: c }
+    }
+
+    #[test]
+    fn add_server_catches_up_then_appends_and_commits_a_config_entry() {
+        let mut n = three_node_leader();
+        let new = NodeId::new(4);
+
+        // The add begins as catch-up: a learner entry, no config entry yet.
+        let effects = n.step(change(MembershipChange::AddServer(new)), NOW);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::SendRpc { to, .. }] if *to == new
+        ));
+        assert!(!n.config().contains(new));
+        if let Role::Leader { next_index, .. } = n.role() {
+            assert!(next_index.contains_key(&new));
+        } else {
+            unreachable!("still leader");
+        }
+
+        // The new server acks up to the leader's last index -> promotion.
+        let last = n.log().last_index().get();
+        drive(&mut n, deliver(4, ae_reply(2, true, last)));
+        assert!(n.config().contains(new));
+        assert_eq!(n.config().len(), 4);
+
+        // A majority of the *new* configuration commits the config entry.
+        let config_index = n.log().last_index().get();
+        drive(&mut n, deliver(2, ae_reply(2, true, config_index)));
+        drive(&mut n, deliver(3, ae_reply(2, true, config_index)));
+        assert!(n.commit_index().get() >= config_index);
+        // The change is finished.
+        drive(&mut n, Input::HeartbeatTick);
+        drive(&mut n, deliver(4, ae_reply(2, true, config_index)));
+    }
+
+    #[test]
+    fn remove_server_appends_a_config_entry_immediately() {
+        let mut n = node(1, &[2, 3, 4, 5]);
+        n.current_term = Term::new(1);
+        drive(&mut n, Input::ElectionTimeout);
+        drive(&mut n, deliver(2, vote_reply(2, true)));
+        drive(&mut n, deliver(3, vote_reply(2, true)));
+        assert!(n.is_leader());
+
+        let effects = n.step(change(MembershipChange::RemoveServer(NodeId::new(5))), NOW);
+
+        assert_eq!(n.config().len(), 4);
+        assert!(!n.config().contains(NodeId::new(5)));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::MembershipChanged { config } if !config.contains(NodeId::new(5))
+        )));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::PersistLog { .. }))
+        );
+    }
+
+    #[test]
+    fn a_leader_that_removes_itself_steps_down_when_the_change_commits() {
+        let mut n = three_node_leader();
+
+        drive(
+            &mut n,
+            change(MembershipChange::RemoveServer(NodeId::new(1))),
+        );
+        assert!(n.is_leader()); // still leading until the entry commits
+        let config_index = n.log().last_index().get();
+
+        drive(&mut n, deliver(2, ae_reply(2, true, config_index)));
+        drive(&mut n, deliver(3, ae_reply(2, true, config_index)));
+
+        assert!(n.is_follower());
+        assert!(!n.config().contains(NodeId::new(1)));
+    }
+
+    #[test]
+    fn only_one_membership_change_at_a_time() {
+        let mut n = three_node_leader();
+        drive(&mut n, change(MembershipChange::AddServer(NodeId::new(4))));
+
+        // A second change while the first is in flight is ignored.
+        let effects = n.step(change(MembershipChange::RemoveServer(NodeId::new(3))), NOW);
+        assert!(effects.is_empty());
+        assert!(n.config().contains(NodeId::new(3)));
+        assert_eq!(n.config().len(), 3);
+    }
+
+    #[test]
+    fn a_stuck_add_server_is_abandoned_after_the_tick_budget() {
+        let mut n = three_node_leader();
+        let new = NodeId::new(4);
+        drive(&mut n, change(MembershipChange::AddServer(new)));
+
+        for _ in 0..CATCH_UP_TICKS {
+            drive(&mut n, Input::HeartbeatTick);
+        }
+
+        assert_eq!(n.config().len(), 3);
+        if let Role::Leader { next_index, .. } = n.role() {
+            assert!(!next_index.contains_key(&new));
+        } else {
+            unreachable!("still leader");
+        }
+        // A fresh change can start again.
+        let effects = n.step(change(MembershipChange::RemoveServer(NodeId::new(3))), NOW);
+        assert!(!effects.is_empty());
+    }
+
+    #[test]
+    fn a_catching_up_learner_does_not_count_toward_quorum() {
+        let mut n = three_node_leader();
+        let new = NodeId::new(4);
+        drive(&mut n, change(MembershipChange::AddServer(new)));
+
+        drive(&mut n, propose(b"c1")); // index 2
+        let idx = n.log().last_index().get();
+
+        // Only the learner acks: {1} of {1,2,3} is not a majority.
+        drive(&mut n, deliver(4, ae_reply(2, true, idx)));
+        assert_eq!(n.commit_index(), LogIndex::new(1));
+
+        // A real voter acks -> now committed.
+        drive(&mut n, deliver(2, ae_reply(2, true, idx)));
+        assert_eq!(n.commit_index().get(), idx);
     }
 
     #[test]
