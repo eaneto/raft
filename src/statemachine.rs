@@ -2,8 +2,8 @@
 //!
 //! The core decides *what* is committed and *in what order*; it hands the
 //! driver an [`Effect::ApplyToStateMachine`](crate::core::Effect::ApplyToStateMachine)
-//! for each entry, one at a time in index order (§9.10). The driver forwards
-//! that to a [`StateMachine`].
+//! for each entry, one at a time in strictly increasing index order and never
+//! past `commitIndex`. The driver forwards that to a [`StateMachine`].
 
 use bytes::Bytes;
 
@@ -13,8 +13,9 @@ use crate::core::LogIndex;
 ///
 /// [`StateMachine::apply`] is called exactly once per committed entry, in
 /// strictly increasing `index` order, and must be deterministic: two servers
-/// that apply the same commands in the same order must reach the same state
-/// (State Machine Safety, §9.5).
+/// that apply the same commands in the same order must reach the same state.
+/// This is what lets Raft guarantee that no two servers ever apply a different
+/// entry at the same index (State Machine Safety).
 pub trait StateMachine: Send {
     /// Applies the committed entry at `index`. `command` is the opaque bytes
     /// the client proposed.

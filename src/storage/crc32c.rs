@@ -1,10 +1,11 @@
 //! A small software CRC-32C (Castagnoli) implementation.
 //!
-//! `AGENTS.md` §8 rule 3 wants every on-disk record covered by a CRC32C. The
-//! polynomial is the reflected Castagnoli constant `0x82F6_3B78`; this is the
-//! same checksum SSE 4.2's `crc32` instruction computes, so a future
-//! hardware-accelerated version stays compatible. Performance is not a goal
-//! here (`AGENTS.md` §1), so this is the straightforward bit-at-a-time form
+//! Every on-disk record is length-prefixed and covered by a CRC32C so that
+//! recovery can tell a torn or corrupt tail from real data. The polynomial is
+//! the reflected Castagnoli constant `0x82F6_3B78`; this is the same checksum
+//! SSE 4.2's `crc32` instruction computes, so a future hardware-accelerated
+//! version stays compatible. This implementation favours being obviously
+//! correct over being fast, so it is the straightforward bit-at-a-time form
 //! with no lookup table.
 
 /// Reflected CRC-32C polynomial.

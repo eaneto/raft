@@ -9,21 +9,27 @@
 //! live here:
 //!
 //! - [`FileStorage`] — the real thing. A checksummed, append-only log file and
-//!   two redundant metadata files, each `fsync`ed, following the durability
-//!   rules in `AGENTS.md` §8.
+//!   two redundant metadata files, each `fsync`ed.
 //! - [`MemStorage`] — an in-memory implementation with selectable `fsync`
 //!   failure behaviour, for the deterministic simulator.
 //!
-//! ## Durability contract (`AGENTS.md` §8)
+//! ## Durability contract
+//!
+//! The rules below assume the worst-case `fsync` behaviour that Linux can
+//! exhibit regardless of filesystem: after `fsync` returns an error the OS may
+//! drop the dirty pages, a *later* `fsync` on the same file may then return `0`
+//! although the data never reached disk, and re-reads may serve cached bytes
+//! that were never persisted.
 //!
 //! - A failed `fsync` (file **or** directory) is **fatal**. A write method
 //!   returning [`Error::Sync`] means the driver must log at `error` and
-//!   terminate the process. It must never retry, and never treat a later
-//!   successful `fsync` as evidence the earlier data reached the disk.
+//!   terminate the process. Because a subsequent `fsync` can falsely report
+//!   success, there is no safe way to retry or to confirm the lost write
+//!   landed — the only correct response is to stop.
 //! - Every write method here `fsync`s before it returns, so a driver that
 //!   performs effects in order and only sends an RPC reply after the
-//!   corresponding [`Storage`] call returns `Ok` satisfies "persist before
-//!   reply".
+//!   corresponding [`Storage`] call returns `Ok` never tells a peer about a
+//!   vote or an entry that a crash could make it forget.
 //! - The log is a sequence of length-prefixed, CRC32C-checked records.
 //!   Recovery replays records until the first one that is short or fails its
 //!   checksum; a torn tail is **expected**, not corruption.
@@ -81,8 +87,8 @@ pub trait Storage {
     /// Returns [`Error::Io`] if the backing store cannot be read, or
     /// [`Error::Corrupt`] if the state is present but unusable (e.g. both
     /// metadata copies fail their checksum). On [`Error::Corrupt`] the driver
-    /// may discard all Raft state and rejoin the cluster as a fresh follower
-    /// (`AGENTS.md` §8 rule 7).
+    /// may discard all Raft state and rejoin the cluster as a fresh follower;
+    /// the leader then repopulates it via `InstallSnapshot` + `AppendEntries`.
     fn load(&mut self) -> Result<PersistentState, Error>;
 
     /// Durably records `current_term` and `voted_for`.
@@ -113,8 +119,10 @@ pub trait Storage {
 pub enum Error {
     /// An `fsync` / `fdatasync` on a file or directory returned an error.
     ///
-    /// **Fatal.** Per `AGENTS.md` §8 the driver must log this at `error` and
-    /// terminate; it must never retry or trust a later successful sync.
+    /// **Fatal.** The driver must log this at `error` and terminate the
+    /// process. A failed `fsync` may have caused the OS to drop the dirty
+    /// pages while a later `fsync` still reports success, so retrying or
+    /// trusting a subsequent sync would risk silently losing the write.
     Sync {
         /// The file or directory whose sync failed.
         path: PathBuf,
@@ -131,7 +139,7 @@ pub enum Error {
     /// Persistent state is present but unusable: both metadata copies failed
     /// their checksum, or a file is malformed in a way recovery cannot treat
     /// as a torn tail. The node may discard all Raft state and rejoin as a
-    /// fresh follower (`AGENTS.md` §8 rule 7).
+    /// fresh follower, to be repopulated by the leader.
     Corrupt {
         /// What was wrong.
         detail: String,
