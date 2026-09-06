@@ -29,6 +29,10 @@ this file just tracks the sequence of small steps and what's done.
 | `InstallSnapshot` | chunked wire format (`offset` + `done`); the reply echoes `last_included_index` so the core can set `matchIndex` without having sent the chunks. Effects `SendSnapshot { to }` / `StoreSnapshotChunk`; inputs `SnapshotInstalled` / `CompactLog` |
 | Compaction trigger | driver-owned: `Config::snapshot_threshold` entries past the last snapshot; core just trims on `CompactLog` |
 | Log-file layout | 8-byte start-index header so recovery can place records after compaction; snapshot written (tmp → rename → dir fsync) **before** the log prefix is dropped, so a crash between leaves a trimmable head, never a gap |
+| Membership changes | **single-server** (thesis §4), not joint consensus. Configuration is a `LogEntryKind::Config` entry; a server uses the latest config in its log, committed or not (§4.1). `RaftNode` derives `config` from the log, falling back to a snapshot's config or the bootstrap set |
+| Catch-up | a new server joins as a passive non-voting learner (`RaftNode::new_learner`); a leader replicates to it until its `matchIndex` reaches the log end, then appends the `Config` entry. Bounded by a heartbeat-tick budget (`CATCH_UP_TICKS`) — **DEVIATION** from thesis §4.2.1's election-timeout-long rounds, since the core has no clock |
+| Change lifecycle | `Input::ChangeMembership` → (catch-up) → `Config` entry → commit. A new leader with an uncommitted `Config` entry adopts the pending change. Leader steps down after committing a config that removes it (§4.2.2). A server absent from its own config stays passive. `Effect::MembershipChanged` drives transport reconciliation |
+| Deferred | removed-/rejoining-server election disruption before it learns of the change is Phase 2 (pre-vote); Phase 1 tests isolate such nodes |
 
 ## Done
 
@@ -86,13 +90,26 @@ this file just tracks the sequence of small steps and what's done.
       catch-up seed batteries. Also a docs pass making every module rustdoc
       self-contained (no `AGENTS.md` cross-references). — `2fc0644..2bfe542`
 
+- [x] **9. Cluster membership changes** — **single-server** (thesis §4), not
+      joint consensus. `LogEntry` becomes `{ term, kind }` with
+      `LogEntryKind::Command | Config`; `ClusterConfig` wraps a sorted voter
+      set. `RaftNode.config` is derived from the log (committed or not),
+      falling back to a snapshot's config or the bootstrap set; `quorum` /
+      `peers` follow it. `Input::ChangeMembership` with `AddServer` catch-up
+      (passive `new_learner`, heartbeat-tick budget — DEVIATION vs §4.2.1) and
+      immediate `RemoveServer`; a new leader adopts an in-flight change; a
+      self-removing leader steps down on commit (§4.2.2); a server absent from
+      its config stays passive. Storage: entry kind tag + config encoding,
+      `SnapshotMeta.config` threaded end to end. `TcpTransport::set_peers`;
+      `Node::add_server` / `remove_server` / `status`; `Effect::MembershipChanged`
+      → transport reconciliation. Sim + TCP integration coverage. Removed-node
+      disruption pre-vote is Phase 2. — `8f632cc..30c0225`
+
 ## Next
 
-- [ ] **9. Cluster membership changes** — prefer single-server (thesis §4); record
-      the decision when starting.
 - [ ] **Property-based tests** (`proptest`). Random cluster sizes + event
-      schedules; assert invariants §9.1–§9.5 after every step; shrink to a minimal
-      failing schedule.
+      schedules; assert the safety properties after every step; shrink to a
+      minimal failing schedule.
 - [ ] **Retire the prototype.** Bring `src/raft.rs` / `src/command.rs` up to
       standard one module at a time (dropping its `#[allow(...)]` in `src/lib.rs`
       in the same change), or delete each once the new code supersedes it.
