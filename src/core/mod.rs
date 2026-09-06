@@ -465,8 +465,7 @@ impl RaftNode {
                 Message::RequestVote(args) => self.handle_request_vote(args),
                 Message::RequestVoteReply(reply) => self.handle_request_vote_reply(from, reply),
                 Message::AppendEntries(args) => self.handle_append_entries(&args),
-                // Leader-side ack handling lands with log replication.
-                Message::AppendEntriesReply(_) => Vec::new(),
+                Message::AppendEntriesReply(reply) => self.handle_append_entries_reply(from, reply),
             },
             Input::ElectionTimeout => self.handle_election_timeout(),
             Input::HeartbeatTick => self.handle_heartbeat_tick(),
@@ -538,12 +537,9 @@ impl RaftNode {
         effects
     }
 
-    /// Handles an incoming `AppendEntries` (Figure 2).
-    ///
-    /// This step covers the term and role rules and the §5.3 log-matching
-    /// *check*; it does not yet truncate, append, or advance `commitIndex`
-    /// (Figure 2 receiver rules 3–5), which arrive with log replication. A
-    /// heartbeat carries no entries, so those rules are inert here.
+    /// Handles an incoming `AppendEntries` (Figure 2), including the receiver
+    /// rules 3–5: splice conflicting entries, append new ones, and advance
+    /// `commitIndex` from the leader's.
     ///
     /// Reception from the current leader (term `>=` ours) resets the election
     /// timer whether or not the consistency check passes — diverging logs do
@@ -555,7 +551,7 @@ impl RaftNode {
         // Receiver rule 1: reply false to a leader from an older term, and do
         // not treat it as leader contact.
         if args.term < self.current_term {
-            effects.push(self.append_entries_reply(args.leader_id, false));
+            effects.push(self.append_entries_reply(args.leader_id, false, LogIndex::ZERO));
             return effects;
         }
 
@@ -564,14 +560,182 @@ impl RaftNode {
         if args.term > self.current_term || self.is_candidate() {
             self.become_follower(args.term);
         }
+        self.persist_if_changed(before, &mut effects);
 
+        // Receiver rule 2: the log must contain `prev_log_index` with a
+        // matching term, or this is the empty-log base case.
         let consistent = args.prev_log_index == LogIndex::ZERO
             || self.log.term_at(args.prev_log_index) == Some(args.prev_log_term);
+        if !consistent {
+            effects.push(Effect::ResetElectionTimer);
+            effects.push(self.append_entries_reply(args.leader_id, false, LogIndex::ZERO));
+            return effects;
+        }
 
-        self.persist_if_changed(before, &mut effects);
+        // The last index this RPC vouches for: everything up to and including
+        // it now matches the leader (paper's "index of last new entry").
+        // usize -> u64 cannot lose bits on any platform Raft runs on.
+        let last_covered = LogIndex::new(args.prev_log_index.get() + args.entries.len() as u64);
+
+        // Receiver rules 3 & 4: splice in the entries that differ.
+        if let Some(from_index) = self.splice_entries(args.prev_log_index, &args.entries) {
+            effects.push(Effect::PersistLog {
+                from_index,
+                entries: self.log.entries_from(from_index).to_vec(),
+            });
+        }
+
+        // Receiver rule 5: adopt the leader's commit point, bounded by what
+        // this RPC actually covered.
+        if args.leader_commit > self.commit_index {
+            self.commit_index = args.leader_commit.min(last_covered);
+            self.apply_committed(&mut effects);
+        }
+
         effects.push(Effect::ResetElectionTimer);
-        effects.push(self.append_entries_reply(args.leader_id, consistent));
+        effects.push(self.append_entries_reply(args.leader_id, true, last_covered));
         effects
+    }
+
+    /// Applies `AppendEntries` receiver rules 3 & 4. Walks `entries` against
+    /// the log from just after `prev_log_index`; at the first index whose term
+    /// disagrees (or that the log lacks) it truncates the tail and appends the
+    /// remainder. Entries already present with a matching term are left as they
+    /// are, so a delayed or duplicated RPC never rewinds the log (Log
+    /// Matching, Leader Append-Only on the leader's behalf).
+    ///
+    /// Returns `Some(from_index)` — the 1-based index of the first entry
+    /// written — when the log changed, or `None` when every entry was already
+    /// present.
+    fn splice_entries(
+        &mut self,
+        prev_log_index: LogIndex,
+        entries: &[LogEntry],
+    ) -> Option<LogIndex> {
+        let mut index = prev_log_index;
+        for (offset, entry) in entries.iter().enumerate() {
+            index = index.next();
+            if self.log.term_at(index) == Some(entry.term) {
+                continue;
+            }
+            // Conflict, or past our end: drop anything from `index` on and
+            // take the leader's version of this suffix.
+            self.log.truncate_after(index.prev());
+            for new in &entries[offset..] {
+                self.log.append(new.clone());
+            }
+            return Some(index);
+        }
+        None
+    }
+
+    /// Emits [`Effect::ApplyToStateMachine`] for every entry from
+    /// `last_applied + 1` through `commit_index`, one at a time in index order,
+    /// advancing `last_applied` as it goes (§9.10, Applied-in-order). Stops if
+    /// an index is somehow missing rather than inventing a command.
+    fn apply_committed(&mut self, effects: &mut Vec<Effect>) {
+        while self.last_applied < self.commit_index {
+            let next = self.last_applied.next();
+            let Some(entry) = self.log.get(next) else {
+                break;
+            };
+            let command = entry.command.clone();
+            self.last_applied = next;
+            effects.push(Effect::ApplyToStateMachine {
+                index: next,
+                command,
+            });
+        }
+    }
+
+    /// Handles an `AppendEntriesReply` from `from` (Figure 2, leader side).
+    ///
+    /// A reply from a newer term steps us down. Otherwise, while we are still
+    /// the leader for the reply's term: `success` moves `match_index[from]` /
+    /// `next_index[from]` forward and may advance `commit_index` (§5.4.2);
+    /// failure decrements `next_index[from]` and retries straight away.
+    fn handle_append_entries_reply(
+        &mut self,
+        from: NodeId,
+        reply: AppendEntriesReply,
+    ) -> Vec<Effect> {
+        let before = (self.current_term, self.voted_for);
+        let mut effects = Vec::new();
+
+        if reply.term > self.current_term {
+            self.become_follower(reply.term);
+            self.persist_if_changed(before, &mut effects);
+            return effects;
+        }
+
+        // A stale reply, or one meant for a leadership we no longer hold.
+        if reply.term < self.current_term || !self.is_leader() {
+            return effects;
+        }
+
+        if reply.success {
+            self.record_match(from, reply.match_index);
+            self.maybe_advance_commit_index(&mut effects);
+        } else {
+            self.back_off(from);
+            effects.push(self.append_entries_to(from));
+        }
+        effects
+    }
+
+    /// Records a successful ack: `match_index[peer]` only moves forward (a
+    /// reordered older ack cannot pull it back) and `next_index[peer]` follows.
+    fn record_match(&mut self, peer: NodeId, matched: LogIndex) {
+        if let Role::Leader {
+            next_index,
+            match_index,
+        } = &mut self.role
+        {
+            if let Some(m) = match_index.get_mut(&peer) {
+                *m = matched.max(*m);
+            }
+            if let Some(n) = next_index.get_mut(&peer) {
+                *n = matched.next().max(*n);
+            }
+        }
+    }
+
+    /// Figure 2: on a failed `AppendEntries`, step `next_index` for the peer
+    /// back by one (never below 1) so the next attempt probes further back.
+    fn back_off(&mut self, peer: NodeId) {
+        if let Role::Leader { next_index, .. } = &mut self.role
+            && let Some(n) = next_index.get_mut(&peer)
+        {
+            *n = n.prev().max(LogIndex::new(1));
+        }
+    }
+
+    /// §5.4.2: advance `commit_index` to the highest index stored on a
+    /// majority (this leader included) — but only when that entry is from the
+    /// **current** term, so a leader never commits an earlier-term entry by
+    /// vote count alone (paper Figure 8). Older entries below it commit
+    /// indirectly, via [`RaftNode::apply_committed`]. Emits the resulting
+    /// applies.
+    fn maybe_advance_commit_index(&mut self, effects: &mut Vec<Effect>) {
+        let majority_matched = {
+            let Role::Leader { match_index, .. } = &self.role else {
+                return;
+            };
+            // Every server's match point: each peer's, plus our own log end.
+            let mut matched: Vec<LogIndex> = match_index.values().copied().collect();
+            matched.push(self.log.last_index());
+            matched.sort_unstable_by_key(|&index| std::cmp::Reverse(index));
+            // Sorted high -> low, position `quorum - 1` is the largest index
+            // that at least `quorum` servers hold.
+            matched[self.quorum() - 1]
+        };
+
+        if majority_matched > self.commit_index
+            && self.log.term_at(majority_matched) == Some(self.current_term)
+        {
+            self.commit_index = majority_matched;
+            self.apply_committed(effects);
+        }
     }
 
     /// Handles the election timer firing: a follower or candidate starts a new
@@ -631,10 +795,10 @@ impl RaftNode {
     /// sends every peer the entries it is missing. Any other role drops the
     /// proposal for now — client redirect to the leader is a later step.
     ///
-    /// The entry is **not** committed here. `commitIndex` advances only once a
-    /// current-term majority has stored the entry (§5.4.2), which is the
-    /// leader-side ack handling of the next step; until then a lone leader
-    /// makes no progress either.
+    /// A majority still has to store the entry before it commits (§5.4.2), so
+    /// on a multi-node cluster nothing is applied until the acks come back. A
+    /// lone leader is its own majority, so `maybe_advance_commit_index` commits
+    /// and applies the entry in this same step.
     fn handle_propose(&mut self, command: Bytes) -> Vec<Effect> {
         if !self.is_leader() {
             return Vec::new();
@@ -651,6 +815,7 @@ impl RaftNode {
             entries: self.log.entries_from(from_index).to_vec(),
         }];
         effects.extend(self.replicate_to_peers());
+        self.maybe_advance_commit_index(&mut effects);
         effects
     }
 
@@ -788,12 +953,21 @@ impl RaftNode {
     }
 
     /// Builds an `AppendEntriesReply` effect addressed to `leader`.
-    const fn append_entries_reply(&self, leader: NodeId, success: bool) -> Effect {
+    ///
+    /// `match_index` is the highest index the follower has stored for this
+    /// leader on `success`, and [`LogIndex::ZERO`] otherwise.
+    const fn append_entries_reply(
+        &self,
+        leader: NodeId,
+        success: bool,
+        match_index: LogIndex,
+    ) -> Effect {
         Effect::SendRpc {
             to: leader,
             message: Message::AppendEntriesReply(AppendEntriesReply {
                 term: self.current_term,
                 success,
+                match_index,
             }),
         }
     }
@@ -895,6 +1069,13 @@ mod tests {
         }
     }
 
+    fn entry_cmd(term: u64, command: &'static [u8]) -> LogEntry {
+        LogEntry {
+            term: Term::new(term),
+            command: Bytes::from_static(command),
+        }
+    }
+
     fn node(id: u64, peers: &[u64]) -> RaftNode {
         RaftNode::new(NodeId::new(id), peers.iter().copied().map(NodeId::new))
     }
@@ -926,14 +1107,37 @@ mod tests {
         })
     }
 
+    /// A failed/heartbeat `AppendEntriesReply` effect: `match_index` is zero.
     fn append_reply(to: u64, term: u64, success: bool) -> Effect {
         Effect::SendRpc {
             to: NodeId::new(to),
             message: Message::AppendEntriesReply(AppendEntriesReply {
                 term: Term::new(term),
                 success,
+                match_index: LogIndex::ZERO,
             }),
         }
+    }
+
+    /// A successful `AppendEntriesReply` effect carrying `matched`.
+    fn ack(to: u64, term: u64, matched: u64) -> Effect {
+        Effect::SendRpc {
+            to: NodeId::new(to),
+            message: Message::AppendEntriesReply(AppendEntriesReply {
+                term: Term::new(term),
+                success: true,
+                match_index: LogIndex::new(matched),
+            }),
+        }
+    }
+
+    /// An incoming `AppendEntriesReply` message.
+    fn ae_reply(term: u64, success: bool, matched: u64) -> Message {
+        Message::AppendEntriesReply(AppendEntriesReply {
+            term: Term::new(term),
+            success,
+            match_index: LogIndex::new(matched),
+        })
     }
 
     fn append_entries(
@@ -942,6 +1146,7 @@ mod tests {
         prev_log_index: u64,
         prev_log_term: u64,
         entries: Vec<LogEntry>,
+        leader_commit: u64,
     ) -> Message {
         Message::AppendEntries(AppendEntriesArgs {
             term: Term::new(term),
@@ -949,7 +1154,7 @@ mod tests {
             prev_log_index: LogIndex::new(prev_log_index),
             prev_log_term: Term::new(prev_log_term),
             entries,
-            leader_commit: LogIndex::ZERO,
+            leader_commit: LogIndex::new(leader_commit),
         })
     }
 
@@ -1479,8 +1684,8 @@ mod tests {
                     from_index: LogIndex::new(1),
                     entries: tail.clone(),
                 },
-                send(2, append_entries(1, 1, 0, 0, tail.clone())),
-                send(3, append_entries(1, 1, 0, 0, tail)),
+                send(2, append_entries(1, 1, 0, 0, tail.clone(), 0)),
+                send(3, append_entries(1, 1, 0, 0, tail, 0)),
             ],
         );
     }
@@ -1512,10 +1717,12 @@ mod tests {
         drive(&mut n, propose(b"cmd"));
         let effects = n.step(propose(b"cmd"), NOW);
 
-        // No ack handling yet, so `next_index` for both peers is still 1: the
+        // No ack has come back, so `next_index` for both peers is still 1: the
         // PersistLog covers only the new entry, but the AppendEntries carries
-        // the whole uncommitted tail.
+        // the whole uncommitted tail. Nothing commits — the leader is one of
+        // three.
         assert_eq!(n.log().len(), 2);
+        assert_eq!(n.commit_index(), LogIndex::ZERO);
         assert_eq!(
             effects,
             vec![
@@ -1523,8 +1730,8 @@ mod tests {
                     from_index: LogIndex::new(2),
                     entries: vec![entry(1)],
                 },
-                send(2, append_entries(1, 1, 0, 0, vec![entry(1), entry(1)])),
-                send(3, append_entries(1, 1, 0, 0, vec![entry(1), entry(1)])),
+                send(2, append_entries(1, 1, 0, 0, vec![entry(1), entry(1)], 0)),
+                send(3, append_entries(1, 1, 0, 0, vec![entry(1), entry(1)], 0)),
             ],
         );
     }
@@ -1541,8 +1748,292 @@ mod tests {
         assert_eq!(
             effects,
             vec![
-                send(2, append_entries(1, 1, 0, 0, vec![entry(1)])),
-                send(3, append_entries(1, 1, 0, 0, vec![entry(1)])),
+                send(2, append_entries(1, 1, 0, 0, vec![entry(1)], 0)),
+                send(3, append_entries(1, 1, 0, 0, vec![entry(1)], 0)),
+            ],
+        );
+    }
+
+    // --- 5b: follower splice (AppendEntries receiver rules 3-5) ------------
+
+    #[test]
+    fn append_entries_appends_new_entries_to_an_empty_log() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(1);
+
+        let entries = vec![entry_cmd(1, b"a"), entry_cmd(1, b"b")];
+        let effects = n.step(
+            deliver(2, append_entries(1, 2, 0, 0, entries.clone(), 0)),
+            NOW,
+        );
+
+        assert_eq!(n.log().entries_from(LogIndex::new(1)), entries.as_slice());
+        assert_eq!(
+            effects,
+            vec![
+                Effect::PersistLog {
+                    from_index: LogIndex::new(1),
+                    entries,
+                },
+                Effect::ResetElectionTimer,
+                ack(2, 1, 2),
+            ],
+        );
+    }
+
+    #[test]
+    fn append_entries_truncates_a_conflicting_tail_then_appends() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(3);
+        n.log.append(entry(1)); // index 1, term 1
+        n.log.append(entry(2)); // index 2, term 2
+        n.log.append(entry(3)); // index 3, term 3
+
+        // The leader agrees up to index 2, then has term 2 at index 3 where we
+        // have term 3: index 3 is a conflict and must be replaced.
+        let incoming = vec![entry(2), entry_cmd(2, b"z")];
+        let effects = n.step(deliver(2, append_entries(3, 2, 1, 1, incoming, 0)), NOW);
+
+        assert_eq!(n.log().len(), 3);
+        assert_eq!(n.log().get(LogIndex::new(2)), Some(&entry(2))); // untouched
+        assert_eq!(n.log().get(LogIndex::new(3)), Some(&entry_cmd(2, b"z")));
+        assert_eq!(
+            effects,
+            vec![
+                Effect::PersistLog {
+                    from_index: LogIndex::new(3),
+                    entries: vec![entry_cmd(2, b"z")],
+                },
+                Effect::ResetElectionTimer,
+                ack(2, 3, 3),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_duplicate_append_entries_does_not_rewrite_the_log() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(1);
+        n.log.append(entry_cmd(1, b"a"));
+        n.log.append(entry_cmd(1, b"b"));
+
+        let dup = vec![entry_cmd(1, b"a"), entry_cmd(1, b"b")];
+        let effects = n.step(deliver(2, append_entries(1, 2, 0, 0, dup, 0)), NOW);
+
+        // Every entry was already present: no splice, no PersistLog.
+        assert_eq!(n.log().len(), 2);
+        assert_eq!(effects, vec![Effect::ResetElectionTimer, ack(2, 1, 2)]);
+    }
+
+    #[test]
+    fn append_entries_advances_commit_index_and_emits_applies_in_order() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(1);
+
+        let entries = vec![entry_cmd(1, b"a"), entry_cmd(1, b"b")];
+        let effects = n.step(
+            deliver(2, append_entries(1, 2, 0, 0, entries.clone(), 2)),
+            NOW,
+        );
+
+        assert_eq!(n.commit_index(), LogIndex::new(2));
+        assert_eq!(n.last_applied(), LogIndex::new(2));
+        assert_eq!(
+            effects,
+            vec![
+                Effect::PersistLog {
+                    from_index: LogIndex::new(1),
+                    entries,
+                },
+                Effect::ApplyToStateMachine {
+                    index: LogIndex::new(1),
+                    command: Bytes::from_static(b"a"),
+                },
+                Effect::ApplyToStateMachine {
+                    index: LogIndex::new(2),
+                    command: Bytes::from_static(b"b"),
+                },
+                Effect::ResetElectionTimer,
+                ack(2, 1, 2),
+            ],
+        );
+    }
+
+    #[test]
+    fn leader_commit_is_clamped_to_what_the_rpc_covered() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(1);
+
+        let effects = n.step(
+            deliver(2, append_entries(1, 2, 0, 0, vec![entry_cmd(1, b"a")], 9)),
+            NOW,
+        );
+
+        assert_eq!(n.commit_index(), LogIndex::new(1));
+        assert_eq!(n.last_applied(), LogIndex::new(1));
+        assert_eq!(
+            effects,
+            vec![
+                Effect::PersistLog {
+                    from_index: LogIndex::new(1),
+                    entries: vec![entry_cmd(1, b"a")],
+                },
+                Effect::ApplyToStateMachine {
+                    index: LogIndex::new(1),
+                    command: Bytes::from_static(b"a"),
+                },
+                Effect::ResetElectionTimer,
+                ack(2, 1, 1),
+            ],
+        );
+    }
+
+    // --- 5b: leader ack handling -----------------------------------------
+
+    #[test]
+    fn a_successful_ack_from_one_peer_commits_in_a_three_node_cluster() {
+        let mut n = node(1, &[2, 3]);
+        drive(&mut n, Input::ElectionTimeout);
+        drive(&mut n, deliver(2, vote_reply(1, true)));
+        drive(&mut n, propose(b"x"));
+        assert_eq!(n.commit_index(), LogIndex::ZERO); // leader alone: not yet
+
+        let effects = n.step(deliver(2, ae_reply(1, true, 1)), NOW);
+
+        // Peer 2 plus the leader is a majority of three.
+        assert_eq!(n.commit_index(), LogIndex::new(1));
+        assert_eq!(n.last_applied(), LogIndex::new(1));
+        assert_eq!(
+            effects,
+            vec![Effect::ApplyToStateMachine {
+                index: LogIndex::new(1),
+                command: Bytes::from_static(b"x"),
+            }],
+        );
+    }
+
+    #[test]
+    fn a_failed_ack_backs_off_next_index_and_retries_immediately() {
+        let mut n = node(1, &[2, 3]);
+        // Two entries already on this node before it wins, so as leader its
+        // `next_index` for every peer starts at 3.
+        n.log.append(entry(1));
+        n.log.append(entry(1));
+        n.current_term = Term::new(1);
+        drive(&mut n, Input::ElectionTimeout); // term 2, candidate
+        drive(&mut n, deliver(2, vote_reply(2, true))); // leader, term 2
+
+        let effects = n.step(deliver(2, ae_reply(2, false, 0)), NOW);
+
+        // next_index[2] 3 -> 2: retry anchors at index 1, carrying index 2 on.
+        assert_eq!(
+            effects,
+            vec![send(2, append_entries(2, 1, 1, 1, vec![entry(1)], 0))],
+        );
+
+        // A second failure walks it back once more: anchor at 0, whole log.
+        let effects = n.step(deliver(2, ae_reply(2, false, 0)), NOW);
+        assert_eq!(
+            effects,
+            vec![send(
+                2,
+                append_entries(2, 1, 0, 0, vec![entry(1), entry(1)], 0)
+            )],
+        );
+    }
+
+    #[test]
+    fn an_ack_from_a_newer_term_makes_the_leader_step_down() {
+        let mut n = node(1, &[2, 3]);
+        drive(&mut n, Input::ElectionTimeout);
+        drive(&mut n, deliver(2, vote_reply(1, true)));
+        assert!(n.is_leader());
+
+        let effects = n.step(deliver(3, ae_reply(7, false, 0)), NOW);
+
+        assert!(n.is_follower());
+        assert_eq!(n.current_term(), Term::new(7));
+        assert_eq!(n.voted_for(), None);
+        assert_eq!(
+            effects,
+            vec![Effect::Persist {
+                current_term: Term::new(7),
+                voted_for: None,
+            }],
+        );
+    }
+
+    #[test]
+    fn a_stale_ack_is_ignored() {
+        let mut n = node(1, &[2, 3]);
+        n.log.append(entry(1));
+        n.current_term = Term::new(1);
+        drive(&mut n, Input::ElectionTimeout); // term 2
+        drive(&mut n, deliver(2, vote_reply(2, true))); // leader, term 2
+
+        let effects = n.step(deliver(2, ae_reply(1, true, 1)), NOW);
+
+        assert!(effects.is_empty());
+        assert_eq!(n.commit_index(), LogIndex::ZERO);
+        assert!(n.is_leader());
+    }
+
+    #[test]
+    fn a_prior_term_entry_commits_only_behind_a_current_term_entry() {
+        let mut n = node(1, &[2, 3]);
+        n.log.append(entry_cmd(1, b"old")); // index 1, term 1
+        n.current_term = Term::new(1);
+        drive(&mut n, Input::ElectionTimeout); // term 2, candidate
+        drive(&mut n, deliver(2, vote_reply(2, true))); // leader, term 2
+
+        // The term-1 entry reaches a majority, but a leader never commits an
+        // earlier term's entry by count alone (paper Figure 8).
+        let effects = n.step(deliver(2, ae_reply(2, true, 1)), NOW);
+        assert_eq!(n.commit_index(), LogIndex::ZERO);
+        assert!(effects.is_empty());
+
+        // A current-term entry at index 2 now reaches a majority.
+        drive(&mut n, propose(b"new"));
+        let effects = n.step(deliver(2, ae_reply(2, true, 2)), NOW);
+
+        // Committing index 2 carries index 1 with it, applied in order.
+        assert_eq!(n.commit_index(), LogIndex::new(2));
+        assert_eq!(n.last_applied(), LogIndex::new(2));
+        assert_eq!(
+            effects,
+            vec![
+                Effect::ApplyToStateMachine {
+                    index: LogIndex::new(1),
+                    command: Bytes::from_static(b"old"),
+                },
+                Effect::ApplyToStateMachine {
+                    index: LogIndex::new(2),
+                    command: Bytes::from_static(b"new"),
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn a_lone_leader_commits_and_applies_a_proposal_in_one_step() {
+        let mut n = node(1, &[]);
+        drive(&mut n, Input::ElectionTimeout); // sole vote -> leader, term 1
+
+        let effects = n.step(propose(b"solo"), NOW);
+
+        assert_eq!(n.commit_index(), LogIndex::new(1));
+        assert_eq!(n.last_applied(), LogIndex::new(1));
+        assert_eq!(
+            effects,
+            vec![
+                Effect::PersistLog {
+                    from_index: LogIndex::new(1),
+                    entries: vec![entry_cmd(1, b"solo")],
+                },
+                Effect::ApplyToStateMachine {
+                    index: LogIndex::new(1),
+                    command: Bytes::from_static(b"solo"),
+                },
             ],
         );
     }

@@ -7,6 +7,7 @@
 //!
 //! See AGENTS.md "Testing standards".
 
+use bytes::Bytes;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -41,6 +42,10 @@ struct Sim {
     election_deadline: Vec<u64>,
     heartbeat_deadline: Vec<u64>,
     inflight: Vec<Envelope>,
+    /// Per node, the `(index, command)` pairs the core told it to apply, in
+    /// the order it was told. The event loop asserts index order as it fills
+    /// this; tests then check the nodes agree.
+    applied: Vec<Vec<(u64, Bytes)>>,
     rng: StdRng,
 }
 
@@ -63,6 +68,7 @@ impl Sim {
             election_deadline,
             heartbeat_deadline,
             inflight: Vec::new(),
+            applied: vec![Vec::new(); node_count],
             rng,
         }
     }
@@ -135,11 +141,18 @@ impl Sim {
                 Effect::ResetElectionTimer => {
                     self.election_deadline[i] = self.arm_election();
                 }
-                // No durability model yet, and nothing is committed to apply
-                // until log replication.
-                Effect::Persist { .. }
-                | Effect::PersistLog { .. }
-                | Effect::ApplyToStateMachine { .. } => {}
+                Effect::ApplyToStateMachine { index, command } => {
+                    let expected = self.applied[i].len() as u64 + 1;
+                    assert_eq!(
+                        index.get(),
+                        expected,
+                        "node {i} applied index {} out of order (expected {expected})",
+                        index.get(),
+                    );
+                    self.applied[i].push((index.get(), command));
+                }
+                // No durability model yet (that is step 6).
+                Effect::Persist { .. } | Effect::PersistLog { .. } => {}
             }
         }
 
@@ -160,6 +173,30 @@ impl Sim {
         (0..self.nodes.len())
             .filter(|&i| self.nodes[i].is_leader())
             .collect()
+    }
+
+    /// The single current leader, or `None` if there is not exactly one.
+    fn sole_leader(&self) -> Option<usize> {
+        match self.leaders().as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        }
+    }
+
+    /// Feeds `command` to the current leader as a client proposal and routes
+    /// the resulting effects.
+    fn propose(&mut self, seed: u64, command: &[u8]) {
+        let leader = self.sole_leader();
+        assert!(
+            leader.is_some(),
+            "seed={seed}: no sole leader to accept a proposal",
+        );
+        self.step(
+            leader.unwrap_or(0),
+            Input::Propose {
+                command: Bytes::copy_from_slice(command),
+            },
+        );
     }
 }
 
@@ -218,5 +255,73 @@ fn three_node_cluster_elects_one_stable_leader() {
 fn five_node_cluster_elects_one_stable_leader() {
     for seed in seeds(&[1, 7, 99, 0x00C0_FFEE]) {
         assert_converges_to_one_stable_leader(5, seed);
+    }
+}
+
+/// On a reliable network, commands proposed to the leader replicate to every
+/// node, commit, and get applied in the same order everywhere.
+fn assert_proposals_replicate_and_commit(node_count: usize, seed: u64) {
+    let commands: [&[u8]; 4] = [b"set x=1", b"set y=2", b"del x", b"set y=3"];
+
+    let mut sim = Sim::new(node_count, seed);
+    sim.run_until(1_000);
+    assert!(
+        sim.sole_leader().is_some(),
+        "seed={seed}: no leader by t=1000",
+    );
+
+    for command in commands {
+        sim.propose(seed, command);
+        sim.run_until(sim.now + 250); // let one round of replication settle
+    }
+    sim.run_until(sim.now + 1_000); // and a few heartbeats to carry commit
+
+    let want: Vec<Bytes> = commands.iter().map(|c| Bytes::copy_from_slice(c)).collect();
+    let n = commands.len() as u64;
+
+    let leader = sim.sole_leader();
+    assert!(
+        leader.is_some(),
+        "seed={seed}: no sole leader after proposals",
+    );
+    let leader = leader.unwrap_or(0);
+    let leader_log = sim.nodes[leader].log().clone();
+
+    for i in 0..node_count {
+        let node = &sim.nodes[i];
+        assert_eq!(
+            node.log(),
+            &leader_log,
+            "seed={seed}: node {i} log diverges from leader {leader}",
+        );
+        assert_eq!(
+            node.commit_index().get(),
+            n,
+            "seed={seed}: node {i} commit_index {} != {n}",
+            node.commit_index().get(),
+        );
+        assert!(
+            node.last_applied().get() <= node.commit_index().get(),
+            "seed={seed}: node {i} applied past its commit index",
+        );
+        let applied: Vec<Bytes> = sim.applied[i].iter().map(|(_, cmd)| cmd.clone()).collect();
+        assert_eq!(
+            applied, want,
+            "seed={seed}: node {i} applied the wrong commands or order",
+        );
+    }
+}
+
+#[test]
+fn three_node_cluster_replicates_and_commits_proposals() {
+    for seed in seeds(&[1, 2, 3, 42, 1_000, 0x5EED]) {
+        assert_proposals_replicate_and_commit(3, seed);
+    }
+}
+
+#[test]
+fn five_node_cluster_replicates_and_commits_proposals() {
+    for seed in seeds(&[1, 7, 99, 0x00C0_FFEE]) {
+        assert_proposals_replicate_and_commit(5, seed);
     }
 }
