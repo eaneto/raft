@@ -60,6 +60,13 @@ pub struct AppendEntriesReply {
     /// `true` if the follower's log contained an entry matching
     /// `prev_log_index` and `prev_log_term`.
     pub success: bool,
+    /// On `success`, the highest log index the follower has now stored for
+    /// this leader — `prev_log_index + entries.len()`. The leader copies it
+    /// straight into `matchIndex` for this peer, which is why a bare
+    /// term/success reply is not enough (this mirrors `mmatchIndex` in
+    /// Ongaro's TLA+ spec). Meaningless and set to [`LogIndex::ZERO`] when
+    /// `success` is `false`.
+    pub match_index: LogIndex,
 }
 
 /// A message between peers: one of the four in Figure 2.
