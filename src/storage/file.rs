@@ -24,26 +24,44 @@ use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 
-use super::{Error, PersistentState, Storage, crc32c};
+use super::{Error, PersistentState, Snapshot, SnapshotMeta, Storage, crc32c};
 use crate::core::{LogEntry, LogIndex, NodeId, Term};
 
 /// The on-disk metadata record is fixed size: crc(4) + term(8) + flag(1) +
 /// vote(8).
 const META_LEN: usize = 21;
 
+/// The `log` file opens with an 8-byte little-endian `u64` giving the global
+/// 1-based index of its first record: `1` for a never-compacted log,
+/// `snapshot_last_index + 1` afterwards. It lets recovery place the records
+/// without stamping an index on every one.
+const LOG_HEADER_LEN: u64 = 8;
+
+/// The snapshot file and the sibling it is staged in before an atomic rename.
+const SNAPSHOT_FILE: &str = "snapshot";
+const SNAPSHOT_TMP: &str = "snapshot.tmp";
+
+/// Fixed-size head of the snapshot file: `crc(4)` + `last_included_index(8)` +
+/// `last_included_term(8)` + `data_len(8)`.
+const SNAPSHOT_HEAD_LEN: usize = 28;
+
 /// Disk-backed durable storage for one Raft server.
 ///
 /// Call [`FileStorage::load`] once before any `persist_*` call: it recovers
-/// the log and, in doing so, learns the byte offset of every record, which
-/// [`FileStorage::persist_log`] needs in order to truncate.
+/// the log and, in doing so, learns the byte offset of every record and the
+/// index the log starts at, which [`FileStorage::persist_log`] and
+/// [`FileStorage::persist_snapshot`] need in order to truncate.
 #[derive(Debug)]
 pub struct FileStorage {
     dir: PathBuf,
     log_path: PathBuf,
     log: File,
-    /// Byte offset just past record `k`, for every stored record. Its length
-    /// is the number of entries currently on disk.
+    /// Byte offset (from the start of the file, [`LOG_HEADER_LEN`] header
+    /// included) just past record `k`, for every record currently on disk.
     record_ends: Vec<u64>,
+    /// Global 1-based index of the first on-disk record — the `log` file's
+    /// header. Equals `snapshot_last_index + 1`.
+    log_start: u64,
     loaded: bool,
 }
 
@@ -69,7 +87,7 @@ impl FileStorage {
 
         let log_path = dir.join("log");
         let existed = log_path.exists();
-        let log = OpenOptions::new()
+        let mut log = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -80,6 +98,16 @@ impl FileStorage {
                 source,
             })?;
         if !existed {
+            // A fresh log starts at index 1; write and sync its header.
+            log.write_all(&1u64.to_le_bytes())
+                .map_err(|source| Error::Io {
+                    path: log_path.clone(),
+                    source,
+                })?;
+            log.sync_all().map_err(|source| Error::Sync {
+                path: log_path.clone(),
+                source,
+            })?;
             sync_dir(&dir)?;
         }
 
@@ -88,6 +116,7 @@ impl FileStorage {
             log_path,
             log,
             record_ends: Vec::new(),
+            log_start: 1,
             loaded: false,
         })
     }
@@ -103,9 +132,25 @@ impl FileStorage {
             .seek(SeekFrom::Start(0))
             .map_err(|source| self.io(source))?;
 
+        // The 8-byte start-index header. A file too short to hold it is a
+        // fresh or torn header: reset it to "starts at index 1".
+        let mut header_bytes = [0u8; 8];
+        match read_exact_or_eof(&mut self.log, &mut header_bytes)
+            .map_err(|source| self.io(source))?
+        {
+            ReadOutcome::Full => {
+                self.log_start = u64::from_le_bytes(header_bytes).max(1);
+            }
+            ReadOutcome::Eof | ReadOutcome::Short => {
+                self.rewrite_log(1, &[])?;
+                self.record_ends = Vec::new();
+                return Ok(Vec::new());
+            }
+        }
+
         let mut entries = Vec::new();
         let mut ends = Vec::new();
-        let mut offset: u64 = 0;
+        let mut offset: u64 = LOG_HEADER_LEN;
 
         loop {
             let mut header = [0u8; 8];
@@ -163,16 +208,137 @@ impl FileStorage {
             source,
         }
     }
+
+    /// Reads the `snapshot` file, or `Ok(None)` if there is none.
+    ///
+    /// The rename in [`FileStorage::persist_snapshot`] is atomic, so a file
+    /// that exists is complete; a checksum failure is real corruption, not a
+    /// torn tail, and surfaces as [`Error::Corrupt`].
+    fn load_snapshot(&self) -> Result<Option<Snapshot>, Error> {
+        let path = self.dir.join(SNAPSHOT_FILE);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(Error::Io { path, source }),
+        };
+        if bytes.len() < SNAPSHOT_HEAD_LEN {
+            return Err(Error::Corrupt {
+                detail: "snapshot file is shorter than its header".to_string(),
+            });
+        }
+        let want_crc = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let body = &bytes[4..];
+        if crc32c(body) != want_crc {
+            return Err(Error::Corrupt {
+                detail: "snapshot checksum mismatch".to_string(),
+            });
+        }
+        let index = u64::from_le_bytes([
+            body[0], body[1], body[2], body[3], body[4], body[5], body[6], body[7],
+        ]);
+        let term = u64::from_le_bytes([
+            body[8], body[9], body[10], body[11], body[12], body[13], body[14], body[15],
+        ]);
+        let data_len = u64::from_le_bytes([
+            body[16], body[17], body[18], body[19], body[20], body[21], body[22], body[23],
+        ]);
+        let data = usize::try_from(data_len)
+            .ok()
+            .and_then(|len| body.get(24..)?.get(..len))
+            .ok_or_else(|| Error::Corrupt {
+                detail: "snapshot data is shorter than its length prefix".to_string(),
+            })?;
+        Ok(Some(Snapshot {
+            meta: SnapshotMeta {
+                last_included_index: LogIndex::new(index),
+                last_included_term: Term::new(term),
+            },
+            data: Bytes::copy_from_slice(data),
+        }))
+    }
+
+    /// Drops the first `drop` on-disk records and rewrites the log with header
+    /// `new_start`, `fsync`ing the result. Remaps `record_ends` for the
+    /// survivors.
+    fn drop_log_prefix(&mut self, drop: usize, new_start: u64) -> Result<(), Error> {
+        let byte_start = if drop == 0 {
+            LOG_HEADER_LEN
+        } else {
+            self.record_ends[drop - 1]
+        };
+        self.log
+            .seek(SeekFrom::Start(byte_start))
+            .map_err(|source| self.io(source))?;
+        let mut surviving = Vec::new();
+        self.log
+            .read_to_end(&mut surviving)
+            .map_err(|source| self.io(source))?;
+        self.rewrite_log(new_start, &surviving)?;
+
+        let shift = byte_start - LOG_HEADER_LEN;
+        self.record_ends = self.record_ends.split_off(drop);
+        for end in &mut self.record_ends {
+            *end -= shift;
+        }
+        Ok(())
+    }
+
+    /// Truncates the log to nothing and writes `[start header][records]`,
+    /// `fsync`ing before returning.
+    fn rewrite_log(&mut self, start: u64, records: &[u8]) -> Result<(), Error> {
+        self.log.set_len(0).map_err(|source| self.io(source))?;
+        self.log
+            .seek(SeekFrom::Start(0))
+            .map_err(|source| self.io(source))?;
+        self.log
+            .write_all(&start.to_le_bytes())
+            .map_err(|source| self.io(source))?;
+        self.log
+            .write_all(records)
+            .map_err(|source| self.io(source))?;
+        self.log.sync_all().map_err(|source| Error::Sync {
+            path: self.log_path.clone(),
+            source,
+        })
+    }
 }
 
 impl Storage for FileStorage {
     fn load(&mut self) -> Result<PersistentState, Error> {
         let (current_term, voted_for) = load_metadata(&self.meta_path(0), &self.meta_path(1))?;
-        let entries = self.recover_log()?;
+        let snapshot = self.load_snapshot()?;
+        let mut entries = self.recover_log()?;
+
+        // If a crash landed between `persist_snapshot` making a snapshot
+        // durable and it rewriting the log, the log still carries a few
+        // records the snapshot now covers. Drop them so `entries[0]` sits at
+        // `last_included_index + 1`.
+        if let Some(snap) = &snapshot {
+            let first_kept = snap.meta.last_included_index.get() + 1;
+            if first_kept >= self.log_start {
+                let drop = usize::try_from(first_kept - self.log_start)
+                    .unwrap_or(usize::MAX)
+                    .min(entries.len());
+                if drop > 0 {
+                    self.drop_log_prefix(drop, first_kept)?;
+                    entries.drain(..drop);
+                }
+                self.log_start = first_kept;
+            } else {
+                return Err(Error::Corrupt {
+                    detail: format!(
+                        "log starts at index {} but the snapshot only covers through {}",
+                        self.log_start, snap.meta.last_included_index,
+                    ),
+                });
+            }
+        }
+
         self.loaded = true;
         Ok(PersistentState {
             current_term,
             voted_for,
+            snapshot,
             entries,
         })
     }
@@ -215,20 +381,21 @@ impl Storage for FileStorage {
 
     fn persist_log(&mut self, from_index: LogIndex, entries: &[LogEntry]) -> Result<(), Error> {
         debug_assert!(self.loaded, "persist_log called before load");
-        // The core only ever passes `1 <= from_index <= len + 1`. Clamp
-        // defensively so a bug cannot truncate to a wild offset; the
+        // The core only ever passes `log_start <= from_index <= len + 1`.
+        // Clamp defensively so a bug cannot truncate to a wild offset; the
         // `debug_assert` fails loudly in tests.
         let stored = self.record_ends.len();
-        let wanted = from_index.get().saturating_sub(1);
+        let wanted = from_index.get().saturating_sub(self.log_start);
         let keep = usize::try_from(wanted).unwrap_or(usize::MAX).min(stored);
         debug_assert!(
             keep as u64 == wanted,
-            "persist_log from_index {} out of range for {stored} stored entries",
+            "persist_log from_index {} out of range (log starts at {}, {stored} stored)",
             from_index.get(),
+            self.log_start,
         );
 
         let mut offset = if keep == 0 {
-            0
+            LOG_HEADER_LEN
         } else {
             self.record_ends[keep - 1]
         };
@@ -251,6 +418,54 @@ impl Storage for FileStorage {
             path: self.log_path.clone(),
             source,
         })
+    }
+
+    fn persist_snapshot(&mut self, meta: SnapshotMeta, data: &[u8]) -> Result<(), Error> {
+        debug_assert!(self.loaded, "persist_snapshot called before load");
+
+        // 1. Write the snapshot durably: staging file, fsync, atomic rename,
+        //    directory fsync. After this the snapshot at `last_included_index`
+        //    has reached the disk.
+        let tmp = self.dir.join(SNAPSHOT_TMP);
+        let final_path = self.dir.join(SNAPSHOT_FILE);
+        let record = encode_snapshot(meta, data);
+        {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp)
+                .map_err(|source| Error::Io {
+                    path: tmp.clone(),
+                    source,
+                })?;
+            file.write_all(&record).map_err(|source| Error::Io {
+                path: tmp.clone(),
+                source,
+            })?;
+            file.sync_all().map_err(|source| Error::Sync {
+                path: tmp.clone(),
+                source,
+            })?;
+        }
+        std::fs::rename(&tmp, &final_path).map_err(|source| Error::Io {
+            path: final_path.clone(),
+            source,
+        })?;
+        sync_dir(&self.dir)?;
+
+        // 2. Drop the now-covered prefix of the log and rewrite it with the
+        //    new start index. A crash between steps 1 and 2 leaves a log with
+        //    a covered head that `load` trims.
+        let first_kept = meta.last_included_index.get() + 1;
+        if first_kept > self.log_start {
+            let drop = usize::try_from(first_kept - self.log_start)
+                .unwrap_or(usize::MAX)
+                .min(self.record_ends.len());
+            self.drop_log_prefix(drop, first_kept)?;
+            self.log_start = first_kept;
+        }
+        Ok(())
     }
 }
 
@@ -305,6 +520,21 @@ fn encode_metadata(current_term: Term, voted_for: Option<NodeId>) -> [u8; META_L
     record[0..4].copy_from_slice(&crc32c(&payload).to_le_bytes());
     record[4..].copy_from_slice(&payload);
     record
+}
+
+/// `[u32 LE crc32c of the rest][u64 LE last_included_index][u64 LE
+/// last_included_term][u64 LE data length][data]`.
+fn encode_snapshot(meta: SnapshotMeta, data: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(SNAPSHOT_HEAD_LEN - 4 + data.len());
+    body.extend_from_slice(&meta.last_included_index.get().to_le_bytes());
+    body.extend_from_slice(&meta.last_included_term.get().to_le_bytes());
+    body.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    body.extend_from_slice(data);
+
+    let mut out = Vec::with_capacity(4 + body.len());
+    out.extend_from_slice(&crc32c(&body).to_le_bytes());
+    out.extend_from_slice(&body);
+    out
 }
 
 /// One metadata copy as read from disk.
@@ -463,9 +693,16 @@ mod tests {
     use bytes::Bytes;
     use tempfile::{TempDir, tempdir};
 
-    use super::{FileStorage, encode_metadata};
+    use super::{FileStorage, encode_metadata, encode_snapshot};
     use crate::core::{LogEntry, LogIndex, NodeId, Term};
-    use crate::storage::{Error, PersistentState, Storage};
+    use crate::storage::{Error, PersistentState, SnapshotMeta, Storage};
+
+    fn snap_meta(index: u64, term: u64) -> SnapshotMeta {
+        SnapshotMeta {
+            last_included_index: LogIndex::new(index),
+            last_included_term: Term::new(term),
+        }
+    }
 
     #[track_caller]
     fn ok<T>(result: Result<T, Error>) -> T {
@@ -658,5 +895,126 @@ mod tests {
         let state = reload(dir.path());
         assert_eq!(state.current_term, Term::new(7));
         assert_eq!(state.voted_for, None);
+    }
+
+    #[test]
+    fn a_snapshot_round_trips_and_trims_the_log_across_a_reopen() {
+        let dir = scratch();
+        {
+            let mut store = ok(FileStorage::open(dir.path()));
+            ok(store.load());
+            ok(store.persist_log(
+                LogIndex::new(1),
+                &[
+                    entry(1, b"a"),
+                    entry(1, b"b"),
+                    entry(2, b"c"),
+                    entry(2, b"d"),
+                ],
+            ));
+            ok(store.persist_snapshot(snap_meta(2, 1), b"state-bytes"));
+            // Appends now use global indices past the base.
+            ok(store.persist_log(LogIndex::new(5), &[entry(3, b"e")]));
+        }
+
+        let state = reload(dir.path());
+        let Some(snapshot) = state.snapshot else {
+            unreachable!("snapshot recovered");
+        };
+        assert_eq!(snapshot.meta, snap_meta(2, 1));
+        assert_eq!(snapshot.data.as_ref(), b"state-bytes");
+        assert_eq!(
+            state.entries,
+            vec![entry(2, b"c"), entry(2, b"d"), entry(3, b"e")],
+        );
+
+        // The on-disk log holds the header plus three records, not seven.
+        let log_len = ok(
+            fs::metadata(dir.path().join("log")).map_err(|source| Error::Io {
+                path: dir.path().join("log"),
+                source,
+            }),
+        )
+        .len();
+        assert!(log_len < 120, "log not trimmed: {log_len} bytes");
+    }
+
+    #[test]
+    fn a_snapshot_ahead_of_the_whole_log_clears_it() {
+        let dir = scratch();
+        {
+            let mut store = ok(FileStorage::open(dir.path()));
+            ok(store.load());
+            ok(store.persist_log(LogIndex::new(1), &[entry(1, b"a"), entry(1, b"b")]));
+            ok(store.persist_snapshot(snap_meta(9, 4), b"far-ahead"));
+            ok(store.persist_log(LogIndex::new(10), &[entry(4, b"j")]));
+        }
+
+        let state = reload(dir.path());
+        assert_eq!(state.snapshot.map(|s| s.meta), Some(snap_meta(9, 4)));
+        assert_eq!(state.entries, vec![entry(4, b"j")]);
+    }
+
+    #[test]
+    fn load_trims_a_log_head_left_by_a_crash_between_snapshot_and_log_rewrite() {
+        let dir = scratch();
+        {
+            let mut store = ok(FileStorage::open(dir.path()));
+            ok(store.load());
+            ok(store.persist_log(
+                LogIndex::new(1),
+                &[
+                    entry(1, b"a"),
+                    entry(1, b"b"),
+                    entry(2, b"c"),
+                    entry(2, b"d"),
+                ],
+            ));
+        }
+        // Simulate the crash: the snapshot file is durable, but the log was
+        // never rewritten, so it still holds all four records with header 1.
+        ok(fs::write(
+            dir.path().join("snapshot"),
+            encode_snapshot(snap_meta(2, 1), b"recovered"),
+        )
+        .map_err(|source| Error::Io {
+            path: dir.path().join("snapshot"),
+            source,
+        }));
+
+        let state = reload(dir.path());
+        assert_eq!(state.snapshot.map(|s| s.meta), Some(snap_meta(2, 1)));
+        assert_eq!(state.entries, vec![entry(2, b"c"), entry(2, b"d")]);
+
+        // The trim was written back, so a second reopen is already clean.
+        let again = reload(dir.path());
+        assert_eq!(again.entries, vec![entry(2, b"c"), entry(2, b"d")]);
+    }
+
+    #[test]
+    fn a_corrupt_snapshot_is_a_corrupt_error() {
+        let dir = scratch();
+        {
+            let mut store = ok(FileStorage::open(dir.path()));
+            ok(store.load());
+            ok(store.persist_snapshot(snap_meta(3, 2), b"good"));
+        }
+        let path = dir.path().join("snapshot");
+        let mut bytes = ok(fs::read(&path).map_err(|source| Error::Io {
+            path: path.clone(),
+            source,
+        }));
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        ok(fs::write(&path, &bytes).map_err(|source| Error::Io {
+            path: path.clone(),
+            source,
+        }));
+
+        let mut store = ok(FileStorage::open(dir.path()));
+        match store.load() {
+            Err(Error::Corrupt { .. }) => {}
+            other => unreachable!("expected Corrupt, got {other:?}"),
+        }
     }
 }

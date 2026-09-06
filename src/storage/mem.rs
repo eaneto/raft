@@ -9,7 +9,9 @@
 
 use std::path::PathBuf;
 
-use super::{Error, PersistentState, Storage};
+use bytes::Bytes;
+
+use super::{Error, PersistentState, Snapshot, SnapshotMeta, Storage};
 use crate::core::{LogEntry, LogIndex, NodeId, Term};
 
 /// What a simulated `fsync` does once it is triggered.
@@ -142,13 +144,37 @@ impl Storage for MemStorage {
     }
 
     fn persist_log(&mut self, from_index: LogIndex, entries: &[LogEntry]) -> Result<(), Error> {
-        let keep = usize::try_from(from_index.get().saturating_sub(1))
+        let base = staged_base(&self.staged);
+        let keep = usize::try_from(from_index.get().saturating_sub(base + 1))
             .unwrap_or(usize::MAX)
             .min(self.staged.entries.len());
         self.staged.entries.truncate(keep);
         self.staged.entries.extend_from_slice(entries);
         self.sync()
     }
+
+    fn persist_snapshot(&mut self, meta: SnapshotMeta, data: &[u8]) -> Result<(), Error> {
+        // Drop the covered prefix of the staged log. `entries[0]` is at
+        // `old_base + 1`; keep only the entries past `last_included_index`.
+        let old_base = staged_base(&self.staged);
+        let drop = usize::try_from(meta.last_included_index.get().saturating_sub(old_base))
+            .unwrap_or(usize::MAX)
+            .min(self.staged.entries.len());
+        self.staged.entries.drain(..drop);
+        self.staged.snapshot = Some(Snapshot {
+            meta,
+            data: Bytes::copy_from_slice(data),
+        });
+        self.sync()
+    }
+}
+
+/// The global index of the entry just before `state.entries[0]`.
+fn staged_base(state: &PersistentState) -> u64 {
+    state
+        .snapshot
+        .as_ref()
+        .map_or(0, |snap| snap.meta.last_included_index.get())
 }
 
 #[cfg(test)]
@@ -157,7 +183,14 @@ mod tests {
 
     use super::{MemStorage, SyncFault};
     use crate::core::{LogEntry, LogIndex, NodeId, Term};
-    use crate::storage::{Error, PersistentState, Storage};
+    use crate::storage::{Error, PersistentState, SnapshotMeta, Storage};
+
+    fn snap_meta(index: u64, term: u64) -> SnapshotMeta {
+        SnapshotMeta {
+            last_included_index: LogIndex::new(index),
+            last_included_term: Term::new(term),
+        }
+    }
 
     fn entry(term: u64, cmd: &'static [u8]) -> LogEntry {
         LogEntry {
@@ -215,6 +248,58 @@ mod tests {
             reloaded(&store).entries,
             vec![entry(1, b"a"), entry(2, b"x")],
         );
+    }
+
+    #[test]
+    fn snapshot_round_trips_and_drops_the_covered_prefix() {
+        let mut store = MemStorage::new();
+        ok(store.persist_log(
+            LogIndex::new(1),
+            &[
+                entry(1, b"a"),
+                entry(1, b"b"),
+                entry(2, b"c"),
+                entry(2, b"d"),
+            ],
+        ));
+        ok(store.persist_snapshot(snap_meta(2, 1), b"snap-bytes"));
+
+        let state = reloaded(&store);
+        let Some(snapshot) = state.snapshot else {
+            unreachable!("snapshot recovered");
+        };
+        assert_eq!(snapshot.meta, snap_meta(2, 1));
+        assert_eq!(snapshot.data.as_ref(), b"snap-bytes");
+        assert_eq!(state.entries, vec![entry(2, b"c"), entry(2, b"d")]);
+    }
+
+    #[test]
+    fn persist_log_after_a_snapshot_is_relative_to_the_base() {
+        let mut store = MemStorage::new();
+        ok(store.persist_log(
+            LogIndex::new(1),
+            &[entry(1, b"a"), entry(1, b"b"), entry(1, b"c")],
+        ));
+        ok(store.persist_snapshot(snap_meta(2, 1), b"s"));
+
+        // Splice at global index 3: keep entry 3, replace it.
+        ok(store.persist_log(LogIndex::new(3), &[entry(4, b"x"), entry(4, b"y")]));
+
+        assert_eq!(
+            reloaded(&store).entries,
+            vec![entry(4, b"x"), entry(4, b"y")],
+        );
+    }
+
+    #[test]
+    fn a_snapshot_ahead_of_the_whole_log_clears_it() {
+        let mut store = MemStorage::new();
+        ok(store.persist_log(LogIndex::new(1), &[entry(1, b"a"), entry(1, b"b")]));
+        ok(store.persist_snapshot(snap_meta(9, 3), b"far"));
+
+        let state = reloaded(&store);
+        assert_eq!(state.snapshot.map(|s| s.meta), Some(snap_meta(9, 3)),);
+        assert!(state.entries.is_empty());
     }
 
     #[test]
