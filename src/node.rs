@@ -415,6 +415,16 @@ impl<S: Storage, M: StateMachine> Driver<S, M> {
                     };
                     self.receive_snapshot_chunk(meta, offset, &data, done)?;
                 }
+                Effect::MembershipChanged { config } => {
+                    // Reconciling the live transport peer set with the new
+                    // configuration is wired up with the membership-change API;
+                    // for now just record it.
+                    log::info!(
+                        "node {}: configuration is now {:?}",
+                        self.config.id,
+                        config.voters(),
+                    );
+                }
             }
         }
         Ok(())
