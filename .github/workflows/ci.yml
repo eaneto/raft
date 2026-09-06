@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt • clippy • test • doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read pinned toolchain
+        id: toolchain
+        run: echo "channel=$(grep '^channel' rust-toolchain.toml | cut -d'\"' -f2)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - run: just ci
+
+  # Durability must be correct on Linux regardless of filesystem. This job runs
+  # the persistence tests on loopback ext4 (both journal modes) and xfs.
+  # `continue-on-error` until tests/ has fs-tagged coverage — see AGENTS.md.
+  filesystems:
+    name: persistence on ${{ matrix.fs }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - fs: ext4-ordered
+            mkfs: mkfs.ext4 -F
+            mount_opts: -o data=ordered
+          - fs: ext4-journal
+            mkfs: mkfs.ext4 -F
+            mount_opts: -o data=journal
+          - fs: xfs
+            mkfs: mkfs.xfs -f
+            mount_opts: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Create and mount ${{ matrix.fs }} loopback image
+        run: |
+          set -eux
+          sudo apt-get update && sudo apt-get install -y xfsprogs
+          truncate -s 1G fs.img
+          ${{ matrix.mkfs }} fs.img
+          mkdir -p "$RUNNER_TEMP/fsmnt"
+          sudo mount ${{ matrix.mount_opts }} -o loop fs.img "$RUNNER_TEMP/fsmnt"
+          sudo chown "$USER" "$RUNNER_TEMP/fsmnt"
+
+      - name: Run persistence tests against the mount
+        if: hashFiles('tests/persistence.rs') != ''
+        env:
+          RAFT_TEST_DIR: ${{ runner.temp }}/fsmnt
+        run: cargo test --all-features --test persistence -- --nocapture
