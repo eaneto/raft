@@ -506,7 +506,7 @@ impl Sim {
                 (
                     base + pos as u64 + 1,
                     entry.term.get(),
-                    entry.command.clone(),
+                    entry.command_bytes().cloned().unwrap_or_default(),
                 )
             })
             .collect()

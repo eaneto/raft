@@ -2,12 +2,14 @@
 //!
 //! Layout inside the data directory:
 //!
-//! - `log` — an append-only file of records. Each record is
-//!   `[u32 LE payload length][u32 LE CRC32C of payload][payload]`, and a
-//!   payload is `[u64 LE term][u32 LE command length][command bytes]`.
-//!   Recovery reads records until one is short or fails its checksum and
-//!   truncates the file there: a torn tail from a crash mid-append is expected,
-//!   not treated as corruption.
+//! - `log` — an 8-byte little-endian start-index header (the global index of
+//!   the first record, `snapshot_last_index + 1`) followed by records. Each
+//!   record is `[u32 LE payload length][u32 LE CRC32C of payload][payload]`; a
+//!   payload is `[u64 LE term][u8 kind]` then, for a command, `[u32 LE length]
+//!   [command bytes]`, or for a configuration, `[u32 LE voter count][u64 LE
+//!   voter id]*count`. Recovery reads records until one is short or fails its
+//!   checksum and truncates the file there: a torn tail from a crash mid-append
+//!   is expected, not treated as corruption.
 //! - `meta.0`, `meta.1` — two independent copies of `{ currentTerm, votedFor }`,
 //!   each `[u32 LE CRC32C][u64 LE term][u8 has_vote][u64 LE vote id]`. Keeping
 //!   two lets recovery survive one being torn or corrupt. On load a copy that
@@ -25,7 +27,7 @@ use std::path::{Path, PathBuf};
 use bytes::Bytes;
 
 use super::{Error, PersistentState, Snapshot, SnapshotMeta, Storage, crc32c};
-use crate::core::{LogEntry, LogIndex, NodeId, Term};
+use crate::core::{ClusterConfig, LogEntry, LogEntryKind, LogIndex, NodeId, Term};
 
 /// The on-disk metadata record is fixed size: crc(4) + term(8) + flag(1) +
 /// vote(8).
@@ -485,29 +487,65 @@ fn frame_record(payload: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(frame)
 }
 
-/// `[u64 LE term][u32 LE command length][command bytes]`.
+/// `[u64 LE term][u8 kind]` then, for a command (kind 0), `[u32 LE length]
+/// [command bytes]`; for a configuration (kind 1), `[u32 LE voter count]
+/// [u64 LE voter id]*count`.
 fn encode_entry(entry: &LogEntry) -> Result<Vec<u8>, Error> {
-    let command_len = u32::try_from(entry.command.len()).map_err(|_| Error::RecordTooLarge {
-        bytes: entry.command.len(),
-    })?;
-    let mut out = Vec::with_capacity(12 + entry.command.len());
+    let mut out = Vec::with_capacity(13);
     out.extend_from_slice(&entry.term.get().to_le_bytes());
-    out.extend_from_slice(&command_len.to_le_bytes());
-    out.extend_from_slice(&entry.command);
+    match &entry.kind {
+        LogEntryKind::Command(command) => {
+            let len = u32::try_from(command.len()).map_err(|_| Error::RecordTooLarge {
+                bytes: command.len(),
+            })?;
+            out.push(0);
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(command);
+        }
+        LogEntryKind::Config(config) => {
+            let count =
+                u32::try_from(config.voters().len()).map_err(|_| Error::RecordTooLarge {
+                    bytes: config.voters().len(),
+                })?;
+            out.push(1);
+            out.extend_from_slice(&count.to_le_bytes());
+            for id in config.voters() {
+                out.extend_from_slice(&id.get().to_le_bytes());
+            }
+        }
+    }
     Ok(out)
 }
 
 fn decode_entry(payload: &[u8]) -> Option<LogEntry> {
-    let term = u64::from_le_bytes(payload.get(0..8)?.try_into().ok()?);
-    let command_len = u32::from_le_bytes(payload.get(8..12)?.try_into().ok()?) as usize;
-    let command = payload.get(12..)?;
-    if command.len() != command_len {
-        return None;
+    let term = Term::new(u64::from_le_bytes(payload.get(0..8)?.try_into().ok()?));
+    let kind = *payload.get(8)?;
+    let rest = payload.get(9..)?;
+    match kind {
+        0 => {
+            let len = u32::from_le_bytes(rest.get(0..4)?.try_into().ok()?) as usize;
+            let command = rest.get(4..)?;
+            if command.len() != len {
+                return None;
+            }
+            Some(LogEntry::command(term, Bytes::copy_from_slice(command)))
+        }
+        1 => {
+            let count = u32::from_le_bytes(rest.get(0..4)?.try_into().ok()?) as usize;
+            let ids = rest.get(4..)?;
+            if ids.len() != count * 8 {
+                return None;
+            }
+            let mut voters = Vec::with_capacity(count);
+            for k in 0..count {
+                let start = k * 8;
+                let id = u64::from_le_bytes(ids.get(start..start + 8)?.try_into().ok()?);
+                voters.push(NodeId::new(id));
+            }
+            Some(LogEntry::config(term, ClusterConfig::new(voters)))
+        }
+        _ => None,
     }
-    Some(LogEntry {
-        term: Term::new(term),
-        command: Bytes::copy_from_slice(command),
-    })
 }
 
 fn encode_metadata(current_term: Term, voted_for: Option<NodeId>) -> [u8; META_LEN] {
@@ -694,7 +732,7 @@ mod tests {
     use tempfile::{TempDir, tempdir};
 
     use super::{FileStorage, encode_metadata, encode_snapshot};
-    use crate::core::{LogEntry, LogIndex, NodeId, Term};
+    use crate::core::{ClusterConfig, LogEntry, LogIndex, NodeId, Term};
     use crate::storage::{Error, PersistentState, SnapshotMeta, Storage};
 
     fn snap_meta(index: u64, term: u64) -> SnapshotMeta {
@@ -713,10 +751,7 @@ mod tests {
     }
 
     fn entry(term: u64, cmd: &'static [u8]) -> LogEntry {
-        LogEntry {
-            term: Term::new(term),
-            command: Bytes::from_static(cmd),
-        }
+        LogEntry::command(Term::new(term), Bytes::from_static(cmd))
     }
 
     fn scratch() -> TempDir {
@@ -895,6 +930,27 @@ mod tests {
         let state = reload(dir.path());
         assert_eq!(state.current_term, Term::new(7));
         assert_eq!(state.voted_for, None);
+    }
+
+    #[test]
+    fn a_config_log_entry_round_trips_across_a_reopen() {
+        let dir = scratch();
+        let voters = [1, 2, 3, 4].map(NodeId::new);
+        let config_entry = LogEntry::config(Term::new(2), ClusterConfig::new(voters));
+        {
+            let mut store = ok(FileStorage::open(dir.path()));
+            ok(store.load());
+            ok(store.persist_log(
+                LogIndex::new(1),
+                &[entry(1, b"a"), config_entry.clone(), entry(2, b"c")],
+            ));
+        }
+
+        let state = reload(dir.path());
+        assert_eq!(
+            state.entries,
+            vec![entry(1, b"a"), config_entry, entry(2, b"c")],
+        );
     }
 
     #[test]

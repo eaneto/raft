@@ -158,8 +158,79 @@ impl fmt::Display for NodeId {
     }
 }
 
-/// One entry in the replicated log: an opaque client command together with the
-/// [`Term`] of the leader that first created it.
+/// The set of servers that vote in the current configuration.
+///
+/// A membership change appends a [`LogEntryKind::Config`] entry carrying the
+/// new set; every server then uses the latest configuration present in its
+/// log, even before that entry is committed (thesis §4.1). Backed by a
+/// [`BTreeSet`] so iteration order never influences behaviour.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ClusterConfig {
+    voters: BTreeSet<NodeId>,
+}
+
+impl ClusterConfig {
+    /// A configuration with exactly `voters`.
+    #[must_use]
+    pub fn new(voters: impl IntoIterator<Item = NodeId>) -> Self {
+        Self {
+            voters: voters.into_iter().collect(),
+        }
+    }
+
+    /// The voting servers, in sorted order.
+    #[must_use]
+    pub const fn voters(&self) -> &BTreeSet<NodeId> {
+        &self.voters
+    }
+
+    /// Whether `id` is a voter.
+    #[must_use]
+    pub fn contains(&self, id: NodeId) -> bool {
+        self.voters.contains(&id)
+    }
+
+    /// The number of voters.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.voters.len()
+    }
+
+    /// Whether there are no voters.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.voters.is_empty()
+    }
+
+    /// A copy with `id` added as a voter.
+    #[must_use]
+    pub fn with_added(&self, id: NodeId) -> Self {
+        let mut voters = self.voters.clone();
+        voters.insert(id);
+        Self { voters }
+    }
+
+    /// A copy with `id` removed.
+    #[must_use]
+    pub fn without(&self, id: NodeId) -> Self {
+        let mut voters = self.voters.clone();
+        voters.remove(&id);
+        Self { voters }
+    }
+}
+
+/// What a [`LogEntry`] carries.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum LogEntryKind {
+    /// An opaque client command for the application state machine. Raft never
+    /// inspects these bytes.
+    Command(Bytes),
+    /// A cluster configuration — a membership change.
+    Config(ClusterConfig),
+}
+
+/// One entry in the replicated log: a payload together with the [`Term`] of the
+/// leader that first created it.
 ///
 /// An entry does not carry its own index — the index is its 1-based position in
 /// the [`Log`]. After log compaction the index of the first surviving entry is
@@ -168,9 +239,46 @@ impl fmt::Display for NodeId {
 pub struct LogEntry {
     /// The term of the leader that first appended this entry.
     pub term: Term,
-    /// The command to hand to the application state machine once the entry is
-    /// committed. Raft never inspects these bytes.
-    pub command: Bytes,
+    /// The entry's payload.
+    pub kind: LogEntryKind,
+}
+
+impl LogEntry {
+    /// A command entry for `command` at `term`.
+    #[must_use]
+    pub fn command(term: Term, command: impl Into<Bytes>) -> Self {
+        Self {
+            term,
+            kind: LogEntryKind::Command(command.into()),
+        }
+    }
+
+    /// A configuration entry for `config` at `term`.
+    #[must_use]
+    pub const fn config(term: Term, config: ClusterConfig) -> Self {
+        Self {
+            term,
+            kind: LogEntryKind::Config(config),
+        }
+    }
+
+    /// The command bytes, or `None` for a configuration entry.
+    #[must_use]
+    pub const fn command_bytes(&self) -> Option<&Bytes> {
+        match &self.kind {
+            LogEntryKind::Command(command) => Some(command),
+            LogEntryKind::Config(_) => None,
+        }
+    }
+
+    /// The configuration, or `None` for a command entry.
+    #[must_use]
+    pub const fn as_config(&self) -> Option<&ClusterConfig> {
+        match &self.kind {
+            LogEntryKind::Config(config) => Some(config),
+            LogEntryKind::Command(_) => None,
+        }
+    }
 }
 
 /// The replicated log.
@@ -583,8 +691,16 @@ pub enum Effect {
 #[derive(Clone, Debug)]
 pub struct RaftNode {
     id: NodeId,
-    /// Other servers in the cluster, sorted and deduplicated so that iteration
-    /// order never influences behaviour.
+    /// The active cluster configuration: the latest [`LogEntryKind::Config`]
+    /// entry in the log, or `base_config` if the in-memory log holds none.
+    /// Recomputed by [`RaftNode::recompute_config`] after any log change.
+    config: ClusterConfig,
+    /// The configuration in force before the first in-memory log entry — from
+    /// the recovered snapshot, or the bootstrap set. The fallback for
+    /// `config` once every `Config` entry has been compacted away.
+    base_config: ClusterConfig,
+    /// The other voters, sorted (a cache derived from `config`), so behaviour
+    /// never depends on set iteration order.
     peers: Vec<NodeId>,
 
     // Persistent state (Figure 2) — the driver must have these durable before
@@ -607,16 +723,18 @@ pub struct RaftNode {
 impl RaftNode {
     /// Creates a fresh follower: term 0, no vote, empty log, nothing committed.
     ///
-    /// `peers` is the set of *other* servers; `id` is removed from it if
-    /// present, and the rest is sorted and deduplicated.
+    /// `peers` is the set of *other* servers; together with `id` they form the
+    /// bootstrap configuration.
     #[must_use]
     pub fn new(id: NodeId, peers: impl IntoIterator<Item = NodeId>) -> Self {
-        let mut peers: Vec<NodeId> = peers.into_iter().filter(|peer| *peer != id).collect();
-        peers.sort_unstable();
-        peers.dedup();
-        Self {
+        let mut voters: BTreeSet<NodeId> = peers.into_iter().collect();
+        voters.insert(id);
+        let config = ClusterConfig { voters };
+        let mut node = Self {
             id,
-            peers,
+            base_config: config.clone(),
+            peers: Vec::new(),
+            config,
             current_term: Term::ZERO,
             voted_for: None,
             log: Log::new(),
@@ -624,7 +742,9 @@ impl RaftNode {
             last_applied: LogIndex::ZERO,
             role: Role::Follower,
             leader_id: None,
-        }
+        };
+        node.recompute_config();
+        node
     }
 
     /// Rebuilds a server from persistent state recovered at startup (Figure 2:
@@ -635,8 +755,12 @@ impl RaftNode {
     /// index, and `commitIndex` / `lastApplied` start there because the driver
     /// has already restored the state machine from the snapshot. Without a
     /// snapshot both start at zero and the restarted node re-learns its commit
-    /// point from the leader and replays the committed prefix. `peers` is
-    /// filtered / sorted / deduped as in [`RaftNode::new`].
+    /// point from the leader and replays the committed prefix.
+    ///
+    /// `peers` is the bootstrap configuration; the active configuration is then
+    /// recomputed from any `Config` entries in `entries` (a snapshot that
+    /// carries its own configuration is threaded in with the storage snapshot
+    /// format).
     #[must_use]
     pub fn from_state(
         id: NodeId,
@@ -657,7 +781,29 @@ impl RaftNode {
             }
             None => Log::from_entries(entries),
         };
+        node.recompute_config();
         node
+    }
+
+    /// Re-derives the active configuration: the latest [`LogEntryKind::Config`]
+    /// entry still in the in-memory log, or `base_config` if there is none. The
+    /// sorted peer cache follows.
+    fn recompute_config(&mut self) {
+        self.config = self
+            .log
+            .entries_from(LogIndex::new(1))
+            .iter()
+            .rev()
+            .find_map(LogEntry::as_config)
+            .cloned()
+            .unwrap_or_else(|| self.base_config.clone());
+        self.peers = self
+            .config
+            .voters()
+            .iter()
+            .copied()
+            .filter(|&voter| voter != self.id)
+            .collect();
     }
 
     /// Advances the state machine by one input and returns the effects the
@@ -799,6 +945,8 @@ impl RaftNode {
 
         // Receiver rules 3 & 4: splice in the entries that differ.
         if let Some(from_index) = self.splice_entries(args.prev_log_index, &args.entries) {
+            // A spliced-in or truncated-away `Config` entry changes membership.
+            self.recompute_config();
             effects.push(Effect::PersistLog {
                 from_index,
                 entries: self.log.entries_from(from_index).to_vec(),
@@ -849,22 +997,27 @@ impl RaftNode {
         None
     }
 
-    /// Emits [`Effect::ApplyToStateMachine`] for every entry from
+    /// Emits [`Effect::ApplyToStateMachine`] for every **command** entry from
     /// `last_applied + 1` through `commit_index`, one at a time in index order,
     /// advancing `last_applied` as it goes so it never overtakes `commit_index`.
-    /// Stops if an index is somehow missing rather than inventing a command.
+    /// Configuration entries advance `last_applied` too but are not handed to
+    /// the application state machine — they took effect the moment they were
+    /// appended. Stops if an index is somehow missing rather than inventing a
+    /// command.
     fn apply_committed(&mut self, effects: &mut Vec<Effect>) {
         while self.last_applied < self.commit_index {
             let next = self.last_applied.next();
             let Some(entry) = self.log.get(next) else {
                 break;
             };
-            let command = entry.command.clone();
+            let command = entry.command_bytes().cloned();
             self.last_applied = next;
-            effects.push(Effect::ApplyToStateMachine {
-                index: next,
-                command,
-            });
+            if let Some(command) = command {
+                effects.push(Effect::ApplyToStateMachine {
+                    index: next,
+                    command,
+                });
+            }
         }
     }
 
@@ -989,6 +1142,7 @@ impl RaftNode {
         let mut effects = Vec::new();
 
         self.log.compact(last_included_index, last_included_term);
+        self.recompute_config();
         self.commit_index = self.commit_index.max(last_included_index);
         if self.last_applied < last_included_index {
             self.last_applied = last_included_index;
@@ -1013,6 +1167,7 @@ impl RaftNode {
             && let Some(term) = self.log.term_at(up_to_index)
         {
             self.log.compact(up_to_index, term);
+            self.recompute_config();
         }
         Vec::new()
     }
@@ -1139,10 +1294,8 @@ impl RaftNode {
         }
 
         let from_index = self.log.last_index().next();
-        self.log.append(LogEntry {
-            term: self.current_term,
-            command,
-        });
+        self.log
+            .append(LogEntry::command(self.current_term, command));
 
         let mut effects = vec![Effect::PersistLog {
             from_index,
@@ -1337,13 +1490,14 @@ impl RaftNode {
         }
     }
 
-    /// Number of servers in the cluster (peers plus self).
-    const fn cluster_size(&self) -> usize {
-        self.peers.len() + 1
+    /// Number of voting servers in the active configuration.
+    fn cluster_size(&self) -> usize {
+        self.config.len()
     }
 
-    /// Votes needed to win an election or commit an entry: a strict majority.
-    const fn quorum(&self) -> usize {
+    /// Votes needed to win an election or commit an entry: a strict majority of
+    /// the active configuration.
+    fn quorum(&self) -> usize {
         self.cluster_size() / 2 + 1
     }
 
@@ -1353,10 +1507,17 @@ impl RaftNode {
         self.id
     }
 
-    /// The other servers in the cluster, sorted.
+    /// The other voters in the active configuration, sorted.
     #[must_use]
     pub fn peers(&self) -> &[NodeId] {
         &self.peers
+    }
+
+    /// The active cluster configuration — the latest one in the log, committed
+    /// or not.
+    #[must_use]
+    pub const fn config(&self) -> &ClusterConfig {
+        &self.config
     }
 
     /// The current role and its per-role volatile state.
@@ -1433,7 +1594,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::{
-        AppendEntriesArgs, AppendEntriesReply, Effect, Input, InstallSnapshotArgs,
+        AppendEntriesArgs, AppendEntriesReply, ClusterConfig, Effect, Input, InstallSnapshotArgs,
         InstallSnapshotReply, Log, LogEntry, LogIndex, LogicalInstant, Message, NodeId, RaftNode,
         RequestVoteArgs, RequestVoteReply, Role, Term,
     };
@@ -1443,17 +1604,11 @@ mod tests {
     const NOW: LogicalInstant = LogicalInstant::START;
 
     fn entry(term: u64) -> LogEntry {
-        LogEntry {
-            term: Term::new(term),
-            command: Bytes::from_static(b"cmd"),
-        }
+        LogEntry::command(Term::new(term), Bytes::from_static(b"cmd"))
     }
 
     fn entry_cmd(term: u64, command: &'static [u8]) -> LogEntry {
-        LogEntry {
-            term: Term::new(term),
-            command: Bytes::from_static(command),
-        }
+        LogEntry::command(Term::new(term), Bytes::from_static(command))
     }
 
     fn node(id: u64, peers: &[u64]) -> RaftNode {
@@ -2756,6 +2911,87 @@ mod tests {
             vec![Effect::Persist {
                 current_term: Term::new(9),
                 voted_for: None,
+            }],
+        );
+    }
+
+    // --- 9: cluster configuration as a log entry ----------------------------
+
+    fn config(ids: &[u64]) -> ClusterConfig {
+        ClusterConfig::new(ids.iter().copied().map(NodeId::new))
+    }
+
+    #[test]
+    fn cluster_config_add_remove_and_membership() {
+        let base = config(&[1, 2, 3]);
+        assert_eq!(base.len(), 3);
+        assert!(base.contains(NodeId::new(2)));
+        assert!(!base.contains(NodeId::new(9)));
+
+        let grown = base.with_added(NodeId::new(4));
+        assert_eq!(grown.len(), 4);
+        assert!(grown.contains(NodeId::new(4)));
+
+        let shrunk = base.without(NodeId::new(2));
+        assert_eq!(
+            shrunk.voters().iter().copied().collect::<Vec<_>>(),
+            vec![NodeId::new(1), NodeId::new(3),]
+        );
+    }
+
+    #[test]
+    fn a_new_node_takes_its_bootstrap_configuration() {
+        let n = node(1, &[2, 3]);
+        assert_eq!(n.config(), &config(&[1, 2, 3]));
+        assert_eq!(n.peers(), [NodeId::new(2), NodeId::new(3)]);
+    }
+
+    #[test]
+    fn a_config_entry_in_the_log_becomes_the_active_configuration() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(1);
+        n.log
+            .append(LogEntry::config(Term::new(1), config(&[1, 2, 3, 4, 5])));
+        n.recompute_config();
+
+        assert_eq!(n.config(), &config(&[1, 2, 3, 4, 5]));
+        assert_eq!(
+            n.peers(),
+            [
+                NodeId::new(2),
+                NodeId::new(3),
+                NodeId::new(4),
+                NodeId::new(5),
+            ]
+        );
+        assert_eq!(n.cluster_size(), 5);
+        assert_eq!(n.quorum(), 3);
+
+        // Truncating the entry away reverts to the bootstrap set.
+        n.log.truncate_after(LogIndex::ZERO);
+        n.recompute_config();
+        assert_eq!(n.config(), &config(&[1, 2, 3]));
+    }
+
+    #[test]
+    fn a_committed_config_entry_advances_last_applied_without_an_apply_effect() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(1);
+        n.log.append(entry_cmd(1, b"cmd")); // index 1
+        n.log
+            .append(LogEntry::config(Term::new(1), config(&[1, 2, 3, 4]))); // index 2
+        n.recompute_config();
+        n.commit_index = LogIndex::new(2);
+
+        let mut effects = Vec::new();
+        n.apply_committed(&mut effects);
+
+        assert_eq!(n.last_applied(), LogIndex::new(2));
+        assert_eq!(
+            effects,
+            vec![Effect::ApplyToStateMachine {
+                index: LogIndex::new(1),
+                command: Bytes::from_static(b"cmd"),
             }],
         );
     }
