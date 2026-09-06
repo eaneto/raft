@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1477988ec38e8635aa37df611671c3d0c9d818023cf6011c1504b962c6aecb76 # shrinks to seed = 4016882132025797510, ops = [Partition([true, false, true, false, false]), Propose, Tick(40), Partition([true, false, false, false, false]), Wipe(2), Tick(269)]
+cc ed0012d08e91255afb791ea511b82aeae3eb274d882c1ca6ce87949d2a893eb8 # shrinks to node_count = 3, seed = 8429795685915227089, ops = [Propose, Propose, Tick(41), Propose, Partition([true, true, false, false, false]), Tick(179), Wipe(1), Partition([false, true, true, false, false]), Tick(44)]
+cc fda459cc8c4f86af5b34a51d3383950f617ac94924c4acc2c08ce1ffee11e0d2 # shrinks to node_count = 4, seed = 13295780473223117863, ops = [Propose, Tick(63), Propose, Partition([true, true, false, false, false]), Tick(62), Partition([true, false, true, false, false]), Wipe(0), Tick(163), Wipe(3), Propose]
