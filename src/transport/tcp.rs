@@ -10,7 +10,7 @@
 //! Everything shuts down through an [`AtomicBool`] plus, for the readers that
 //! block in `read`, a `shutdown(Both)` on a cloned handle.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,6 +34,7 @@ const DIAL_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// A running TCP transport. Dropping it stops every thread.
 pub struct TcpTransport {
+    id: NodeId,
     senders: BTreeMap<NodeId, SyncSender<Message>>,
     shutdown: Arc<AtomicBool>,
     reader_streams: Arc<Mutex<Vec<TcpStream>>>,
@@ -95,6 +96,7 @@ impl TcpTransport {
         }
 
         Ok(Self {
+            id,
             senders,
             shutdown,
             reader_streams,
@@ -102,6 +104,34 @@ impl TcpTransport {
             listener_handle: Some(listener_handle),
             sender_handles,
         })
+    }
+
+    /// Reconciles the outbound peer set with `peers`: starts a sender thread
+    /// for each new peer and drops the channel for each departed one (its
+    /// sender thread then exits on the next poll). Existing peers are left
+    /// alone. Used when a membership change adds or removes a server.
+    pub fn set_peers(&mut self, peers: &[(NodeId, SocketAddr)]) {
+        let wanted: BTreeSet<NodeId> = peers.iter().map(|(id, _)| *id).collect();
+        let departed: Vec<NodeId> = self
+            .senders
+            .keys()
+            .copied()
+            .filter(|id| !wanted.contains(id))
+            .collect();
+        for id in departed {
+            self.senders.remove(&id);
+        }
+        for &(peer, addr) in peers {
+            if peer == self.id || self.senders.contains_key(&peer) {
+                continue;
+            }
+            let (tx, rx) = sync_channel::<Message>(SEND_QUEUE);
+            self.senders.insert(peer, tx);
+            let shutdown = Arc::clone(&self.shutdown);
+            let id = self.id;
+            self.sender_handles
+                .push(thread::spawn(move || send_loop(id, addr, &rx, &shutdown)));
+        }
     }
 }
 
@@ -226,5 +256,55 @@ impl TcpTransport {
     /// The set of peer ids this transport can send to.
     pub fn peers(&self) -> impl Iterator<Item = NodeId> + '_ {
         self.senders.keys().copied()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{SocketAddr, TcpListener};
+    use std::sync::mpsc;
+
+    use super::{NodeId, TcpTransport};
+
+    #[track_caller]
+    fn ok<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(err) => unreachable!("expected Ok: {err:?}"),
+        }
+    }
+
+    fn free_addr() -> SocketAddr {
+        let listener = ok(TcpListener::bind("127.0.0.1:0"));
+        ok(listener.local_addr())
+    }
+
+    #[test]
+    fn set_peers_adds_and_drops_sender_threads() {
+        let (tx, _rx) = mpsc::channel();
+        let a = (NodeId::new(2), free_addr());
+        let b = (NodeId::new(3), free_addr());
+        let c = (NodeId::new(4), free_addr());
+
+        let mut transport = ok(TcpTransport::start(
+            NodeId::new(1),
+            &[a, b],
+            free_addr(),
+            tx,
+        ));
+        let mut ids: Vec<NodeId> = transport.peers().collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![NodeId::new(2), NodeId::new(3)]);
+
+        // Drop peer 2, add peer 4; peer 3 stays.
+        transport.set_peers(&[b, c]);
+        let mut ids: Vec<NodeId> = transport.peers().collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![NodeId::new(3), NodeId::new(4)]);
+
+        // The local id is never added as its own peer.
+        transport.set_peers(&[(NodeId::new(1), free_addr()), b]);
+        let ids: Vec<NodeId> = transport.peers().collect();
+        assert_eq!(ids, vec![NodeId::new(3)]);
     }
 }
