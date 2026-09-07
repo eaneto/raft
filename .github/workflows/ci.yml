@@ -17,7 +17,7 @@ jobs:
 
       - name: Read pinned toolchain
         id: toolchain
-        run: echo "channel=$(grep '^channel' rust-toolchain.toml | cut -d'\"' -f2)" >> "$GITHUB_OUTPUT"
+        run: echo "channel=$(grep '^channel' rust-toolchain.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@master
         with:
