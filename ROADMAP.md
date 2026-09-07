@@ -115,26 +115,33 @@ this file just tracks the sequence of small steps and what's done.
       batteries (they can exceed the fault budget under a partition). —
       `bf3f021..863105a`
 
-## Next
+- [x] **Retire the prototype.** `src/raft.rs` / `src/command.rs` deleted
+      (superseded by the sans-IO modules); their `#[allow(...)]` markers, the
+      `src/lib.rs` banner comments, the unused `clap` dependency, and the
+      `AGENTS.md` §3 migration plan removed. — `738b778`
 
-- [ ] **Retire the prototype.** Delete `src/raft.rs` / `src/command.rs` (the
-      new core + storage + transport + node supersede them) and drop their
-      `#[allow(...)]` markers and the unused `clap` dependency.
+## Phase 1 complete
 
-## Phase 2 (only once the above is solid and simulation-tested)
+Leader election, log replication, snapshotting / `InstallSnapshot`, and
+single-server membership changes are implemented, unit-tested, driven over a
+deterministic simulator (curated seed batteries + `proptest`) and over a real
+TCP transport. `just check` is green. Every module rustdoc is self-contained.
+
+## Phase 2 (not started)
 
 - Pre-vote (thesis §9.6) + CandidateId / disruption fixes
 - Leadership transfer (`TimeoutNow`, thesis §3.10)
 - Batching / pipelining `AppendEntries`
 - Read-index / lease reads (thesis §6.4)
 
-## Target module layout (`AGENTS.md` §5)
+## Module layout (`AGENTS.md` §5)
 
 ```
-src/core/           done through log replication (steps 1–5)
-src/storage/        step 6 — done
-src/transport/      step 7 — done
-src/clock.rs        step 7 — done
-src/statemachine.rs step 7 — done (trait the committed log applies to)
-src/node.rs         step 7 — done
+src/core/           pure state machine: election, replication, snapshots, membership
+src/storage/        Storage trait + FileStorage + fault-injecting MemStorage
+src/transport/      Transport trait + TcpTransport (dynamic peer set)
+src/clock.rs        Clock trait + MonotonicClock
+src/statemachine.rs StateMachine trait (apply / snapshot / restore)
+src/node.rs         the driver: event loop, timers, effects, membership API
+tests/harness/      shared Sim; tests/simulation.rs + tests/proptest.rs use it
 ```
