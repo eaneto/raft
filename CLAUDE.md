@@ -12,6 +12,6 @@ Quick reminders (all detailed in `AGENTS.md`):
   randomness — side effects are returned as values (§5).
 - `fsync` failure is fatal; persist `currentTerm`/`votedFor`/log entries before replying
   to the RPC that depends on them (§8).
-- `src/raft.rs` and `src/command.rs` are the pre-standards prototype and are lint-exempt
-  in `src/lib.rs`; bring modules up to standard one at a time (§3).
+- The IO-coupled prototype (`src/raft.rs`, `src/command.rs`) has been removed; the
+  sans-IO modules under `src/` are the whole implementation (§3).
 - Use paper terminology for new code (`nextIndex`, `matchIndex`, `commitIndex`, …).
