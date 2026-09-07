@@ -14,41 +14,6 @@
 //! `fsync` failure as fatal, and makes `currentTerm` / `votedFor` / log
 //! appends durable before the RPC that relied on them is answered.
 
-// --------------------------------------------------------------------------
-// TECH DEBT: the modules below are the original IO-coupled prototype. They
-// predate the project's coding standards (concrete error enums, no bare
-// `unwrap`/`panic` on reachable paths, `///` docs on public items, paper
-// terminology, no behaviour depending on `HashMap` iteration order) and are
-// exempted from the lint gate so it stays meaningful for new code. Bring one
-// module up to standard at a time, then delete its `allow`.
-// --------------------------------------------------------------------------
-#[allow(
-    missing_docs,
-    clippy::pedantic,
-    clippy::nursery,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::todo
-)]
-pub mod command;
-
-#[allow(
-    missing_docs,
-    clippy::pedantic,
-    clippy::nursery,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::todo
-)]
-pub mod raft;
-
-// --------------------------------------------------------------------------
-// New code below this line meets the project's coding standards and carries no
-// lint debt. Keep it that way.
-// --------------------------------------------------------------------------
-
 pub mod clock;
 pub mod core;
 pub mod node;

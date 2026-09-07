@@ -60,14 +60,15 @@ tolerance, alternative consensus algorithms.
 
 ---
 
-## 3. Current state & migration plan
+## 3. Current state
 
-There is an existing prototype: `src/raft.rs`, `src/command.rs`. It is a single-file,
-IO-coupled first pass that follows Kleppmann-style pseudocode (`prefix_len` / `suffix`
-naming). It works but does not meet these standards, so both modules carry a
-`#[allow(...)]` lint-debt marker in `src/lib.rs`.
+The sans-IO rewrite is complete through Phase 1 (leader election, log
+replication, snapshotting / `InstallSnapshot`, single-server membership
+changes). The original IO-coupled prototype (`src/raft.rs`, `src/command.rs`)
+has been **deleted** — the new modules fully supersede it. `ROADMAP.md` tracks
+what is done and what remains.
 
-**Target module layout** (the sans-IO design, see §5):
+**Module layout** (the sans-IO design, see §5):
 
 ```
 src/core/          pure Raft state machine — no IO, no clock, no threads, no RNG
@@ -77,21 +78,6 @@ src/clock.rs       time source trait
 src/statemachine.rs application state machine trait the committed log applies to
 src/node.rs        the driver: owns the clock/RNG, runs the event loop, performs effects
 ```
-
-Migrate one module at a time. When a module meets these standards, delete its
-`#[allow(...)]` marker in `src/lib.rs` in the same change.
-
-**Known deviations in the prototype to fix during migration:**
-
-- `start_election` increments `current_term` then *decrements* it if the election fails —
-  term must be monotonic (§9, invariant 7). Stay a candidate at the higher term until the
-  next timeout instead.
-- RPCs are sent synchronously (blocking `TcpStream`) from inside state-transition methods.
-  The core must not do IO (§5).
-- `unwrap()` on wire parsing (`command.rs`, `send_*_request`).
-- `HashMap` iteration in `broadcast_current_log` / `commit_log_entries` — iteration order
-  must not affect behaviour (§7).
-- Ad-hoc `&str` error types — replace with real error enums (§6).
 
 Adopt **paper terminology** for all new identifiers: `nextIndex`, `matchIndex`,
 `commitIndex`, `lastApplied`, `AppendEntries`, `RequestVote`, `InstallSnapshot`.
