@@ -968,14 +968,30 @@ impl RaftNode {
 
     /// Handles an incoming `RequestVote` (Figure 2).
     ///
-    /// Steps down first if the candidate's term is newer, rejects outright if
-    /// it is older, then grants the vote only when this server has not already
-    /// voted for someone else this term and the candidate's log is at least as
-    /// up-to-date as ours (§5.4.1). Any change to `currentTerm` / `votedFor` is
-    /// emitted as [`Effect::Persist`] before the reply (persist-before-reply).
+    /// Disregards the request outright — no term adoption, no vote, no timer
+    /// reset — while this server is still hearing from a leader (thesis
+    /// §4.2.3): a server that was removed or partitioned away, and whose own
+    /// `RequestVote` therefore carries an inflated term, must not be able to
+    /// force a sitting leader out. (Pre-vote already stops the term inflating
+    /// in the first place; this covers a straggler that missed the leader's
+    /// last heartbeat but whose peers did not.) Otherwise: steps down if the
+    /// candidate's term is newer, rejects outright if it is older, then grants
+    /// the vote only when this server has not already voted for someone else
+    /// this term and the candidate's log is at least as up-to-date as ours
+    /// (§5.4.1). Any change to `currentTerm` / `votedFor` is emitted as
+    /// [`Effect::Persist`] before the reply (persist-before-reply).
     fn handle_request_vote(&mut self, args: RequestVoteArgs) -> Vec<Effect> {
         let before = (self.current_term, self.voted_for);
         let mut effects = Vec::new();
+
+        // §4.2.3: while a leader is still in contact it outranks any lone
+        // campaigner. Reply with our unchanged term so a genuinely newer
+        // candidate learns nothing it can use, and retry once our own timer
+        // fires and clears `heard_from_leader`.
+        if self.heard_from_leader {
+            effects.push(self.request_vote_reply(args.candidate_id, false));
+            return effects;
+        }
 
         if args.term > self.current_term {
             self.become_follower(args.term);
@@ -1035,14 +1051,20 @@ impl RaftNode {
     /// This is a query, not a vote: it never changes `currentTerm`, `votedFor`,
     /// the role, or anything on disk, so a partitioned or removed server that
     /// keeps asking can never disrupt the cluster. The reply says whether this
-    /// server *would* grant a real vote right now — it would, when it is not
-    /// currently hearing from a leader (thesis §4.2.3 / §9.6), the would-be term
-    /// in `args.term` is not stale, and the pre-candidate's log is at least as
-    /// up-to-date as ours (§5.4.1). The reply always carries our real
-    /// `currentTerm` so a pre-candidate a term behind can catch up.
+    /// server *would* grant a real vote right now — it would, when it is
+    /// neither a leader itself nor hearing from one (thesis §4.2.3 / §9.6), the
+    /// would-be term in `args.term` is not stale, and the pre-candidate's log
+    /// is at least as up-to-date as ours (§5.4.1). The reply always carries our
+    /// real `currentTerm` so a pre-candidate a term behind can catch up.
+    ///
+    /// A leader must refuse: in a three-node cluster a single peer that can
+    /// still reach the leader would otherwise get the leader's "yes" plus its
+    /// own and reach a quorum, promote to a real candidate, and unseat the very
+    /// leader it just polled.
     fn handle_pre_vote(&self, args: &RequestVoteArgs) -> Vec<Effect> {
-        let would_grant = args.term >= self.current_term
+        let would_grant = !self.is_leader()
             && !self.heard_from_leader
+            && args.term >= self.current_term
             && self.candidate_log_is_up_to_date(args.last_log_index, args.last_log_term);
         vec![Effect::SendRpc {
             to: args.candidate_id,
@@ -2758,6 +2780,22 @@ mod tests {
     }
 
     #[test]
+    fn a_leader_refuses_pre_votes_so_a_lone_peer_cannot_unseat_it() {
+        let mut n = node(1, &[2, 3]);
+        time_out(&mut n);
+        drive(&mut n, deliver(2, vote_reply(1, true)));
+        assert!(n.is_leader());
+
+        // Node 3, cut off from node 2 but still able to reach the leader, keeps
+        // pre-voting. If the leader granted, {3, leader} would be a quorum of 3.
+        let effects = n.step(deliver(3, pre_vote(2, 3, 0, 0)), NOW);
+
+        assert!(n.is_leader());
+        assert_eq!(n.current_term(), Term::new(1));
+        assert_eq!(effects, vec![send(3, pre_vote_reply(1, false))]);
+    }
+
+    #[test]
     fn a_pre_vote_is_refused_for_a_stale_log_or_a_stale_would_be_term() {
         let mut n = node(1, &[2, 3]);
         n.current_term = Term::new(4);
@@ -2918,6 +2956,58 @@ mod tests {
                 Effect::SendRpc {
                     to: NodeId::new(2),
                     message: vote_reply(4, false),
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn a_follower_hearing_a_leader_disregards_a_request_vote() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(4);
+        drive(&mut n, deliver(3, heartbeat(4, 3, 0, 0))); // leader 3 is in contact
+
+        // A higher-term candidate campaigns: disregarded outright (§4.2.3).
+        let effects = n.step(deliver(2, request_vote(9, 2, 0, 0)), NOW);
+
+        assert!(n.is_follower());
+        assert_eq!(n.current_term(), Term::new(4)); // term NOT adopted
+        assert_eq!(n.voted_for(), None);
+        assert_eq!(
+            effects,
+            vec![Effect::SendRpc {
+                to: NodeId::new(2),
+                message: vote_reply(4, false),
+            }],
+        );
+    }
+
+    #[test]
+    fn once_its_own_timer_fires_a_follower_processes_a_request_vote() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(4);
+        drive(&mut n, deliver(3, heartbeat(4, 3, 0, 0)));
+
+        // Its election timer fires: it no longer shields the old leader.
+        drive(&mut n, Input::ElectionTimeout);
+        assert!(n.is_pre_candidate());
+
+        let effects = n.step(deliver(2, request_vote(9, 2, 0, 0)), NOW);
+
+        assert!(n.is_follower());
+        assert_eq!(n.current_term(), Term::new(9));
+        assert_eq!(n.voted_for(), Some(NodeId::new(2)));
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Persist {
+                    current_term: Term::new(9),
+                    voted_for: Some(NodeId::new(2)),
+                },
+                Effect::ResetElectionTimer,
+                Effect::SendRpc {
+                    to: NodeId::new(2),
+                    message: vote_reply(9, true),
                 },
             ],
         );
