@@ -110,8 +110,8 @@ pub struct InstallSnapshotReply {
     pub last_included_index: LogIndex,
 }
 
-/// A message between peers: the four RPCs of Figure 2 plus `InstallSnapshot`
-/// (Figure 13).
+/// A message between peers: the four RPCs of Figure 2, the `PreVote` straw poll
+/// (thesis §9.6), and `InstallSnapshot` (Figure 13).
 ///
 /// The core emits these inside [`Effect::SendRpc`](super::Effect::SendRpc) and
 /// receives them inside [`Input::Deliver`](super::Input::Deliver).
@@ -121,6 +121,15 @@ pub enum Message {
     RequestVote(RequestVoteArgs),
     /// A response to [`Message::RequestVote`].
     RequestVoteReply(RequestVoteReply),
+    /// A pre-candidate's straw poll before it increments its term (thesis
+    /// §9.6): "if I started an election now, would you vote for me?". Reuses
+    /// [`RequestVoteArgs`]; `term` is the term the pre-candidate *would* use
+    /// (its `currentTerm + 1`). Answering one never changes the recipient's
+    /// `currentTerm`, `votedFor`, or role.
+    PreVote(RequestVoteArgs),
+    /// A response to [`Message::PreVote`]. Reuses [`RequestVoteReply`];
+    /// `vote_granted` means the responder *would* grant a real vote now.
+    PreVoteReply(RequestVoteReply),
     /// A leader replicating entries, or a heartbeat when `entries` is empty.
     AppendEntries(AppendEntriesArgs),
     /// A response to [`Message::AppendEntries`].

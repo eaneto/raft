@@ -495,15 +495,28 @@ impl Log {
 /// The role a server plays in the current term (paper §5.1), together with the
 /// volatile state that only makes sense in that role.
 ///
-/// A server is always in exactly one of these. It starts as [`Role::Follower`],
-/// becomes a [`Role::Candidate`] when its election timer fires, and becomes
-/// [`Role::Leader`] on winning an election. Keeping the per-role bookkeeping
-/// inside the variant means a follower simply has no `match_index` to get wrong.
+/// A server is always in exactly one of these. It starts as [`Role::Follower`];
+/// when its election timer fires it becomes a [`Role::PreCandidate`] and runs a
+/// pre-vote straw poll (thesis §9.6), only promoting to [`Role::Candidate`] —
+/// and only then incrementing its term — once a majority say they would vote
+/// for it. Winning the real election makes it [`Role::Leader`]. Keeping the
+/// per-role bookkeeping inside the variant means a follower simply has no
+/// `match_index` to get wrong.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Role {
     /// Passive: responds to leaders and candidates, and starts an election if
     /// it stops hearing from a leader.
     Follower,
+    /// Running a pre-vote round (thesis §9.6): asking peers whether they *would*
+    /// grant a vote, without having incremented `currentTerm` or voted for
+    /// itself. A server stuck here — partitioned away, or removed and not yet
+    /// aware — never inflates its term, so it cannot disrupt the cluster when
+    /// it reconnects.
+    PreCandidate {
+        /// Servers that said they would grant a vote, including this one. A
+        /// [`BTreeSet`] so the count is order-independent.
+        pre_votes_granted: BTreeSet<NodeId>,
+    },
     /// Actively soliciting votes for its own term.
     Candidate {
         /// Servers that have granted a vote this term, including this one. A
@@ -800,6 +813,15 @@ pub struct RaftNode {
     /// the reply after the driver installs a received snapshot, and (later) to
     /// redirect clients.
     leader_id: Option<NodeId>,
+    /// Whether this node has heard from a current-term leader since its
+    /// election timer last fired. The driver only delivers
+    /// [`Input::ElectionTimeout`] after a full randomized timeout with no
+    /// [`Effect::ResetElectionTimer`], so while this is `true` a leader was
+    /// alive within the last minimum election timeout. Used to withhold
+    /// (pre-)votes from a would-be candidate while a leader still holds office
+    /// (thesis §4.2.3 / §9.6). Set on accepted `AppendEntries` /
+    /// `InstallSnapshot`; cleared on timeout and on entering a (pre-)candidacy.
+    heard_from_leader: bool,
     /// While this node leads and has a membership change under way, its
     /// progress on it. At most one change is in flight at a time.
     pending_change: Option<PendingChange>,
@@ -827,6 +849,7 @@ impl RaftNode {
             last_applied: LogIndex::ZERO,
             role: Role::Follower,
             leader_id: None,
+            heard_from_leader: false,
             pending_change: None,
         };
         node.recompute_config();
@@ -910,9 +933,10 @@ impl RaftNode {
     /// driver must perform, in order.
     ///
     /// `now` is the driver's current [`LogicalInstant`]. This timer model keeps
-    /// election deadlines in the driver, so the core does not consult `now`
-    /// yet; it stays in the signature for the features that will (pre-vote, the
-    /// leader-disruption fix).
+    /// election deadlines in the driver and derives "a leader is still alive"
+    /// from whether [`Input::ElectionTimeout`] has fired
+    /// (`RaftNode::heard_from_leader`), so the core never has to compare
+    /// instants; `now` stays in the signature for a future feature that will.
     #[must_use]
     pub fn step(&mut self, input: Input, now: LogicalInstant) -> Vec<Effect> {
         let _ = now;
@@ -920,6 +944,8 @@ impl RaftNode {
             Input::Deliver { from, message } => match message {
                 Message::RequestVote(args) => self.handle_request_vote(args),
                 Message::RequestVoteReply(reply) => self.handle_request_vote_reply(from, reply),
+                Message::PreVote(args) => self.handle_pre_vote(&args),
+                Message::PreVoteReply(reply) => self.handle_pre_vote_reply(from, reply),
                 Message::AppendEntries(args) => self.handle_append_entries(&args),
                 Message::AppendEntriesReply(reply) => self.handle_append_entries_reply(from, reply),
                 Message::InstallSnapshot(args) => self.handle_install_snapshot(&args),
@@ -1004,6 +1030,59 @@ impl RaftNode {
         effects
     }
 
+    /// Handles an incoming `PreVote` straw poll (thesis §9.6).
+    ///
+    /// This is a query, not a vote: it never changes `currentTerm`, `votedFor`,
+    /// the role, or anything on disk, so a partitioned or removed server that
+    /// keeps asking can never disrupt the cluster. The reply says whether this
+    /// server *would* grant a real vote right now — it would, when it is not
+    /// currently hearing from a leader (thesis §4.2.3 / §9.6), the would-be term
+    /// in `args.term` is not stale, and the pre-candidate's log is at least as
+    /// up-to-date as ours (§5.4.1). The reply always carries our real
+    /// `currentTerm` so a pre-candidate a term behind can catch up.
+    fn handle_pre_vote(&self, args: &RequestVoteArgs) -> Vec<Effect> {
+        let would_grant = args.term >= self.current_term
+            && !self.heard_from_leader
+            && self.candidate_log_is_up_to_date(args.last_log_index, args.last_log_term);
+        vec![Effect::SendRpc {
+            to: args.candidate_id,
+            message: Message::PreVoteReply(RequestVoteReply {
+                term: self.current_term,
+                vote_granted: would_grant,
+            }),
+        }]
+    }
+
+    /// Handles a `PreVoteReply` while we are still pre-campaigning.
+    ///
+    /// A reply from a genuinely newer term steps us down (and is the one way a
+    /// pre-vote round touches persistent state). Otherwise a "yes" for our
+    /// current term is tallied, and a majority of them promotes us out of the
+    /// straw poll into a real election via [`RaftNode::promote_pre_candidate_if_quorum`].
+    fn handle_pre_vote_reply(&mut self, from: NodeId, reply: RequestVoteReply) -> Vec<Effect> {
+        let before = (self.current_term, self.voted_for);
+        let mut effects = Vec::new();
+
+        if reply.term > self.current_term {
+            self.become_follower(reply.term);
+            self.persist_if_changed(before, &mut effects);
+            return effects;
+        }
+
+        // A stale responder, or a reply that outlived the round it belongs to.
+        if reply.term < self.current_term || !self.is_pre_candidate() {
+            return effects;
+        }
+
+        if reply.vote_granted {
+            if let Role::PreCandidate { pre_votes_granted } = &mut self.role {
+                pre_votes_granted.insert(from);
+            }
+            effects.extend(self.promote_pre_candidate_if_quorum());
+        }
+        effects
+    }
+
     /// Handles an incoming `AppendEntries` (Figure 2), including the receiver
     /// rules 3–5: splice conflicting entries, append new ones, and advance
     /// `commitIndex` from the leader's.
@@ -1023,11 +1102,15 @@ impl RaftNode {
         }
 
         // A newer term, or the same term while we still think we are a
-        // candidate: the sender is the leader for this term, so step down.
-        if args.term > self.current_term || self.is_candidate() {
+        // (pre-)candidate: the sender is the leader for this term, so step down
+        // and abandon any campaign.
+        if args.term > self.current_term || self.is_candidate() || self.is_pre_candidate() {
             self.become_follower(args.term);
         }
         self.leader_id = Some(args.leader_id);
+        // A live leader for our term: withhold (pre-)votes until our election
+        // timer next fires (thesis §4.2.3 / §9.6).
+        self.heard_from_leader = true;
         self.persist_if_changed(before, &mut effects);
 
         // Receiver rule 2: the log must contain `prev_log_index` with a
@@ -1184,10 +1267,11 @@ impl RaftNode {
             return effects;
         }
 
-        if args.term > self.current_term || self.is_candidate() {
+        if args.term > self.current_term || self.is_candidate() || self.is_pre_candidate() {
             self.become_follower(args.term);
         }
         self.leader_id = Some(args.leader_id);
+        self.heard_from_leader = true;
         self.persist_if_changed(before, &mut effects);
 
         effects.push(Effect::ResetElectionTimer);
@@ -1570,12 +1654,16 @@ impl RaftNode {
         }
     }
 
-    /// Handles the election timer firing: a follower or candidate starts a new
-    /// election for `currentTerm + 1` (paper §5.2).
+    /// Handles the election timer firing: a follower or (pre-)candidate starts a
+    /// fresh **pre-vote** round (thesis §9.6). It asks every peer whether they
+    /// would vote for it at `currentTerm + 1` *without* incrementing its own
+    /// term or voting for itself; only [`RaftNode::promote_pre_candidate_if_quorum`],
+    /// on a majority of "yes" replies, does that and starts the real election.
     ///
-    /// Term monotonicity holds by construction — [`RaftNode::become_candidate`]
-    /// only ever calls [`Term::next`], and a failed election just leaves us a
-    /// candidate at the higher term until the timer fires again.
+    /// A server that keeps timing out in isolation therefore never inflates its
+    /// term, so it cannot force a sitting leader to step down when it reconnects.
+    /// Term monotonicity still holds by construction —
+    /// [`RaftNode::become_candidate`] only ever calls [`Term::next`].
     fn handle_election_timeout(&mut self) -> Vec<Effect> {
         // A leader never re-elects, and a server absent from its own
         // configuration (a not-yet-added learner, or one just removed) stays
@@ -1584,31 +1672,29 @@ impl RaftNode {
             return Vec::new();
         }
 
-        self.become_candidate();
+        self.become_pre_candidate();
 
-        let mut effects = Vec::new();
-        // currentTerm and votedFor both just changed; make them durable before
-        // asking anyone for a vote.
-        effects.push(Effect::Persist {
-            current_term: self.current_term,
-            voted_for: self.voted_for,
-        });
+        // A pre-vote round changes nothing on disk, so there is nothing to
+        // persist before asking.
         let last_log_index = self.log.last_index();
         let last_log_term = self.log.last_term();
-        for &peer in &self.peers {
-            effects.push(Effect::SendRpc {
+        let mut effects: Vec<Effect> = self
+            .peers
+            .iter()
+            .map(|&peer| Effect::SendRpc {
                 to: peer,
-                message: Message::RequestVote(RequestVoteArgs {
-                    term: self.current_term,
+                message: Message::PreVote(RequestVoteArgs {
+                    // The term we *would* campaign in, not one we have adopted.
+                    term: self.current_term.next(),
                     candidate_id: self.id,
                     last_log_index,
                     last_log_term,
                 }),
-            });
-        }
+            })
+            .collect();
         effects.push(Effect::ResetElectionTimer);
-        // A single-node cluster reaches quorum on its own vote right away.
-        effects.extend(self.promote_if_quorum());
+        // A lone voter wins its own pre-vote (and then its own election).
+        effects.extend(self.promote_pre_candidate_if_quorum());
         effects
     }
 
@@ -1675,9 +1761,28 @@ impl RaftNode {
             self.current_term = term;
             self.voted_for = None;
             self.leader_id = None;
+            // A new term we did not reach via a leader's RPC: assume no leader
+            // until one contacts us. `handle_append_entries` /
+            // `handle_install_snapshot` set this back to `true` right after
+            // calling us when the step-down *was* a leader's doing.
+            self.heard_from_leader = false;
         }
         self.pending_change = None;
         self.role = Role::Follower;
+    }
+
+    /// Starts a pre-vote round (thesis §9.6): unlike [`RaftNode::become_candidate`]
+    /// this does **not** touch `currentTerm` or `votedFor`, so a server that
+    /// keeps pre-voting in isolation never inflates its term. Every
+    /// [`Input::ElectionTimeout`] begins a fresh round with the pre-candidate's
+    /// own straw-poll vote already counted.
+    fn become_pre_candidate(&mut self) {
+        self.leader_id = None;
+        self.heard_from_leader = false;
+        self.pending_change = None;
+        let mut pre_votes_granted = BTreeSet::new();
+        pre_votes_granted.insert(self.id);
+        self.role = Role::PreCandidate { pre_votes_granted };
     }
 
     /// Starts a candidacy: bump the term, vote for self, record that one vote.
@@ -1685,6 +1790,7 @@ impl RaftNode {
         self.current_term = self.current_term.next();
         self.voted_for = Some(self.id);
         self.leader_id = None;
+        self.heard_from_leader = false;
         self.pending_change = None;
         let mut votes_granted = BTreeSet::new();
         votes_granted.insert(self.id);
@@ -1766,7 +1872,7 @@ impl RaftNode {
     fn promote_if_quorum(&mut self) -> Vec<Effect> {
         let has_quorum = match &self.role {
             Role::Candidate { votes_granted } => votes_granted.len() >= self.quorum(),
-            Role::Follower | Role::Leader { .. } => false,
+            Role::Follower | Role::PreCandidate { .. } | Role::Leader { .. } => false,
         };
         if !has_quorum {
             return Vec::new();
@@ -1774,6 +1880,53 @@ impl RaftNode {
 
         self.become_leader();
         self.replicate_to_peers()
+    }
+
+    /// If we are a pre-candidate whose straw poll has reached a quorum of "yes"
+    /// replies, the cluster would elect us: now actually start the election
+    /// with [`RaftNode::start_real_election`]. Otherwise nothing happens and we
+    /// keep collecting replies until the next timeout starts a fresh round.
+    fn promote_pre_candidate_if_quorum(&mut self) -> Vec<Effect> {
+        let has_quorum = match &self.role {
+            Role::PreCandidate { pre_votes_granted } => pre_votes_granted.len() >= self.quorum(),
+            Role::Follower | Role::Candidate { .. } | Role::Leader { .. } => false,
+        };
+        if !has_quorum {
+            return Vec::new();
+        }
+        self.start_real_election()
+    }
+
+    /// Increments the term, votes for self, makes both durable, and solicits
+    /// real votes from every peer. Reached only from a won pre-vote round
+    /// (thesis §9.6), so by the time the term moves a majority has already said
+    /// it would elect us.
+    fn start_real_election(&mut self) -> Vec<Effect> {
+        self.become_candidate();
+
+        // currentTerm and votedFor both just changed; make them durable before
+        // asking anyone for a vote.
+        let mut effects = vec![Effect::Persist {
+            current_term: self.current_term,
+            voted_for: self.voted_for,
+        }];
+        let last_log_index = self.log.last_index();
+        let last_log_term = self.log.last_term();
+        for &peer in &self.peers {
+            effects.push(Effect::SendRpc {
+                to: peer,
+                message: Message::RequestVote(RequestVoteArgs {
+                    term: self.current_term,
+                    candidate_id: self.id,
+                    last_log_index,
+                    last_log_term,
+                }),
+            });
+        }
+        effects.push(Effect::ResetElectionTimer);
+        // A single-node cluster reaches quorum on its own vote right away.
+        effects.extend(self.promote_if_quorum());
+        effects
     }
 
     /// Replicates to every peer: an `AppendEntries` carrying the entries it is
@@ -1792,7 +1945,7 @@ impl RaftNode {
                     .map(|&peer| self.replicate_to(peer))
                     .collect()
             }
-            Role::Follower | Role::Candidate { .. } => Vec::new(),
+            Role::Follower | Role::PreCandidate { .. } | Role::Candidate { .. } => Vec::new(),
         }
     }
 
@@ -1837,7 +1990,9 @@ impl RaftNode {
                 .get(&peer)
                 .copied()
                 .unwrap_or_else(|| self.log.last_index().next()),
-            Role::Follower | Role::Candidate { .. } => self.log.last_index().next(),
+            Role::Follower | Role::PreCandidate { .. } | Role::Candidate { .. } => {
+                self.log.last_index().next()
+            }
         }
     }
 
@@ -1953,6 +2108,13 @@ impl RaftNode {
         matches!(self.role, Role::Follower)
     }
 
+    /// Whether this server is currently a pre-candidate: running the pre-vote
+    /// straw poll (thesis §9.6) but not yet campaigning for real.
+    #[must_use]
+    pub const fn is_pre_candidate(&self) -> bool {
+        matches!(self.role, Role::PreCandidate { .. })
+    }
+
     /// Whether this server is currently a candidate.
     #[must_use]
     pub const fn is_candidate(&self) -> bool {
@@ -2047,6 +2209,22 @@ mod tests {
 
     fn vote_reply(term: u64, granted: bool) -> Message {
         Message::RequestVoteReply(RequestVoteReply {
+            term: Term::new(term),
+            vote_granted: granted,
+        })
+    }
+
+    fn pre_vote(term: u64, candidate: u64, last_log_index: u64, last_log_term: u64) -> Message {
+        Message::PreVote(RequestVoteArgs {
+            term: Term::new(term),
+            candidate_id: NodeId::new(candidate),
+            last_log_index: LogIndex::new(last_log_index),
+            last_log_term: Term::new(last_log_term),
+        })
+    }
+
+    fn pre_vote_reply(term: u64, granted: bool) -> Message {
+        Message::PreVoteReply(RequestVoteReply {
             term: Term::new(term),
             vote_granted: granted,
         })
@@ -2171,6 +2349,23 @@ mod tests {
     /// Used to arrange a node into a role before the call under test.
     fn drive(n: &mut RaftNode, input: Input) {
         let _ = n.step(input, NOW);
+    }
+
+    /// Drives `n` through an election timeout and a winning pre-vote round,
+    /// leaving it a real [`Role::Candidate`] at `currentTerm + 1` (a single-node
+    /// cluster runs straight through to [`Role::Leader`]). This is what a bare
+    /// `Input::ElectionTimeout` did before pre-vote (thesis §9.6) existed, so
+    /// tests that only need a campaigning node use it and stay concise.
+    fn time_out(n: &mut RaftNode) {
+        let would_be_term = n.current_term().get();
+        drive(n, Input::ElectionTimeout);
+        let voters: Vec<u64> = n.peers().iter().map(|peer| peer.get()).collect();
+        for voter in voters {
+            if !n.is_pre_candidate() {
+                break;
+            }
+            drive(n, deliver(voter, pre_vote_reply(would_be_term, true)));
+        }
     }
 
     #[test]
@@ -2415,19 +2610,46 @@ mod tests {
     }
 
     #[test]
-    fn election_timeout_starts_a_candidacy_and_solicits_votes() {
+    fn election_timeout_starts_a_pre_vote_without_touching_the_term() {
         let mut n = node(1, &[2, 3]);
 
         let effects = n.step(Input::ElectionTimeout, NOW);
 
+        // No term bump, no self-vote, nothing to persist: just a straw poll.
+        assert!(n.is_pre_candidate());
+        assert_eq!(n.current_term(), Term::ZERO);
+        assert_eq!(n.voted_for(), None);
+        assert!(matches!(
+            n.role(),
+            Role::PreCandidate { pre_votes_granted } if pre_votes_granted.len() == 1
+        ));
+
+        assert_eq!(
+            effects,
+            vec![
+                Effect::SendRpc {
+                    to: NodeId::new(2),
+                    message: pre_vote(1, 1, 0, 0),
+                },
+                Effect::SendRpc {
+                    to: NodeId::new(3),
+                    message: pre_vote(1, 1, 0, 0),
+                },
+                Effect::ResetElectionTimer,
+            ],
+        );
+    }
+
+    #[test]
+    fn a_quorum_of_pre_votes_starts_the_real_election() {
+        let mut n = node(1, &[2, 3]);
+        drive(&mut n, Input::ElectionTimeout);
+
+        let effects = n.step(deliver(2, pre_vote_reply(0, true)), NOW);
+
         assert!(n.is_candidate());
         assert_eq!(n.current_term(), Term::new(1));
         assert_eq!(n.voted_for(), Some(NodeId::new(1)));
-        assert!(matches!(
-            n.role(),
-            Role::Candidate { votes_granted } if votes_granted.len() == 1
-        ));
-
         assert_eq!(
             effects,
             vec![
@@ -2449,14 +2671,110 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_election_leaves_the_term_raised_not_rolled_back() {
+    fn a_lost_pre_vote_round_leaves_the_term_untouched() {
         let mut n = node(1, &[2, 3]);
 
+        // Peers refuse (they still hear a leader): no promotion, no term bump.
         drive(&mut n, Input::ElectionTimeout);
-        drive(&mut n, Input::ElectionTimeout);
+        drive(&mut n, deliver(2, pre_vote_reply(0, false)));
+        drive(&mut n, deliver(3, pre_vote_reply(0, false)));
+        assert!(n.is_pre_candidate());
+        assert_eq!(n.current_term(), Term::ZERO);
 
-        assert_eq!(n.current_term(), Term::new(2));
+        // The next timeout just starts another round, still at term 0.
+        drive(&mut n, Input::ElectionTimeout);
+        assert!(n.is_pre_candidate());
+        assert_eq!(n.current_term(), Term::ZERO);
+
+        // Once a round wins, the term finally advances and does not roll back.
+        drive(&mut n, deliver(2, pre_vote_reply(0, true)));
         assert!(n.is_candidate());
+        assert_eq!(n.current_term(), Term::new(1));
+        drive(&mut n, Input::ElectionTimeout); // real election failed: re-poll
+        assert!(n.is_pre_candidate());
+        assert_eq!(n.current_term(), Term::new(1));
+    }
+
+    #[test]
+    fn a_pre_vote_reply_from_a_newer_term_steps_the_pre_candidate_down() {
+        let mut n = node(1, &[2, 3]);
+        drive(&mut n, Input::ElectionTimeout);
+        assert!(n.is_pre_candidate());
+
+        let effects = n.step(deliver(2, pre_vote_reply(7, false)), NOW);
+
+        assert!(n.is_follower());
+        assert_eq!(n.current_term(), Term::new(7));
+        assert_eq!(
+            effects,
+            vec![Effect::Persist {
+                current_term: Term::new(7),
+                voted_for: None,
+            }],
+        );
+    }
+
+    #[test]
+    fn a_pre_vote_is_granted_when_no_leader_is_known_and_the_log_is_current() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(4);
+
+        // Would-be term 5, empty log matches ours: grant, and change nothing.
+        let effects = n.step(deliver(2, pre_vote(5, 2, 0, 0)), NOW);
+
+        assert_eq!(n.current_term(), Term::new(4));
+        assert_eq!(n.voted_for(), None);
+        assert!(n.is_follower());
+        assert_eq!(
+            effects,
+            vec![Effect::SendRpc {
+                to: NodeId::new(2),
+                message: pre_vote_reply(4, true),
+            }],
+        );
+    }
+
+    #[test]
+    fn a_pre_vote_is_refused_while_a_leader_is_active() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(4);
+        // A heartbeat from the term-4 leader: we now hear a leader.
+        drive(&mut n, deliver(3, heartbeat(4, 3, 0, 0)));
+
+        let effects = n.step(deliver(2, pre_vote(5, 2, 0, 0)), NOW);
+
+        assert_eq!(
+            effects,
+            vec![Effect::SendRpc {
+                to: NodeId::new(2),
+                message: pre_vote_reply(4, false),
+            }],
+        );
+
+        // After our own timer fires we no longer shield the leader.
+        drive(&mut n, Input::ElectionTimeout);
+        let effects = n.step(deliver(2, pre_vote(5, 2, 0, 0)), NOW);
+        assert_eq!(effects, vec![send(2, pre_vote_reply(4, true))]);
+    }
+
+    #[test]
+    fn a_pre_vote_is_refused_for_a_stale_log_or_a_stale_would_be_term() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(4);
+        n.log.append(entry(4)); // our last entry: index 1, term 4
+
+        // Up-to-date term but the pre-candidate's log is shorter.
+        drive(&mut n, deliver(2, pre_vote(5, 2, 0, 0)));
+        let stale_log = n.step(deliver(2, pre_vote(5, 2, 0, 0)), NOW);
+        assert_eq!(stale_log, vec![send(2, pre_vote_reply(4, false))]);
+
+        // Fresh enough log, but the would-be term is behind ours.
+        let stale_term = n.step(deliver(2, pre_vote(3, 2, 1, 4)), NOW);
+        assert_eq!(stale_term, vec![send(2, pre_vote_reply(4, false))]);
+
+        // Control: fresh log, current would-be term -> granted.
+        let ok = n.step(deliver(2, pre_vote(5, 2, 1, 4)), NOW);
+        assert_eq!(ok, vec![send(2, pre_vote_reply(4, true))]);
     }
 
     #[test]
@@ -2470,6 +2788,8 @@ mod tests {
         assert_eq!(
             effects,
             vec![
+                // Pre-vote reset, then the real election's persist + reset.
+                Effect::ResetElectionTimer,
                 Effect::Persist {
                     current_term: Term::new(1),
                     voted_for: Some(NodeId::new(1)),
@@ -2482,7 +2802,7 @@ mod tests {
     #[test]
     fn candidate_wins_on_a_quorum_and_sends_heartbeats() {
         let mut n = node(1, &[2, 3]);
-        drive(&mut n, Input::ElectionTimeout);
+        time_out(&mut n);
 
         let effects = n.step(deliver(2, vote_reply(1, true)), NOW);
 
@@ -2504,7 +2824,7 @@ mod tests {
     #[test]
     fn votes_arriving_after_the_win_are_ignored() {
         let mut n = node(1, &[2, 3]);
-        drive(&mut n, Input::ElectionTimeout);
+        time_out(&mut n);
         drive(&mut n, deliver(2, vote_reply(1, true)));
         assert!(n.is_leader());
 
@@ -2606,7 +2926,7 @@ mod tests {
     #[test]
     fn a_reply_with_a_newer_term_makes_a_leader_step_down() {
         let mut n = node(1, &[2, 3]);
-        drive(&mut n, Input::ElectionTimeout);
+        time_out(&mut n);
         drive(&mut n, deliver(2, vote_reply(1, true)));
         assert!(n.is_leader());
 
@@ -2642,8 +2962,8 @@ mod tests {
     #[test]
     fn append_entries_with_a_newer_term_steps_a_candidate_down() {
         let mut n = node(1, &[2, 3]);
-        drive(&mut n, Input::ElectionTimeout); // candidate, term 1
-        drive(&mut n, Input::ElectionTimeout); // candidate, term 2
+        time_out(&mut n); // candidate, term 1
+        time_out(&mut n); // candidate, term 2
 
         let effects = n.step(deliver(3, heartbeat(5, 3, 0, 0)), NOW);
 
@@ -2666,7 +2986,7 @@ mod tests {
     #[test]
     fn same_term_append_entries_makes_a_candidate_yield_without_a_new_fsync() {
         let mut n = node(1, &[2, 3]);
-        drive(&mut n, Input::ElectionTimeout); // candidate, term 1, voted for self
+        time_out(&mut n); // candidate, term 1, voted for self
 
         let effects = n.step(deliver(2, heartbeat(1, 2, 0, 0)), NOW);
 
@@ -2708,7 +3028,7 @@ mod tests {
     #[test]
     fn heartbeat_tick_makes_the_leader_rebroadcast_append_entries() {
         let mut n = node(1, &[2, 3]);
-        drive(&mut n, Input::ElectionTimeout);
+        time_out(&mut n);
         drive(&mut n, deliver(2, vote_reply(1, true)));
         assert!(n.is_leader());
 
@@ -2744,7 +3064,7 @@ mod tests {
         assert!(n.log().is_empty());
         assert!(n.is_follower());
 
-        drive(&mut n, Input::ElectionTimeout); // candidate
+        time_out(&mut n); // candidate
         assert!(n.step(propose(b"cmd"), NOW).is_empty());
         assert!(n.log().is_empty());
     }
@@ -2752,7 +3072,7 @@ mod tests {
     #[test]
     fn propose_on_a_leader_appends_persists_then_replicates() {
         let mut n = node(1, &[2, 3]);
-        drive(&mut n, Input::ElectionTimeout);
+        time_out(&mut n);
         drive(&mut n, deliver(2, vote_reply(1, true)));
         assert!(n.is_leader());
 
@@ -2778,7 +3098,7 @@ mod tests {
     #[test]
     fn persist_log_precedes_the_replicating_send_rpcs() {
         let mut n = node(1, &[2, 3]);
-        drive(&mut n, Input::ElectionTimeout);
+        time_out(&mut n);
         drive(&mut n, deliver(2, vote_reply(1, true)));
 
         let effects = n.step(propose(b"cmd"), NOW);
@@ -2796,7 +3116,7 @@ mod tests {
     #[test]
     fn a_second_proposal_replicates_the_whole_unacked_tail() {
         let mut n = node(1, &[2, 3]);
-        drive(&mut n, Input::ElectionTimeout);
+        time_out(&mut n);
         drive(&mut n, deliver(2, vote_reply(1, true)));
 
         drive(&mut n, propose(b"cmd"));
@@ -2824,7 +3144,7 @@ mod tests {
     #[test]
     fn heartbeat_tick_carries_entries_a_peer_has_not_acked() {
         let mut n = node(1, &[2, 3]);
-        drive(&mut n, Input::ElectionTimeout);
+        time_out(&mut n);
         drive(&mut n, deliver(2, vote_reply(1, true)));
         drive(&mut n, propose(b"cmd"));
 
@@ -2978,7 +3298,7 @@ mod tests {
     #[test]
     fn a_successful_ack_from_one_peer_commits_in_a_three_node_cluster() {
         let mut n = node(1, &[2, 3]);
-        drive(&mut n, Input::ElectionTimeout);
+        time_out(&mut n);
         drive(&mut n, deliver(2, vote_reply(1, true)));
         drive(&mut n, propose(b"x"));
         assert_eq!(n.commit_index(), LogIndex::ZERO); // leader alone: not yet
@@ -3005,7 +3325,7 @@ mod tests {
         n.log.append(entry(1));
         n.log.append(entry(1));
         n.current_term = Term::new(1);
-        drive(&mut n, Input::ElectionTimeout); // term 2, candidate
+        time_out(&mut n); // term 2, candidate
         drive(&mut n, deliver(2, vote_reply(2, true))); // leader, term 2
 
         let effects = n.step(deliver(2, ae_reply(2, false, 0)), NOW);
@@ -3030,7 +3350,7 @@ mod tests {
     #[test]
     fn an_ack_from_a_newer_term_makes_the_leader_step_down() {
         let mut n = node(1, &[2, 3]);
-        drive(&mut n, Input::ElectionTimeout);
+        time_out(&mut n);
         drive(&mut n, deliver(2, vote_reply(1, true)));
         assert!(n.is_leader());
 
@@ -3053,7 +3373,7 @@ mod tests {
         let mut n = node(1, &[2, 3]);
         n.log.append(entry(1));
         n.current_term = Term::new(1);
-        drive(&mut n, Input::ElectionTimeout); // term 2
+        time_out(&mut n); // term 2
         drive(&mut n, deliver(2, vote_reply(2, true))); // leader, term 2
 
         let effects = n.step(deliver(2, ae_reply(1, true, 1)), NOW);
@@ -3068,7 +3388,7 @@ mod tests {
         let mut n = node(1, &[2, 3]);
         n.log.append(entry_cmd(1, b"old")); // index 1, term 1
         n.current_term = Term::new(1);
-        drive(&mut n, Input::ElectionTimeout); // term 2, candidate
+        time_out(&mut n); // term 2, candidate
         drive(&mut n, deliver(2, vote_reply(2, true))); // leader, term 2
 
         // The term-1 entry reaches a majority, but a leader never commits an
@@ -3102,7 +3422,7 @@ mod tests {
     #[test]
     fn a_lone_leader_commits_and_applies_a_proposal_in_one_step() {
         let mut n = node(1, &[]);
-        drive(&mut n, Input::ElectionTimeout); // sole vote -> leader, term 1
+        time_out(&mut n); // sole vote -> leader, term 1
 
         let effects = n.step(propose(b"solo"), NOW);
 
@@ -3133,7 +3453,7 @@ mod tests {
             n.log.append(entry(1));
         }
         n.current_term = Term::new(1);
-        drive(&mut n, Input::ElectionTimeout); // term 2, candidate
+        time_out(&mut n); // term 2, candidate
         drive(&mut n, deliver(2, vote_reply(2, true))); // leader, term 2
         n.commit_index = LogIndex::new(5);
         n.last_applied = LogIndex::new(5);
@@ -3405,7 +3725,7 @@ mod tests {
     fn three_node_leader() -> RaftNode {
         let mut n = node(1, &[2, 3]);
         n.current_term = Term::new(1);
-        drive(&mut n, Input::ElectionTimeout); // term 2, candidate
+        time_out(&mut n); // term 2, candidate
         drive(&mut n, deliver(2, vote_reply(2, true))); // leader, term 2
         drive(&mut n, propose(b"c0"));
         drive(&mut n, deliver(2, ae_reply(2, true, 1))); // commit index 1
@@ -3455,7 +3775,7 @@ mod tests {
     fn remove_server_appends_a_config_entry_immediately() {
         let mut n = node(1, &[2, 3, 4, 5]);
         n.current_term = Term::new(1);
-        drive(&mut n, Input::ElectionTimeout);
+        time_out(&mut n);
         drive(&mut n, deliver(2, vote_reply(2, true)));
         drive(&mut n, deliver(3, vote_reply(2, true)));
         assert!(n.is_leader());
@@ -3580,7 +3900,7 @@ mod tests {
         n.log
             .append(LogEntry::config(Term::new(1), config(&[1, 2, 3, 4])));
         n.recompute_config();
-        drive(&mut n, Input::ElectionTimeout);
+        time_out(&mut n);
         assert!(n.is_candidate());
     }
 
