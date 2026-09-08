@@ -486,8 +486,11 @@ impl Sim {
 
     /// Whether every currently-connected node that considers itself a voter
     /// agrees `id` is (or is not) a voter. Nodes cut off by a partition are
-    /// skipped: without pre-vote (Phase 2) a removed node that never hears the
-    /// change keeps its stale view.
+    /// skipped, and so is a removed node that never heard the change: it keeps
+    /// its stale view for good (single-server membership does not notify a
+    /// departed server), but pre-vote stops that stale view disrupting anyone
+    /// -- see `a_reconnected_removed_server_does_not_disrupt` in the simulation
+    /// battery.
     pub fn all_agree_member(&self, id: u64, expected: bool) -> bool {
         let id = NodeId::new(id);
         self.nodes

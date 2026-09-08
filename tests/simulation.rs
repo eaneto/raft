@@ -591,7 +591,8 @@ fn a_server_added_by_the_leader_catches_up_and_votes() {
 
 /// A server that is already partitioned away is removed: the connected
 /// majority recomputes its configuration and keeps committing as a smaller
-/// cluster. (The isolated node keeps its stale view until pre-vote, Phase 2.)
+/// cluster. (The isolated node keeps its stale view for good; pre-vote keeps
+/// that harmless -- see `a_reconnected_removed_server_does_not_disrupt`.)
 fn assert_removed_server_stops_counting(seed: u64) {
     let node_count = 5;
     let mut sim = Sim::new(node_count, seed).with_net(JITTER5);
@@ -742,5 +743,138 @@ fn assert_catch_up_aborts_for_an_unreachable_server(seed: u64) {
 fn a_catch_up_against_an_unreachable_server_aborts() {
     for seed in seeds(&[1, 2, 3, 42, 1_000]) {
         assert_catch_up_aborts_for_an_unreachable_server(seed);
+    }
+}
+
+/// Pre-vote (thesis §9.6), term-inflation half. A follower cut off from the
+/// cluster keeps timing out, but every pre-vote round it runs goes unanswered,
+/// so it never promotes to a real candidate and its term never moves. When it
+/// reconnects the sitting leader is untouched -- same node, same term -- and
+/// the wanderer simply catches up. Without pre-vote its term would have climbed
+/// once per timeout and the reconnection would have forced a fresh election.
+fn assert_isolated_follower_does_not_inflate_its_term(seed: u64) {
+    let node_count = 5;
+    let mut sim = Sim::new(node_count, seed).with_net(JITTER5);
+    let leader = sim.run_until_leader(5_000);
+    sim.propose_at(leader, b"a");
+    sim.run_until(sim.now + 500);
+    let leader_term = sim.nodes[leader].current_term().get();
+
+    // Cut one follower off from the other four.
+    let victim = (0..node_count).find(|&i| i != leader).unwrap_or(1);
+    let mut groups = vec![0usize; node_count];
+    groups[victim] = 1;
+    sim.set_groups(groups);
+    let frozen_term = sim.nodes[victim].current_term().get();
+
+    // Let it stew through many election timeouts.
+    let deadline = sim.now + 8_000;
+    while sim.now < deadline {
+        sim.run_until(sim.now + HEARTBEAT_PERIOD);
+        let vt = sim.nodes[victim].current_term().get();
+        assert!(
+            vt <= frozen_term,
+            "seed={seed}: isolated follower inflated its term {frozen_term} -> {vt}",
+        );
+        assert!(
+            !sim.nodes[victim].is_leader() && !sim.nodes[victim].is_candidate(),
+            "seed={seed}: isolated follower reached a real candidacy",
+        );
+    }
+    assert!(
+        sim.nodes[leader].is_leader() && sim.nodes[leader].current_term().get() == leader_term,
+        "seed={seed}: leader was disturbed while a lone follower was isolated",
+    );
+
+    // Heal: the wanderer rejoins without forcing an election, then catches up.
+    sim.set_groups(vec![0; node_count]);
+    sim.run_until(sim.now + 5_000);
+    assert!(
+        sim.nodes[leader].is_leader() && sim.nodes[leader].current_term().get() == leader_term,
+        "seed={seed}: the reconnecting follower unseated the leader / forced a new term",
+    );
+
+    sim.propose_at(leader, b"b");
+    sim.run_until(sim.now + 3_000);
+    assert_eq!(
+        sim.log_entries(victim),
+        sim.log_entries(leader),
+        "seed={seed}: the reconnected follower did not catch up",
+    );
+}
+
+#[test]
+fn an_isolated_follower_does_not_inflate_its_term() {
+    for seed in seeds(&[1, 2, 3, 42, 1_000, 0x5EED, 7, 99]) {
+        assert_isolated_follower_does_not_inflate_its_term(seed);
+    }
+}
+
+/// Pre-vote (thesis §9.6) + thesis §4.2.3, disruption half. A server removed
+/// while it was partitioned keeps a stale view of the configuration for good.
+/// When it reconnects it still believes it is a voter and keeps starting
+/// pre-vote rounds, but every remaining member refuses -- the leader because it
+/// leads, the followers because they hear the leader -- so its term never moves
+/// and the shrunk cluster carries on committing, its leader and term intact.
+fn assert_reconnected_removed_server_does_not_disrupt(seed: u64) {
+    let node_count = 5;
+    let mut sim = Sim::new(node_count, seed).with_net(JITTER5);
+    let leader = sim.run_until_leader(5_000);
+    sim.propose_at(leader, b"c0");
+    sim.run_until(sim.now + 300);
+
+    // Isolate a follower, then remove it in absentia.
+    let victim = (0..node_count).find(|&i| i != leader).unwrap_or(4);
+    let mut groups = vec![0usize; node_count];
+    groups[victim] = 1;
+    sim.set_groups(groups);
+    sim.run_until(sim.now + 400);
+
+    let _ = sim.run_until_leader(5_000);
+    sim.remove_server(sim.ids[victim].get());
+    let deadline = sim.now + 12_000;
+    while sim.now < deadline && !sim.all_agree_member(sim.ids[victim].get(), false) {
+        sim.run_until(sim.now + HEARTBEAT_PERIOD);
+    }
+    assert!(
+        sim.all_agree_member(sim.ids[victim].get(), false),
+        "seed={seed}: the connected majority did not drop the removed node",
+    );
+
+    // Reconnect the removed node and let it flail. It still thinks it is a
+    // member (its config was never updated), so it will keep pre-voting.
+    let survivor = sim.run_until_leader(5_000);
+    assert_ne!(survivor, victim, "seed={seed}: the removed node is leading");
+    let term = sim.nodes[survivor].current_term().get();
+    let commit_before = sim.nodes[survivor].commit_index().get();
+    sim.set_groups(vec![0; node_count]);
+
+    let deadline = sim.now + 8_000;
+    while sim.now < deadline {
+        sim.run_until(sim.now + HEARTBEAT_PERIOD);
+        assert!(
+            sim.nodes[survivor].is_leader() && sim.nodes[survivor].current_term().get() == term,
+            "seed={seed}: the reconnected removed node disturbed the leader",
+        );
+        assert!(
+            !sim.nodes[victim].is_leader() && !sim.nodes[victim].is_candidate(),
+            "seed={seed}: the removed node forced its way into a real candidacy",
+        );
+    }
+
+    // The four-node cluster is still making progress.
+    let l = sim.run_until_leader(5_000);
+    sim.propose_at(l, b"c1");
+    sim.run_until(sim.now + 2_000);
+    assert!(
+        sim.nodes[l].commit_index().get() > commit_before,
+        "seed={seed}: the shrunk cluster stopped committing after the reconnect",
+    );
+}
+
+#[test]
+fn a_reconnected_removed_server_does_not_disrupt() {
+    for seed in seeds(&[1, 2, 3, 42, 1_000, 0x5EED]) {
+        assert_reconnected_removed_server_does_not_disrupt(seed);
     }
 }
