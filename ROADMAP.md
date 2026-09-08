@@ -32,7 +32,7 @@ this file just tracks the sequence of small steps and what's done.
 | Membership changes | **single-server** (thesis §4), not joint consensus. Configuration is a `LogEntryKind::Config` entry; a server uses the latest config in its log, committed or not (§4.1). `RaftNode` derives `config` from the log, falling back to a snapshot's config or the bootstrap set |
 | Catch-up | a new server joins as a passive non-voting learner (`RaftNode::new_learner`); a leader replicates to it until its `matchIndex` reaches the log end, then appends the `Config` entry. Bounded by a heartbeat-tick budget (`CATCH_UP_TICKS`) — **DEVIATION** from thesis §4.2.1's election-timeout-long rounds, since the core has no clock |
 | Change lifecycle | `Input::ChangeMembership` → (catch-up) → `Config` entry → commit. A new leader with an uncommitted `Config` entry adopts the pending change. Leader steps down after committing a config that removes it (§4.2.2). A server absent from its own config stays passive. `Effect::MembershipChanged` drives transport reconciliation |
-| Deferred | removed-/rejoining-server election disruption before it learns of the change is Phase 2 (pre-vote); Phase 1 tests isolate such nodes |
+| Pre-vote (§9.6) | election timeout → `Role::PreCandidate` runs a `Message::PreVote` straw poll at `currentTerm + 1` with no term bump / self-vote / persist; a quorum of grants promotes to a real `Candidate`. "A leader is still alive" is `RaftNode::heard_from_leader` — set on accepted `AppendEntries` / `InstallSnapshot`, cleared on `ElectionTimeout` — so the core reads no clock. A (pre-)vote is withheld while `heard_from_leader`, and a leader grants no pre-votes (§4.2.3). A removed server keeps its stale config for good but can no longer disrupt |
 
 ## Done
 
@@ -127,12 +127,21 @@ single-server membership changes are implemented, unit-tested, driven over a
 deterministic simulator (curated seed batteries + `proptest`) and over a real
 TCP transport. `just check` is green. Every module rustdoc is self-contained.
 
-## Phase 2 (not started)
+## Phase 2
 
-- Pre-vote (thesis §9.6) + CandidateId / disruption fixes
-- Leadership transfer (`TimeoutNow`, thesis §3.10)
-- Batching / pipelining `AppendEntries`
-- Read-index / lease reads (thesis §6.4)
+- [x] **Pre-vote (thesis §9.6) + disruption fixes (§4.2.3).** `Role::PreCandidate`
+      + `Message::PreVote` / `PreVoteReply` (reusing the `RequestVote` structs);
+      `handle_election_timeout` runs a straw poll that touches no persistent
+      state, `promote_pre_candidate_if_quorum` starts the real election.
+      `RaftNode::heard_from_leader` (timer-derived, no clock in the core) gates
+      both the pre-vote grant and a new "disregard `RequestVote` while a leader
+      is active" rule; a leader grants no pre-votes. Unit tests for every
+      transition + two simulation batteries
+      (`an_isolated_follower_does_not_inflate_its_term`,
+      `a_reconnected_removed_server_does_not_disrupt`). — `d349688..3603c99`
+- [ ] Leadership transfer (`TimeoutNow`, thesis §3.10)
+- [ ] Batching / pipelining `AppendEntries`
+- [ ] Read-index / lease reads (thesis §6.4)
 
 ## Module layout (`AGENTS.md` §5)
 

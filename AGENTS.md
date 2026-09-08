@@ -49,7 +49,11 @@ See §8.
 
 **Phase 2 (only after the above is solid and simulation-tested):**
 
-- Pre-vote (thesis §9.6) and the CandidateId/disruption fixes
+- ~~Pre-vote (thesis §9.6) and the CandidateId/disruption fixes~~ — **done**
+  (`Role::PreCandidate` + `Message::PreVote`; a straw poll precedes any term
+  increment, and a (pre-)vote is withheld while a leader is in contact —
+  `RaftNode::heard_from_leader`, derived from the election timer so the core
+  reads no clock)
 - Leadership transfer (`TimeoutNow`, thesis §3.10) — a *deliberate* handoff, distinct from
   failover via election
 - Batching / pipelining of `AppendEntries`
@@ -64,7 +68,8 @@ tolerance, alternative consensus algorithms.
 
 The sans-IO rewrite is complete through Phase 1 (leader election, log
 replication, snapshotting / `InstallSnapshot`, single-server membership
-changes). The original IO-coupled prototype (`src/raft.rs`, `src/command.rs`)
+changes), plus pre-vote and the §4.2.3 disruption fixes from Phase 2. The
+original IO-coupled prototype (`src/raft.rs`, `src/command.rs`)
 has been **deleted** — the new modules fully supersede it. `ROADMAP.md` tracks
 what is done and what remains.
 
