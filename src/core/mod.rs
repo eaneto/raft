@@ -2796,13 +2796,70 @@ mod tests {
     }
 
     #[test]
+    fn an_append_entries_reverts_a_pre_candidate_to_a_follower() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(4);
+        drive(&mut n, Input::ElectionTimeout);
+        assert!(n.is_pre_candidate());
+
+        // The leader was alive after all: yield, and shield it from then on.
+        let effects = n.step(deliver(3, heartbeat(4, 3, 0, 0)), NOW);
+
+        assert!(n.is_follower());
+        assert_eq!(n.current_term(), Term::new(4));
+        assert_eq!(n.leader_id(), Some(NodeId::new(3)));
+        // A pre-vote round writes nothing, so conceding one costs no fsync.
+        assert_eq!(
+            effects,
+            vec![Effect::ResetElectionTimer, append_reply(3, 4, true)],
+        );
+        assert_eq!(
+            n.step(deliver(2, pre_vote(5, 2, 0, 0)), NOW),
+            vec![send(2, pre_vote_reply(4, false))],
+        );
+    }
+
+    #[test]
+    fn an_install_snapshot_reverts_a_pre_candidate_to_a_follower() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(4);
+        drive(&mut n, Input::ElectionTimeout);
+        assert!(n.is_pre_candidate());
+
+        drive(&mut n, deliver(3, install_snapshot(4, 3, 2, 4, true)));
+
+        assert!(n.is_follower());
+        assert_eq!(n.current_term(), Term::new(4));
+        assert_eq!(n.leader_id(), Some(NodeId::new(3)));
+    }
+
+    #[test]
+    fn a_whole_pre_vote_round_persists_nothing() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(4);
+
+        let mut effects = n.step(Input::ElectionTimeout, NOW);
+        effects.extend(n.step(deliver(2, pre_vote_reply(4, false)), NOW));
+        effects.extend(n.step(deliver(3, pre_vote_reply(4, false)), NOW));
+
+        assert!(n.is_pre_candidate());
+        assert_eq!(n.current_term(), Term::new(4));
+        assert_eq!(n.voted_for(), None);
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::Persist { .. } | Effect::PersistLog { .. })),
+            "a losing pre-vote round must not touch stable storage: {effects:?}",
+        );
+    }
+
+    #[test]
     fn a_pre_vote_is_refused_for_a_stale_log_or_a_stale_would_be_term() {
         let mut n = node(1, &[2, 3]);
         n.current_term = Term::new(4);
         n.log.append(entry(4)); // our last entry: index 1, term 4
 
         // Up-to-date term but the pre-candidate's log is shorter.
-        drive(&mut n, deliver(2, pre_vote(5, 2, 0, 0)));
         let stale_log = n.step(deliver(2, pre_vote(5, 2, 0, 0)), NOW);
         assert_eq!(stale_log, vec![send(2, pre_vote_reply(4, false))]);
 
