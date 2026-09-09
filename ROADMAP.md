@@ -5,7 +5,8 @@ this file just tracks the sequence of small steps and what's done.
 
 ## How we're working
 
-- One small increment per commit, on branch `sans-io-core`.
+- One small increment per commit. Phase 1 landed on `main`; each later chunk of
+  work gets its own branch off `main` (Phase 2's pre-vote step used `pre-vote`).
 - Propose a plan and ask the open design questions **before** writing (`AGENTS.md` §0).
 - `just check` green before every commit.
 - Commit subject: `area: imperative summary` (`AGENTS.md` §12).
