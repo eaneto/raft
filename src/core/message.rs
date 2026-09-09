@@ -10,7 +10,7 @@
 //! which the transport always knows, so the messages stay faithful to the
 //! paper.
 
-use super::{ClusterConfig, LogEntry, LogIndex, NodeId, Term};
+use super::{ClusterConfig, LogEntry, LogIndex, NodeId, PreVoteRound, Term};
 
 /// Arguments for the `RequestVote` RPC (Figure 2), sent by a candidate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -32,6 +32,43 @@ pub struct RequestVoteReply {
     pub term: Term,
     /// Whether the vote was granted.
     pub vote_granted: bool,
+}
+
+/// Arguments for the `PreVote` RPC (thesis §9.6), sent by a *pre-candidate*
+/// before it dares increment its term.
+///
+/// It mirrors [`RequestVoteArgs`] — same up-to-date check, same candidate id —
+/// but asks a hypothetical question rather than requesting a commitment, and
+/// answering it changes nothing on the recipient. The two differences from a
+/// real `RequestVote` are that `term` is a term nobody has adopted, and the
+/// extra `round`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PreVoteArgs {
+    /// The term the pre-candidate *would* campaign in: its `currentTerm + 1`.
+    /// It has **not** adopted this term, and will not unless the poll succeeds.
+    pub term: Term,
+    /// The pre-candidate running the poll.
+    pub candidate_id: NodeId,
+    /// Index of the pre-candidate's last log entry (§5.4.1).
+    pub last_log_index: LogIndex,
+    /// Term of the pre-candidate's last log entry (§5.4.1).
+    pub last_log_term: Term,
+    /// Which of the pre-candidate's rounds this is. Echoed verbatim in the
+    /// reply so a "yes" cannot be spent in a later round — see
+    /// [`PreVoteRound`].
+    pub round: PreVoteRound,
+}
+
+/// Reply to a `PreVote` RPC (thesis §9.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PreVoteReply {
+    /// The responder's real `currentTerm` — not the hypothetical one it was
+    /// asked about — so a pre-candidate left behind can catch up.
+    pub term: Term,
+    /// Whether the responder *would* grant a real vote right now.
+    pub vote_granted: bool,
+    /// The `round` from the request, echoed unchanged.
+    pub round: PreVoteRound,
 }
 
 /// Arguments for the `AppendEntries` RPC (Figure 2), sent by the leader both to
@@ -122,14 +159,13 @@ pub enum Message {
     /// A response to [`Message::RequestVote`].
     RequestVoteReply(RequestVoteReply),
     /// A pre-candidate's straw poll before it increments its term (thesis
-    /// §9.6): "if I started an election now, would you vote for me?". Reuses
-    /// [`RequestVoteArgs`]; `term` is the term the pre-candidate *would* use
-    /// (its `currentTerm + 1`). Answering one never changes the recipient's
-    /// `currentTerm`, `votedFor`, or role.
-    PreVote(RequestVoteArgs),
-    /// A response to [`Message::PreVote`]. Reuses [`RequestVoteReply`];
-    /// `vote_granted` means the responder *would* grant a real vote now.
-    PreVoteReply(RequestVoteReply),
+    /// §9.6): "if I started an election now, would you vote for me?".
+    /// Answering one never changes the recipient's `currentTerm`, `votedFor`,
+    /// or role.
+    PreVote(PreVoteArgs),
+    /// A response to [`Message::PreVote`]: `vote_granted` means the responder
+    /// *would* grant a real vote now.
+    PreVoteReply(PreVoteReply),
     /// A leader replicating entries, or a heartbeat when `entries` is empty.
     AppendEntries(AppendEntriesArgs),
     /// A response to [`Message::AppendEntries`].
