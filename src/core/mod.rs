@@ -28,7 +28,7 @@ mod message;
 
 pub use message::{
     AppendEntriesArgs, AppendEntriesReply, InstallSnapshotArgs, InstallSnapshotReply, Message,
-    RequestVoteArgs, RequestVoteReply,
+    PreVoteArgs, PreVoteReply, RequestVoteArgs, RequestVoteReply,
 };
 
 /// A Raft term: a logical clock that increases monotonically over the life of
@@ -153,6 +153,56 @@ impl NodeId {
 }
 
 impl fmt::Display for NodeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Which pre-vote straw poll a [`PreVoteArgs`] belongs to (thesis §9.6).
+///
+/// Not a paper concept. A pre-vote round deliberately leaves `currentTerm`
+/// alone, so consecutive rounds at the same term are otherwise
+/// indistinguishable: a "yes" a peer sent in one round — formed when it had
+/// heard no leader — could be delivered late and counted in a later round,
+/// where the peer may well have a leader again. That would promote the
+/// pre-candidate on consent it no longer has, and the resulting term increment
+/// unseats a healthy leader (any higher term reaches it through
+/// `AppendEntriesReply`, Figure 2). Numbering the rounds is what makes a grant
+/// spendable only in the round that solicited it.
+///
+/// It counts rounds for the life of one server process, not per role: a
+/// pre-candidate that yields to a leader and later polls again must not reuse a
+/// number, or a straggling reply from the first stint would match the second.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct PreVoteRound(u64);
+
+impl PreVoteRound {
+    /// Before any round has been started. No pre-vote ever carries this, so a
+    /// reply bearing it can never be mistaken for a live one.
+    pub const ZERO: Self = Self(0);
+
+    /// Wraps a raw round number.
+    #[must_use]
+    pub const fn new(round: u64) -> Self {
+        Self(round)
+    }
+
+    /// The next round.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+
+    /// The raw round number.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for PreVoteRound {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
@@ -822,6 +872,11 @@ pub struct RaftNode {
     /// (thesis §4.2.3 / §9.6). Set on accepted `AppendEntries` /
     /// `InstallSnapshot`; cleared on timeout and on entering a (pre-)candidacy.
     heard_from_leader: bool,
+    /// The pre-vote round this node last started (thesis §9.6). Written **only**
+    /// by [`RaftNode::become_pre_candidate`], which bumps it in the same breath
+    /// as it creates the fresh tally, so the two can never disagree; a reply
+    /// carrying any other round belongs to a round that is over and is dropped.
+    pre_vote_round: PreVoteRound,
     /// While this node leads and has a membership change under way, its
     /// progress on it. At most one change is in flight at a time.
     pending_change: Option<PendingChange>,
@@ -850,6 +905,7 @@ impl RaftNode {
             role: Role::Follower,
             leader_id: None,
             heard_from_leader: false,
+            pre_vote_round: PreVoteRound::ZERO,
             pending_change: None,
         };
         node.recompute_config();
@@ -1061,16 +1117,20 @@ impl RaftNode {
     /// still reach the leader would otherwise get the leader's "yes" plus its
     /// own and reach a quorum, promote to a real candidate, and unseat the very
     /// leader it just polled.
-    fn handle_pre_vote(&self, args: &RequestVoteArgs) -> Vec<Effect> {
+    ///
+    /// `args.round` is echoed untouched so the pre-candidate can tell which of
+    /// its rounds this answer belongs to; this server never interprets it.
+    fn handle_pre_vote(&self, args: &PreVoteArgs) -> Vec<Effect> {
         let would_grant = !self.is_leader()
             && !self.heard_from_leader
             && args.term >= self.current_term
             && self.candidate_log_is_up_to_date(args.last_log_index, args.last_log_term);
         vec![Effect::SendRpc {
             to: args.candidate_id,
-            message: Message::PreVoteReply(RequestVoteReply {
+            message: Message::PreVoteReply(PreVoteReply {
                 term: self.current_term,
                 vote_granted: would_grant,
+                round: args.round,
             }),
         }]
     }
@@ -1078,10 +1138,15 @@ impl RaftNode {
     /// Handles a `PreVoteReply` while we are still pre-campaigning.
     ///
     /// A reply from a genuinely newer term steps us down (and is the one way a
-    /// pre-vote round touches persistent state). Otherwise a "yes" for our
-    /// current term is tallied, and a majority of them promotes us out of the
-    /// straw poll into a real election via [`RaftNode::promote_pre_candidate_if_quorum`].
-    fn handle_pre_vote_reply(&mut self, from: NodeId, reply: RequestVoteReply) -> Vec<Effect> {
+    /// pre-vote round touches persistent state). That check comes first and
+    /// ignores the round: a newer term is real news whichever poll carried it.
+    /// Otherwise a "yes" is tallied only if it answers the round we are
+    /// *currently* running — a peer that consented while it heard no leader may
+    /// well have one again by the next round, and spending that stale consent
+    /// would promote us on support we no longer have (see [`PreVoteRound`]).
+    /// A majority of live "yes"es promotes us out of the straw poll into a real
+    /// election via [`RaftNode::promote_pre_candidate_if_quorum`].
+    fn handle_pre_vote_reply(&mut self, from: NodeId, reply: PreVoteReply) -> Vec<Effect> {
         let before = (self.current_term, self.voted_for);
         let mut effects = Vec::new();
 
@@ -1091,8 +1156,12 @@ impl RaftNode {
             return effects;
         }
 
-        // A stale responder, or a reply that outlived the round it belongs to.
-        if reply.term < self.current_term || !self.is_pre_candidate() {
+        // A stale responder, a reply to a round we have already left behind, or
+        // one that outlived the pre-candidacy itself.
+        if reply.term < self.current_term
+            || reply.round != self.pre_vote_round
+            || !self.is_pre_candidate()
+        {
             return effects;
         }
 
@@ -1705,12 +1774,13 @@ impl RaftNode {
             .iter()
             .map(|&peer| Effect::SendRpc {
                 to: peer,
-                message: Message::PreVote(RequestVoteArgs {
+                message: Message::PreVote(PreVoteArgs {
                     // The term we *would* campaign in, not one we have adopted.
                     term: self.current_term.next(),
                     candidate_id: self.id,
                     last_log_index,
                     last_log_term,
+                    round: self.pre_vote_round,
                 }),
             })
             .collect();
@@ -1798,10 +1868,15 @@ impl RaftNode {
     /// keeps pre-voting in isolation never inflates its term. Every
     /// [`Input::ElectionTimeout`] begins a fresh round with the pre-candidate's
     /// own straw-poll vote already counted.
+    ///
+    /// Numbering the round and emptying the tally happen together and nowhere
+    /// else, which is what stops a "yes" from one round being counted in the
+    /// next ([`PreVoteRound`]).
     fn become_pre_candidate(&mut self) {
         self.leader_id = None;
         self.heard_from_leader = false;
         self.pending_change = None;
+        self.pre_vote_round = self.pre_vote_round.next();
         let mut pre_votes_granted = BTreeSet::new();
         pre_votes_granted.insert(self.id);
         self.role = Role::PreCandidate { pre_votes_granted };
@@ -2201,7 +2276,8 @@ mod tests {
     use super::{
         AppendEntriesArgs, AppendEntriesReply, CATCH_UP_TICKS, ClusterConfig, Effect, Input,
         InstallSnapshotArgs, InstallSnapshotReply, Log, LogEntry, LogIndex, LogicalInstant,
-        MembershipChange, Message, NodeId, RaftNode, RequestVoteArgs, RequestVoteReply, Role, Term,
+        MembershipChange, Message, NodeId, PreVoteArgs, PreVoteReply, PreVoteRound, RaftNode,
+        RequestVoteArgs, RequestVoteReply, Role, Term,
     };
 
     /// The core does not consult the clock under this timer model, so every
@@ -2236,19 +2312,37 @@ mod tests {
         })
     }
 
+    /// A `PreVote` for round 1 — the round a node's first timeout starts.
     fn pre_vote(term: u64, candidate: u64, last_log_index: u64, last_log_term: u64) -> Message {
-        Message::PreVote(RequestVoteArgs {
+        pre_vote_in(1, term, candidate, last_log_index, last_log_term)
+    }
+
+    fn pre_vote_in(
+        round: u64,
+        term: u64,
+        candidate: u64,
+        last_log_index: u64,
+        last_log_term: u64,
+    ) -> Message {
+        Message::PreVote(PreVoteArgs {
             term: Term::new(term),
             candidate_id: NodeId::new(candidate),
             last_log_index: LogIndex::new(last_log_index),
             last_log_term: Term::new(last_log_term),
+            round: PreVoteRound::new(round),
         })
     }
 
+    /// A `PreVoteReply` answering round 1.
     fn pre_vote_reply(term: u64, granted: bool) -> Message {
-        Message::PreVoteReply(RequestVoteReply {
+        pre_vote_reply_in(1, term, granted)
+    }
+
+    fn pre_vote_reply_in(round: u64, term: u64, granted: bool) -> Message {
+        Message::PreVoteReply(PreVoteReply {
             term: Term::new(term),
             vote_granted: granted,
+            round: PreVoteRound::new(round),
         })
     }
 
@@ -2381,12 +2475,17 @@ mod tests {
     fn time_out(n: &mut RaftNode) {
         let would_be_term = n.current_term().get();
         drive(n, Input::ElectionTimeout);
+        // Answer the round the timeout just opened, whichever number that is.
+        let round = n.pre_vote_round.get();
         let voters: Vec<u64> = n.peers().iter().map(|peer| peer.get()).collect();
         for voter in voters {
             if !n.is_pre_candidate() {
                 break;
             }
-            drive(n, deliver(voter, pre_vote_reply(would_be_term, true)));
+            drive(
+                n,
+                deliver(voter, pre_vote_reply_in(round, would_be_term, true)),
+            );
         }
     }
 
@@ -2709,12 +2808,46 @@ mod tests {
         assert_eq!(n.current_term(), Term::ZERO);
 
         // Once a round wins, the term finally advances and does not roll back.
-        drive(&mut n, deliver(2, pre_vote_reply(0, true)));
+        drive(&mut n, deliver(2, pre_vote_reply_in(2, 0, true)));
         assert!(n.is_candidate());
         assert_eq!(n.current_term(), Term::new(1));
         drive(&mut n, Input::ElectionTimeout); // real election failed: re-poll
         assert!(n.is_pre_candidate());
         assert_eq!(n.current_term(), Term::new(1));
+    }
+
+    #[test]
+    fn a_grant_from_an_earlier_round_cannot_be_spent_in_a_later_one() {
+        // Five voters, so a quorum of 3 needs two grants beyond our own and a
+        // round can genuinely end short.
+        let mut n = node(1, &[2, 3, 4, 5]);
+        n.current_term = Term::new(5);
+
+        drive(&mut n, Input::ElectionTimeout); // round 1
+        drive(&mut n, deliver(2, pre_vote_reply_in(1, 5, true))); // {1,2}
+        assert!(n.is_pre_candidate(), "two of five is not a quorum");
+
+        drive(&mut n, Input::ElectionTimeout); // round 2, tally emptied
+        drive(&mut n, deliver(3, pre_vote_reply_in(2, 5, true))); // {1,3}
+        assert!(n.is_pre_candidate());
+
+        // Node 2's round-1 "yes" finally lands. It was formed when node 2 heard
+        // no leader; by now it may well hear one again, so it must not count.
+        drive(&mut n, deliver(2, pre_vote_reply_in(1, 5, true)));
+        assert!(
+            n.is_pre_candidate(),
+            "a stale round-1 grant was spent in round 2",
+        );
+        assert_eq!(
+            n.current_term(),
+            Term::new(5),
+            "term inflated on stale consent"
+        );
+
+        // The same peer answering the *current* round does count.
+        drive(&mut n, deliver(2, pre_vote_reply_in(2, 5, true)));
+        assert!(n.is_candidate());
+        assert_eq!(n.current_term(), Term::new(6));
     }
 
     #[test]
