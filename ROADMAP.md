@@ -17,7 +17,7 @@ this file just tracks the sequence of small steps and what's done.
 | --- | --- |
 | Core surface | `RaftNode::step(Input, LogicalInstant) -> Vec<Effect>`, pure |
 | Command payload | `bytes::Bytes` — opaque, core stays non-generic |
-| `Role` | enum carrying per-role state: `Candidate { votes_granted }`, `Leader { next_index, match_index }` |
+| `Role` | enum carrying per-role state: `PreCandidate { pre_votes_granted }`, `Candidate { votes_granted }`, `Leader { next_index, match_index }` |
 | Timers | driver owns them; core emits `Effect::ResetElectionTimer`, receives `Input::ElectionTimeout` / `HeartbeatTick` |
 | `Effect::Persist` | `{ current_term, voted_for }` — metadata only |
 | `Effect::PersistLog` | `{ from_index, entries }` — a delta: the log from `from_index` (1-based) onward, in full. Append sets `from_index` past the old tail; a follower splice can step it back over conflicts |
