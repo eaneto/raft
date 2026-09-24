@@ -668,7 +668,18 @@ fn load_metadata(path0: &Path, path1: &Path) -> Result<(Term, Option<NodeId>), E
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Every directory [`sync_dir`] has synced on this thread. Tests read it to
+    /// check the directory `fsync`s `AGENTS.md` §8 rule 4 requires: short of
+    /// cutting the power, nothing else can tell one was skipped.
+    static DIR_SYNCS: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn sync_dir(dir: &Path) -> Result<(), Error> {
+    #[cfg(test)]
+    DIR_SYNCS.with_borrow_mut(|synced| synced.push(dir.to_path_buf()));
     File::open(dir)
         .and_then(|handle| handle.sync_all())
         .map_err(|source| Error::Sync {
@@ -752,12 +763,12 @@ fn warn_if_unusual_filesystem(_dir: &Path) {}
 mod tests {
     use std::fs::{self, OpenOptions};
     use std::io::Write;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use bytes::Bytes;
     use tempfile::{TempDir, tempdir};
 
-    use super::{FileStorage, encode_metadata, encode_snapshot, filesystem_of};
+    use super::{DIR_SYNCS, FileStorage, encode_metadata, encode_snapshot, filesystem_of};
     use crate::core::{ClusterConfig, LogEntry, LogIndex, NodeId, Term};
     use crate::storage::{Error, PersistentState, SnapshotMeta, Storage};
 
@@ -828,6 +839,50 @@ not a mountinfo line
     fn no_matching_mount_names_no_filesystem() {
         assert_eq!(filesystem_of("", Path::new("/var")), None);
         assert_eq!(filesystem_of("garbage", Path::new("/var")), None);
+    }
+
+    /// The directories synced on this thread since the last call.
+    fn take_dir_syncs() -> Vec<PathBuf> {
+        DIR_SYNCS.with_borrow_mut(std::mem::take)
+    }
+
+    #[test]
+    fn creating_the_log_syncs_the_directory_and_reopening_does_not() {
+        let dir = scratch();
+        take_dir_syncs();
+
+        drop(ok(FileStorage::open(dir.path())));
+        assert_eq!(take_dir_syncs(), [dir.path()]);
+
+        drop(ok(FileStorage::open(dir.path())));
+        assert!(take_dir_syncs().is_empty());
+    }
+
+    #[test]
+    fn creating_the_metadata_files_syncs_the_directory_and_rewriting_does_not() {
+        let dir = scratch();
+        let mut store = ok(FileStorage::open(dir.path()));
+        ok(store.load());
+        take_dir_syncs();
+
+        ok(store.persist_metadata(Term::new(1), Some(NodeId::new(2))));
+        assert_eq!(take_dir_syncs(), [dir.path()]);
+
+        ok(store.persist_metadata(Term::new(2), None));
+        assert!(take_dir_syncs().is_empty());
+    }
+
+    #[test]
+    fn a_snapshot_rename_syncs_the_directory() {
+        let dir = scratch();
+        let mut store = ok(FileStorage::open(dir.path()));
+        ok(store.load());
+        ok(store.persist_log(LogIndex::new(1), &[entry(1, b"a")]));
+        take_dir_syncs();
+
+        ok(store.persist_snapshot(snap_meta(1, 1), b"state"));
+
+        assert_eq!(take_dir_syncs(), [dir.path()]);
     }
 
     #[test]
