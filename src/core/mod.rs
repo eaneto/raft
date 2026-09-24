@@ -1033,9 +1033,7 @@ impl RaftNode {
                 Message::InstallSnapshotReply(reply) => {
                     self.handle_install_snapshot_reply(from, reply)
                 }
-                // Starting the election a `TimeoutNow` asks for comes in the
-                // next step; for now it is dropped.
-                Message::TimeoutNow(_) => Vec::new(),
+                Message::TimeoutNow(args) => self.handle_timeout_now(args),
             },
             Input::ElectionTimeout => self.handle_election_timeout(),
             Input::HeartbeatTick => self.handle_heartbeat_tick(),
@@ -1059,8 +1057,10 @@ impl RaftNode {
     /// `RequestVote` therefore carries an inflated term, must not be able to
     /// force a sitting leader out. (Pre-vote already stops the term inflating
     /// in the first place; this covers a straggler that missed the leader's
-    /// last heartbeat but whose peers did not.) Otherwise: steps down if the
-    /// candidate's term is newer, rejects outright if it is older, then grants
+    /// last heartbeat but whose peers did not.) The exception is a request
+    /// flagged `leadership_transfer`: that leader sent the candidate a
+    /// `TimeoutNow` precisely so it would be replaced (thesis §3.10).
+    /// Otherwise: steps down if the candidate's term is newer, rejects outright if it is older, then grants
     /// the vote only when this server has not already voted for someone else
     /// this term and the candidate's log is at least as up-to-date as ours
     /// (§5.4.1). Any change to `currentTerm` / `votedFor` is emitted as
@@ -1073,7 +1073,7 @@ impl RaftNode {
         // campaigner. Reply with our unchanged term so a genuinely newer
         // candidate learns nothing it can use, and retry once our own timer
         // fires and clears `heard_from_leader`.
-        if self.heard_from_leader {
+        if self.heard_from_leader && !args.leadership_transfer {
             effects.push(self.request_vote_reply(args.candidate_id, false));
             return effects;
         }
@@ -1201,6 +1201,34 @@ impl RaftNode {
             effects.extend(self.promote_pre_candidate_if_quorum());
         }
         effects
+    }
+
+    /// Handles a `TimeoutNow` from a leader handing leadership to this server
+    /// (thesis §3.10): start a real election at once, as if the election timer
+    /// had fired, but without the pre-vote round — the leader has already
+    /// checked this server holds its whole log, and its peers would refuse a
+    /// pre-vote while they still hear from that leader. The `RequestVote`s it
+    /// sends carry `leadership_transfer` so they are not refused for the same
+    /// reason.
+    ///
+    /// A `TimeoutNow` from an older term is stale — most likely a duplicate
+    /// arriving after the election it asked for — and is dropped. A newer term
+    /// is adopted first. A leader, or a server absent from its own
+    /// configuration, does not campaign.
+    fn handle_timeout_now(&mut self, args: TimeoutNowArgs) -> Vec<Effect> {
+        let before = (self.current_term, self.voted_for);
+        if args.term < self.current_term {
+            return Vec::new();
+        }
+        if args.term > self.current_term {
+            self.become_follower(args.term);
+        }
+        if self.is_leader() || !self.config.contains(self.id) {
+            let mut effects = Vec::new();
+            self.persist_if_changed(before, &mut effects);
+            return effects;
+        }
+        self.start_real_election(true)
     }
 
     /// Handles an incoming `AppendEntries` (Figure 2), including the receiver
@@ -2047,14 +2075,15 @@ impl RaftNode {
         if !has_quorum {
             return Vec::new();
         }
-        self.start_real_election()
+        self.start_real_election(false)
     }
 
     /// Increments the term, votes for self, makes both durable, and solicits
-    /// real votes from every peer. Reached only from a won pre-vote round
-    /// (thesis §9.6), so by the time the term moves a majority has already said
-    /// it would elect us.
-    fn start_real_election(&mut self) -> Vec<Effect> {
+    /// real votes from every peer. Reached from a won pre-vote round (thesis
+    /// §9.6), so by the time the term moves a majority has already said it
+    /// would elect us — or from a leader's `TimeoutNow` (thesis §3.10), in
+    /// which case `leadership_transfer` is set on every `RequestVote`.
+    fn start_real_election(&mut self, leadership_transfer: bool) -> Vec<Effect> {
         self.become_candidate();
 
         // currentTerm and votedFor both just changed; make them durable before
@@ -2073,6 +2102,7 @@ impl RaftNode {
                     candidate_id: self.id,
                     last_log_index,
                     last_log_term,
+                    leadership_transfer,
                 }),
             });
         }
@@ -2371,6 +2401,23 @@ mod tests {
             candidate_id: NodeId::new(candidate),
             last_log_index: LogIndex::new(last_log_index),
             last_log_term: Term::new(last_log_term),
+            leadership_transfer: false,
+        })
+    }
+
+    /// A `RequestVote` from a candidate a leader handed off to (thesis §3.10).
+    fn transfer_vote(
+        term: u64,
+        candidate: u64,
+        last_log_index: u64,
+        last_log_term: u64,
+    ) -> Message {
+        Message::RequestVote(RequestVoteArgs {
+            term: Term::new(term),
+            candidate_id: NodeId::new(candidate),
+            last_log_index: LogIndex::new(last_log_index),
+            last_log_term: Term::new(last_log_term),
+            leadership_transfer: true,
         })
     }
 
@@ -4630,14 +4677,15 @@ mod tests {
         }
     }
 
+    fn timeout_now_args(term: u64, leader: u64) -> TimeoutNowArgs {
+        TimeoutNowArgs {
+            term: Term::new(term),
+            leader_id: NodeId::new(leader),
+        }
+    }
+
     fn timeout_now(to: u64, term: u64, leader: u64) -> Effect {
-        send(
-            to,
-            Message::TimeoutNow(TimeoutNowArgs {
-                term: Term::new(term),
-                leader_id: NodeId::new(leader),
-            }),
-        )
+        send(to, Message::TimeoutNow(timeout_now_args(term, leader)))
     }
 
     #[test]
@@ -4792,5 +4840,110 @@ mod tests {
 
         assert!(n.is_follower());
         assert!(!n.is_transferring());
+    }
+
+    #[test]
+    fn timeout_now_starts_a_real_election_without_a_pre_vote() {
+        let mut n = node(2, &[1, 3]);
+        n.current_term = Term::new(2);
+        drive(&mut n, deliver(1, heartbeat(2, 1, 0, 0))); // leader 1 in contact
+
+        let effects = n.step(deliver(1, Message::TimeoutNow(timeout_now_args(2, 1))), NOW);
+
+        assert!(n.is_candidate());
+        assert_eq!(n.current_term(), Term::new(3));
+        assert_eq!(n.voted_for(), Some(NodeId::new(2)));
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Persist {
+                    current_term: Term::new(3),
+                    voted_for: Some(NodeId::new(2)),
+                },
+                send(1, transfer_vote(3, 2, 0, 0)),
+                send(3, transfer_vote(3, 2, 0, 0)),
+                Effect::ResetElectionTimer,
+            ],
+        );
+    }
+
+    #[test]
+    fn timeout_now_from_a_newer_term_is_adopted_before_campaigning() {
+        let mut n = node(2, &[1, 3]);
+        n.current_term = Term::new(2);
+
+        drive(
+            &mut n,
+            deliver(1, Message::TimeoutNow(timeout_now_args(5, 1))),
+        );
+
+        assert!(n.is_candidate());
+        assert_eq!(n.current_term(), Term::new(6));
+    }
+
+    #[test]
+    fn a_stale_timeout_now_is_dropped() {
+        let mut n = node(2, &[1, 3]);
+        n.current_term = Term::new(4);
+
+        let effects = n.step(deliver(1, Message::TimeoutNow(timeout_now_args(3, 1))), NOW);
+
+        assert!(effects.is_empty());
+        assert!(n.is_follower());
+        assert_eq!(n.current_term(), Term::new(4));
+    }
+
+    #[test]
+    fn a_leader_does_not_campaign_on_a_same_term_timeout_now() {
+        let mut n = three_node_leader(); // term 2
+
+        let effects = n.step(deliver(2, Message::TimeoutNow(timeout_now_args(2, 2))), NOW);
+
+        assert!(effects.is_empty());
+        assert!(n.is_leader());
+        assert_eq!(n.current_term(), Term::new(2));
+    }
+
+    #[test]
+    fn a_server_outside_its_configuration_does_not_campaign_on_timeout_now() {
+        let mut n = RaftNode::new_learner(NodeId::new(4));
+
+        let effects = n.step(deliver(1, Message::TimeoutNow(timeout_now_args(3, 1))), NOW);
+
+        // It adopts the newer term, durably, but stays passive.
+        assert_eq!(
+            effects,
+            vec![Effect::Persist {
+                current_term: Term::new(3),
+                voted_for: None,
+            }],
+        );
+        assert!(n.is_follower());
+    }
+
+    #[test]
+    fn a_follower_hearing_a_leader_grants_a_transfer_vote() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(4);
+        drive(&mut n, deliver(3, heartbeat(4, 3, 0, 0))); // leader 3 in contact
+
+        let effects = n.step(deliver(2, transfer_vote(5, 2, 0, 0)), NOW);
+
+        assert_eq!(n.current_term(), Term::new(5));
+        assert_eq!(n.voted_for(), Some(NodeId::new(2)));
+        assert!(effects.contains(&send(2, vote_reply(5, true))));
+    }
+
+    #[test]
+    fn a_transfer_vote_still_needs_an_up_to_date_log() {
+        let mut n = node(1, &[2, 3]);
+        n.log.append(entry(4));
+        n.current_term = Term::new(4);
+        drive(&mut n, deliver(3, heartbeat(4, 3, 1, 4)));
+
+        let effects = n.step(deliver(2, transfer_vote(5, 2, 0, 0)), NOW);
+
+        assert_eq!(n.voted_for(), None);
+        assert!(effects.contains(&send(2, vote_reply(5, false))));
     }
 }
