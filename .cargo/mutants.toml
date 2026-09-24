@@ -29,4 +29,10 @@ exclude_re = [
     'replace > with >= in <impl Storage for FileStorage>::persist_snapshot$',
     # Only logs; what it logs comes from `filesystem_of`, which is tested.
     'replace warn_if_unusual_filesystem with \(\)$',
+
+    # src/transport/mod.rs
+    #
+    # An 8-byte payload is a sender id with an empty message body, which the
+    # decoder rejects as InvalidData just as the length check would.
+    'replace < with <= in read_frame$',
 ]
