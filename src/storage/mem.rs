@@ -305,6 +305,7 @@ mod tests {
         // The 2nd persist call's sync drops its writes and then lies.
         let mut store = MemStorage::new().fail_sync_on_call(2, SyncFault::DropWritesThenLie);
         ok(store.persist_metadata(Term::new(1), None)); // call 1: ok
+        assert!(!store.is_lying());
 
         fatal_err(store.persist_metadata(Term::new(2), Some(NodeId::new(1)))); // call 2
 
@@ -324,5 +325,36 @@ mod tests {
         fatal_err(store.persist_metadata(Term::new(5), None));
 
         assert_eq!(reloaded(&store).current_term, Term::new(5));
+    }
+
+    #[test]
+    fn a_restart_clears_a_fired_fault_so_writes_persist_again() {
+        let mut store = MemStorage::new().fail_sync_on_call(1, SyncFault::DropWritesThenLie);
+        fatal_err(store.persist_metadata(Term::new(2), None));
+        assert!(store.is_lying());
+
+        store.restart();
+        assert!(!store.is_lying());
+        ok(store.persist_metadata(Term::new(3), None));
+
+        assert_eq!(store.durable().current_term, Term::new(3));
+    }
+
+    #[test]
+    fn with_state_starts_from_that_state_on_disk() {
+        let state = PersistentState {
+            current_term: Term::new(4),
+            voted_for: Some(NodeId::new(2)),
+            snapshot: None,
+            entries: vec![entry(1, b"a"), entry(4, b"b")],
+        };
+        let mut store = MemStorage::with_state(state.clone());
+        assert_eq!(ok(store.load()), state);
+
+        // Later writes build on that state rather than on an empty one.
+        ok(store.persist_metadata(Term::new(5), None));
+        let reloaded = reloaded(&store);
+        assert_eq!(reloaded.current_term, Term::new(5));
+        assert_eq!(reloaded.entries, state.entries);
     }
 }
