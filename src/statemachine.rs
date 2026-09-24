@@ -101,6 +101,21 @@ mod tests {
     use crate::core::LogIndex;
 
     #[test]
+    fn apply_records_each_command_in_order() {
+        let mut sm = RecordingStateMachine::new();
+        sm.apply(LogIndex::new(1), &Bytes::from_static(b"a"));
+        sm.apply(LogIndex::new(2), &Bytes::from_static(b"b"));
+
+        assert_eq!(
+            sm.applied(),
+            [
+                (LogIndex::new(1), Bytes::from_static(b"a")),
+                (LogIndex::new(2), Bytes::from_static(b"b")),
+            ]
+        );
+    }
+
+    #[test]
     fn snapshot_and_restore_round_trip_the_applied_log() {
         let mut sm = RecordingStateMachine::new();
         sm.apply(LogIndex::new(1), &Bytes::from_static(b"set x=1"));
