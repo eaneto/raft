@@ -23,6 +23,11 @@ pub struct RequestVoteArgs {
     pub last_log_index: LogIndex,
     /// Term of the candidate's last log entry (§5.4.1).
     pub last_log_term: Term,
+    /// Set when the candidate is campaigning because the leader told it to
+    /// with a [`Message::TimeoutNow`] (thesis §3.10). A voter still hearing
+    /// from that leader would otherwise disregard the request (thesis
+    /// §4.2.3); this flag says the leader itself wants to be replaced.
+    pub leadership_transfer: bool,
 }
 
 /// Reply to a `RequestVote` RPC (Figure 2).
