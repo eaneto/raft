@@ -721,8 +721,9 @@ pub enum Input {
         message: Message,
     },
     /// A client asks the cluster to append and eventually commit a command.
-    /// Only a leader acts on it; a follower or candidate currently drops it
-    /// (redirecting the client to the leader is future work).
+    /// Only a leader acts on it, and not while it is transferring leadership;
+    /// anyone else currently drops it (redirecting the client to the leader is
+    /// future work).
     Propose {
         /// The opaque command bytes.
         command: Bytes,
