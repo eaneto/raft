@@ -17,4 +17,16 @@ exclude_re = [
     # Re-committing the current commitIndex: nothing new to apply, and a
     # committed config change was already finished when it first committed.
     'replace > with >= in RaftNode::maybe_advance_commit_index$',
+
+    # src/storage/file.rs
+    #
+    # A 28-byte snapshot file has no room for its configuration, so it is
+    # `Corrupt` whether the length check or the config decode rejects it.
+    'replace < with <= in FileStorage::load_snapshot$',
+    # With nothing to drop, `drop_log_prefix(0, ..)` rewrites the log with the
+    # same contents: the result is identical, only slower.
+    'replace > with >= in <impl Storage for FileStorage>::load$',
+    'replace > with >= in <impl Storage for FileStorage>::persist_snapshot$',
+    # Only logs; what it logs comes from `filesystem_of`, which is tested.
+    'replace warn_if_unusual_filesystem with \(\)$',
 ]
