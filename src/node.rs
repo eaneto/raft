@@ -740,3 +740,459 @@ fn random_timeout(rng: &mut StdRng, config: &Config) -> Duration {
     let hi = u64::try_from(config.election_timeout.1.as_millis()).unwrap_or(300);
     Duration::from_millis(rng.gen_range(lo..hi.max(lo + 1)))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error as _;
+    use std::io;
+    use std::net::SocketAddr;
+    use std::sync::{Mutex, PoisonError};
+    use std::time::{Duration, Instant};
+
+    use bytes::Bytes;
+
+    use super::{Config, Driver, NodeGone, PeerTransport, StartError, random_timeout, soonest};
+    use crate::core::{ClusterConfig, Effect, Input, LogIndex, Message, NodeId, Term};
+    use crate::statemachine::{RecordingStateMachine, StateMachine};
+    use crate::storage::{self, MemStorage, Snapshot, SnapshotMeta};
+    use crate::transport::{self, Transport};
+
+    /// A transport that records what it is asked to send and to whom.
+    #[derive(Default)]
+    struct FakeTransport {
+        sent: Mutex<Vec<(NodeId, Message)>>,
+        peers: Vec<NodeId>,
+    }
+
+    impl FakeTransport {
+        fn take_sent(&self) -> Vec<(NodeId, Message)> {
+            std::mem::take(&mut *self.sent.lock().unwrap_or_else(PoisonError::into_inner))
+        }
+    }
+
+    impl Transport for FakeTransport {
+        fn send(&self, to: NodeId, message: &Message) {
+            let mut sent = self.sent.lock().unwrap_or_else(PoisonError::into_inner);
+            // A send loop that never ends must fail the test, not eat memory.
+            assert!(sent.len() < 1_000, "runaway send loop");
+            sent.push((to, message.clone()));
+        }
+    }
+
+    impl PeerTransport for FakeTransport {
+        fn peers(&self) -> Vec<NodeId> {
+            self.peers.clone()
+        }
+
+        fn set_peers(&mut self, peers: &[(NodeId, SocketAddr)]) {
+            self.peers = peers.iter().map(|(id, _)| *id).collect();
+        }
+    }
+
+    type TestDriver = Driver<MemStorage, RecordingStateMachine, FakeTransport>;
+
+    const MIN_TIMEOUT: Duration = Duration::from_millis(150);
+    const MAX_TIMEOUT: Duration = Duration::from_millis(300);
+
+    fn addr(id: u64) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 9_000 + u16::try_from(id).unwrap_or(0)))
+    }
+
+    /// Node 1's config with `peers`. Nothing binds these addresses.
+    fn config(peers: &[u64]) -> Config {
+        Config::new(NodeId::new(1), addr(1), "unused").with_peers(
+            peers
+                .iter()
+                .map(|&id| (NodeId::new(id), addr(id)))
+                .collect(),
+        )
+    }
+
+    fn driver(config: Config, now: Instant) -> TestDriver {
+        let mut transport = FakeTransport::default();
+        transport.set_peers(&config.peers);
+        let restored = Driver::restore(
+            config,
+            transport,
+            MemStorage::new(),
+            RecordingStateMachine::new(),
+            now,
+        );
+        let Ok(driver) = restored else {
+            unreachable!("fresh MemStorage always loads");
+        };
+        driver
+    }
+
+    /// A single-node cluster: its first election timeout makes it leader.
+    fn lone_leader(config: Config, now: Instant) -> TestDriver {
+        let mut d = driver(config, now);
+        step(&mut d, Input::ElectionTimeout, now);
+        assert!(d.node.is_leader());
+        d
+    }
+
+    #[track_caller]
+    fn ok<T>(result: Result<T, storage::Error>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(err) => unreachable!("expected Ok, got {err}"),
+        }
+    }
+
+    #[track_caller]
+    fn step(d: &mut TestDriver, input: Input, now: Instant) {
+        ok(d.step(input, now));
+    }
+
+    #[track_caller]
+    fn assert_election_armed_from(d: &TestDriver, from: Instant) {
+        let Some(deadline) = d.election_deadline else {
+            unreachable!("no election deadline armed");
+        };
+        assert!(
+            deadline >= from + MIN_TIMEOUT && deadline < from + MAX_TIMEOUT,
+            "deadline {:?} after `from`, outside [150ms, 300ms)",
+            deadline.saturating_duration_since(from),
+        );
+    }
+
+    // --- timers --------------------------------------------------------------
+
+    #[test]
+    fn restore_arms_the_first_election_timeout_from_now() {
+        let now = Instant::now();
+        let d = driver(config(&[2, 3]), now);
+
+        assert_election_armed_from(&d, now);
+        assert_eq!(d.heartbeat_deadline, None);
+    }
+
+    #[test]
+    fn a_reset_election_timer_rearms_it_from_now() {
+        let start = Instant::now();
+        let mut d = driver(config(&[2, 3]), start);
+        let later = start + Duration::from_secs(10);
+
+        ok(d.perform(vec![Effect::ResetElectionTimer], later));
+
+        assert_election_armed_from(&d, later);
+    }
+
+    #[test]
+    fn an_election_timeout_fires_at_its_deadline_and_not_before() {
+        let start = Instant::now();
+        let mut d = driver(config(&[2, 3]), start);
+        let due = start + Duration::from_millis(200);
+        d.election_deadline = Some(due);
+
+        ok(d.fire_due_timers(start + Duration::from_millis(199)));
+        assert!(d.node.is_follower());
+        assert!(d.transport.take_sent().is_empty());
+
+        ok(d.fire_due_timers(due));
+        assert!(d.node.is_pre_candidate());
+        let sent = d.transport.take_sent();
+        assert_eq!(sent.len(), 2);
+        assert!(
+            sent.iter()
+                .all(|(_, message)| matches!(message, Message::PreVote(_)))
+        );
+    }
+
+    #[test]
+    fn a_leader_heartbeats_at_its_deadline_then_every_interval() {
+        let now = Instant::now();
+        let mut d = lone_leader(config(&[]), now);
+        let interval = d.config.heartbeat_interval;
+        d.heartbeat_deadline = Some(now);
+
+        ok(d.fire_due_timers(now));
+        assert_eq!(d.heartbeat_deadline, Some(now + interval));
+
+        // Not due again until a full interval has passed.
+        ok(d.fire_due_timers(now + interval.saturating_sub(Duration::from_millis(1))));
+        assert_eq!(d.heartbeat_deadline, Some(now + interval));
+    }
+
+    #[test]
+    fn reconcile_timers_arms_exactly_the_timer_the_role_needs() {
+        let start = Instant::now();
+        let later = start + Duration::from_secs(10);
+
+        // A leader heartbeats at once and runs no election timer.
+        let mut d = lone_leader(config(&[]), start);
+        d.reconcile_timers(later);
+        assert_eq!(d.election_deadline, None);
+        assert_eq!(d.heartbeat_deadline, Some(later));
+
+        // A follower whose election timer was disarmed gets a fresh one.
+        let mut d = driver(config(&[2, 3]), start);
+        d.election_deadline = None;
+        d.heartbeat_deadline = Some(start);
+        d.reconcile_timers(later);
+        assert_eq!(d.heartbeat_deadline, None);
+        assert_election_armed_from(&d, later);
+    }
+
+    #[test]
+    fn soonest_is_the_earlier_armed_deadline() {
+        let a = Instant::now();
+        let b = a + Duration::from_millis(5);
+        assert_eq!(soonest(Some(a), Some(b)), Some(a));
+        assert_eq!(soonest(Some(b), Some(a)), Some(a));
+        assert_eq!(soonest(None, Some(b)), Some(b));
+        assert_eq!(soonest(None, None), None);
+    }
+
+    #[test]
+    fn random_timeout_tolerates_an_empty_range() {
+        let mut config = config(&[]);
+        config.election_timeout = (Duration::from_millis(200), Duration::from_millis(200));
+        let mut rng = rand::SeedableRng::seed_from_u64(0);
+
+        assert_eq!(
+            random_timeout(&mut rng, &config),
+            Duration::from_millis(200)
+        );
+    }
+
+    // --- snapshots -----------------------------------------------------------
+
+    fn snapshot_meta() -> SnapshotMeta {
+        SnapshotMeta {
+            last_included_index: LogIndex::new(3),
+            last_included_term: Term::new(1),
+            config: ClusterConfig::new([1, 2, 3].map(NodeId::new)),
+        }
+    }
+
+    /// A real state machine's snapshot of three applied commands.
+    fn snapshot_data() -> Bytes {
+        let mut sm = RecordingStateMachine::new();
+        for (index, command) in [b"a", b"b", b"c"].into_iter().enumerate() {
+            sm.apply(
+                LogIndex::new(index as u64 + 1),
+                &Bytes::from_static(command),
+            );
+        }
+        sm.snapshot()
+    }
+
+    #[test]
+    fn a_snapshot_is_streamed_in_chunks_with_only_the_last_marked_done() {
+        let now = Instant::now();
+        let mut d = driver(config(&[2, 3]), now);
+        d.config.snapshot_chunk_size = 4;
+        d.snapshot = Some((snapshot_meta(), Bytes::from_static(b"0123456789")));
+
+        d.send_snapshot(NodeId::new(2));
+
+        let chunks: Vec<(u64, Vec<u8>, bool)> = d
+            .transport
+            .take_sent()
+            .into_iter()
+            .map(|(to, message)| {
+                assert_eq!(to, NodeId::new(2));
+                let Message::InstallSnapshot(args) = message else {
+                    unreachable!("only InstallSnapshot is sent");
+                };
+                assert_eq!(args.last_included_index, LogIndex::new(3));
+                (args.offset, args.data, args.done)
+            })
+            .collect();
+        assert_eq!(
+            chunks,
+            vec![
+                (0, b"0123".to_vec(), false),
+                (4, b"4567".to_vec(), false),
+                (8, b"89".to_vec(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn with_no_snapshot_to_send_nothing_is_sent() {
+        let now = Instant::now();
+        let d = driver(config(&[2, 3]), now);
+
+        d.send_snapshot(NodeId::new(2));
+
+        assert!(d.transport.take_sent().is_empty());
+    }
+
+    /// Feeds `data` to `d` as 4-byte chunks starting at `from`, the last one
+    /// marked done.
+    fn feed_chunks(
+        d: &mut TestDriver,
+        meta: &SnapshotMeta,
+        data: &[u8],
+        from: usize,
+        now: Instant,
+    ) {
+        let mut offset = from;
+        while offset < data.len() {
+            let end = (offset + 4).min(data.len());
+            let done = end == data.len();
+            ok(d.receive_snapshot_chunk(
+                meta.clone(),
+                offset as u64,
+                &data[offset..end],
+                done,
+                now,
+            ));
+            offset = end;
+        }
+    }
+
+    #[test]
+    fn a_complete_chunk_stream_is_persisted_restored_and_adopted() {
+        let now = Instant::now();
+        let mut d = driver(config(&[2, 3]), now);
+        let (meta, data) = (snapshot_meta(), snapshot_data());
+
+        // Everything but the final chunk: nothing is installed yet.
+        let last = (data.len() - 1) / 4 * 4;
+        for offset in (0..last).step_by(4) {
+            let chunk = &data[offset..offset + 4];
+            ok(d.receive_snapshot_chunk(meta.clone(), offset as u64, chunk, false, now));
+        }
+        assert_eq!(d.storage.durable().snapshot, None);
+
+        ok(d.receive_snapshot_chunk(meta.clone(), last as u64, &data[last..], true, now));
+
+        assert_eq!(
+            d.storage.durable().snapshot,
+            Some(Snapshot {
+                meta: meta.clone(),
+                data: data.clone(),
+            })
+        );
+        let mut expected = RecordingStateMachine::new();
+        expected.restore(&data);
+        assert_eq!(d.state_machine.applied(), expected.applied());
+        assert_eq!(d.snapshot, Some((meta, data)));
+        assert_eq!(d.node.commit_index(), LogIndex::new(3));
+    }
+
+    #[test]
+    fn a_stream_restarted_from_offset_zero_starts_over() {
+        let now = Instant::now();
+        let mut d = driver(config(&[2, 3]), now);
+        let (meta, data) = (snapshot_meta(), snapshot_data());
+
+        // The leader gives up on a stream after one chunk and resends it all.
+        ok(d.receive_snapshot_chunk(meta.clone(), 0, &data[..4], false, now));
+        feed_chunks(&mut d, &meta, &data, 0, now);
+
+        assert_eq!(
+            d.storage
+                .durable()
+                .snapshot
+                .as_ref()
+                .map(|snapshot| &snapshot.data),
+            Some(&data)
+        );
+    }
+
+    #[test]
+    fn a_gap_in_the_stream_drops_it_until_the_leader_starts_over() {
+        let now = Instant::now();
+        let mut d = driver(config(&[2, 3]), now);
+        let (meta, data) = (snapshot_meta(), snapshot_data());
+
+        // Chunk 0 arrives, chunk 1 is lost, the rest arrive.
+        ok(d.receive_snapshot_chunk(meta.clone(), 0, &data[..4], false, now));
+        feed_chunks(&mut d, &meta, &data, 8, now);
+        assert_eq!(d.storage.durable().snapshot, None);
+        assert!(d.state_machine.applied().is_empty());
+
+        // A chunk of a different snapshot cannot continue this one either.
+        let other = SnapshotMeta {
+            last_included_index: LogIndex::new(4),
+            ..meta.clone()
+        };
+        ok(d.receive_snapshot_chunk(meta.clone(), 0, &data[..4], false, now));
+        feed_chunks(&mut d, &other, &data, 4, now);
+        assert_eq!(d.storage.durable().snapshot, None);
+    }
+
+    // --- compaction and membership -------------------------------------------
+
+    #[test]
+    fn the_log_is_compacted_once_the_threshold_is_reached() {
+        let now = Instant::now();
+        let mut d = lone_leader(config(&[]).with_snapshot_threshold(3), now);
+        let propose = |command: &'static [u8]| Input::Propose {
+            command: Bytes::from_static(command),
+        };
+
+        step(&mut d, propose(b"a"), now);
+        step(&mut d, propose(b"b"), now);
+        assert_eq!(d.storage.durable().snapshot, None);
+
+        step(&mut d, propose(b"c"), now);
+        let snapshot = d.storage.durable().snapshot.clone();
+        assert_eq!(
+            snapshot.map(|snapshot| snapshot.meta.last_included_index),
+            Some(LogIndex::new(3))
+        );
+        assert_eq!(d.node.snapshot_last_index(), LogIndex::new(3));
+    }
+
+    #[test]
+    fn a_membership_change_points_the_transport_at_the_known_voters() {
+        let now = Instant::now();
+        let mut d = driver(config(&[2, 3]), now);
+        let voters = |ids: &[u64]| ClusterConfig::new(ids.iter().copied().map(NodeId::new));
+
+        ok(d.perform(
+            vec![Effect::MembershipChanged {
+                config: voters(&[1, 2]),
+            }],
+            now,
+        ));
+        assert_eq!(d.transport.peers, [NodeId::new(2)]);
+
+        // Node 9 has no known address yet, so it is left out for now.
+        ok(d.perform(
+            vec![Effect::MembershipChanged {
+                config: voters(&[1, 2, 3, 9]),
+            }],
+            now,
+        ));
+        assert_eq!(d.transport.peers, [NodeId::new(2), NodeId::new(3)]);
+    }
+
+    // --- errors --------------------------------------------------------------
+
+    #[test]
+    fn start_errors_name_their_layer_and_expose_the_cause() {
+        let storage = StartError::Storage(storage::Error::Corrupt {
+            detail: "bad crc".into(),
+        });
+        assert_eq!(
+            storage.to_string(),
+            "storage: persistent state is corrupt: bad crc"
+        );
+        assert_eq!(
+            storage.source().map(ToString::to_string),
+            Some("persistent state is corrupt: bad crc".into())
+        );
+
+        let transport = StartError::Transport(transport::Error::Bind {
+            addr: addr(1),
+            source: io::Error::other("in use"),
+        });
+        assert_eq!(
+            transport.to_string(),
+            "transport: cannot bind 127.0.0.1:9001: in use"
+        );
+        assert_eq!(
+            transport.source().map(ToString::to_string),
+            Some("cannot bind 127.0.0.1:9001: in use".into())
+        );
+
+        assert_eq!(NodeGone.to_string(), "the raft node has shut down");
+    }
+}
