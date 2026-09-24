@@ -1436,9 +1436,7 @@ impl RaftNode {
         self.base_config = config;
         self.recompute_config();
         self.commit_index = self.commit_index.max(last_included_index);
-        if self.last_applied < last_included_index {
-            self.last_applied = last_included_index;
-        }
+        self.last_applied = self.last_applied.max(last_included_index);
         // Normally a no-op: only runs if a concurrent AppendEntries had already
         // pushed commitIndex past the snapshot.
         self.apply_committed(&mut effects);
