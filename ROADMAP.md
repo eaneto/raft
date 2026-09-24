@@ -34,6 +34,7 @@ this file just tracks the sequence of small steps and what's done.
 | Catch-up | a new server joins as a passive non-voting learner (`RaftNode::new_learner`); a leader replicates to it until its `matchIndex` reaches the log end, then appends the `Config` entry. Bounded by a heartbeat-tick budget (`CATCH_UP_TICKS`) — **DEVIATION** from thesis §4.2.1's election-timeout-long rounds, since the core has no clock |
 | Change lifecycle | `Input::ChangeMembership` → (catch-up) → `Config` entry → commit. A new leader with an uncommitted `Config` entry adopts the pending change. Leader steps down after committing a config that removes it (§4.2.2). A server being removed keeps receiving `AppendEntries` until its removal commits, so it learns of it. A server absent from its own config stays passive. `Effect::MembershipChanged` drives transport reconciliation |
 | Pre-vote (§9.6) | election timeout → `Role::PreCandidate` runs a `Message::PreVote` straw poll at `currentTerm + 1` with no term bump / self-vote / persist; a quorum of grants promotes to a real `Candidate`. "A leader is still alive" is `RaftNode::heard_from_leader` — set on accepted `AppendEntries` / `InstallSnapshot`, cleared on `ElectionTimeout` — so the core reads no clock. A (pre-)vote is withheld while `heard_from_leader`, and a leader grants no pre-votes (§4.2.3). A removed server that never received its removal keeps its stale config for good but can no longer disrupt |
+| Leadership transfer (§3.10) | `Input::TransferLeadership { target }`; the transfer lives on `Role::Leader` (`LeadershipTransfer`), so any step-down drops it. The leader refuses proposals and membership changes while transferring, and refuses a transfer to itself, to a non-voter, during a membership change, or while one is running. It sends `Message::TimeoutNow` on every ack showing the target holds its whole log (a lost one is retried on the next heartbeat's ack). The target skips pre-vote and campaigns at once; its `RequestVote`s carry `leadership_transfer: bool`, which lets voters grant despite `heard_from_leader`. The transfer is abandoned after `TRANSFER_TICKS` heartbeats — **DEVIATION** from §3.10's election-timeout bound, since the core has no clock |
 | `PreVoteRound` | pre-vote rounds are numbered (`PreVoteArgs.round`, echoed by the reply) and a grant counts only for the round it answers. Rounds at one term are otherwise indistinguishable — `currentTerm` deliberately does not move — so a late "yes" from an earlier round would be spent in a later one, promoting on consent the peer no longer gives; the term bump that follows unseats a healthy leader via `AppendEntriesReply`. This is why `PreVote` gets its own structs instead of reusing `RequestVoteArgs` / `RequestVoteReply` |
 
 ## Done
@@ -143,7 +144,22 @@ TCP transport. `just check` is green. Every module rustdoc is self-contained.
       two simulation batteries
       (`an_isolated_follower_does_not_inflate_its_term`,
       `a_reconnected_removed_server_does_not_disrupt`). — `d349688..f31cff4`
-- [ ] Leadership transfer (`TimeoutNow`, thesis §3.10)
+- [x] **Mutation-testing pass.** `cargo mutants` run file by file
+      (`cargo mutants -j 2 -f <file>`); every surviving mutant closed with a
+      test or a justified `exclude_re` in `.cargo/mutants.toml`. Found a
+      removed peer never sent its own removal and an `AppendEntries` that
+      could move `commitIndex` back; `Driver` made generic over a private
+      `PeerTransport` so it is unit-tested against a fake.
+- [x] **Leadership transfer (thesis §3.10).** Leader side:
+      `Input::TransferLeadership`, `LeadershipTransfer` on `Role::Leader`,
+      proposals / membership changes refused while transferring,
+      `Message::TimeoutNow` once the target's `matchIndex` reaches the log
+      end. Target side: `TimeoutNow` skips pre-vote; `RequestVoteArgs` gains
+      `leadership_transfer` to get past the §4.2.3 leader-contact rule.
+      `TRANSFER_TICKS` abort (DEVIATION). Sim batteries
+      (`a_leader_hands_off_to_a_chosen_voter`,
+      `a_transfer_to_an_unreachable_voter_is_abandoned`) + a proptest
+      `Transfer` op; `Node::transfer_leadership` + a TCP integration test.
 - [ ] Batching / pipelining `AppendEntries`
 - [ ] Read-index / lease reads (thesis §6.4)
 

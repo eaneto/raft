@@ -1,14 +1,22 @@
 //! The RPC messages the core exchanges with its peers.
 //!
-//! These mirror the two RPCs of Figure 2 — a request and a reply for each —
-//! expressed with the core's newtypes. They are plain data: the core produces
-//! and consumes them, and a later transport layer serializes them. No wire
-//! format is fixed here.
+//! Expressed with the core's newtypes, they cover:
 //!
-//! The Figure 2 reply structs have no sender field. The core learns who a
-//! message came from via [`Input::Deliver`](super::Input::Deliver)'s `from`,
-//! which the transport always knows, so the messages stay faithful to the
-//! paper.
+//! - `RequestVote` and `AppendEntries`, the two RPCs of Figure 2;
+//! - `PreVote`, the straw poll that precedes an election (thesis §9.6);
+//! - `InstallSnapshot`, for a follower behind the leader's snapshot
+//!   (Figure 13);
+//! - `TimeoutNow`, which tells a leadership-transfer target to start an
+//!   election at once (thesis §3.10).
+//!
+//! Each has a request and a reply, except `TimeoutNow`, which is one-way: the
+//! leader learns the outcome from the new term the target's election brings.
+//! They are plain data: the core produces and consumes them, and the transport
+//! serializes them. No wire format is fixed here.
+//!
+//! The reply structs have no sender field. The core learns who a message came
+//! from via [`Input::Deliver`](super::Input::Deliver)'s `from`, which the
+//! transport always knows, so the messages stay faithful to the paper.
 
 use super::{ClusterConfig, LogEntry, LogIndex, NodeId, PreVoteRound, Term};
 
@@ -166,7 +174,7 @@ pub struct TimeoutNowArgs {
     pub leader_id: NodeId,
 }
 
-/// A message between peers: the four RPCs of Figure 2, the `PreVote` straw poll
+/// A message between peers: the two RPCs of Figure 2, the `PreVote` straw poll
 /// (thesis §9.6), `InstallSnapshot` (Figure 13), and `TimeoutNow` (thesis
 /// §3.10).
 ///

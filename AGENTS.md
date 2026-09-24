@@ -54,8 +54,11 @@ See §8.
   increment, and a (pre-)vote is withheld while a leader is in contact —
   `RaftNode::heard_from_leader`, derived from the election timer so the core
   reads no clock)
-- Leadership transfer (`TimeoutNow`, thesis §3.10) — a *deliberate* handoff, distinct from
-  failover via election
+- ~~Leadership transfer (`TimeoutNow`, thesis §3.10)~~ — **done** (a *deliberate*
+  handoff, distinct from failover via election: `Input::TransferLeadership`, the
+  target skips pre-vote on `Message::TimeoutNow`, and its `RequestVote`s carry
+  `leadership_transfer` past the leader-contact rule; abandoned after
+  `TRANSFER_TICKS` heartbeats)
 - Batching / pipelining of `AppendEntries`
 - Read-index / lease reads (thesis §6.4)
 
@@ -68,10 +71,10 @@ tolerance, alternative consensus algorithms.
 
 The sans-IO rewrite is complete through Phase 1 (leader election, log
 replication, snapshotting / `InstallSnapshot`, single-server membership
-changes), plus pre-vote and the §4.2.3 disruption fixes from Phase 2. The
-original IO-coupled prototype (`src/raft.rs`, `src/command.rs`)
-has been **deleted** — the new modules fully supersede it. `ROADMAP.md` tracks
-what is done and what remains.
+changes), plus pre-vote, the §4.2.3 disruption fixes, and leadership transfer
+from Phase 2. The original IO-coupled prototype (`src/raft.rs`,
+`src/command.rs`) has been **deleted** — the new modules fully supersede it.
+`ROADMAP.md` tracks what is done and what remains.
 
 **Module layout** (the sans-IO design, see §5):
 
