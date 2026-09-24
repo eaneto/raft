@@ -194,7 +194,9 @@ fn accept_loop(
                     handles.push(handle);
                 }
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(ACCEPT_POLL),
+            // Nothing pending (the listener is non-blocking), or a transient
+            // accept failure such as running out of descriptors: either way,
+            // wait and poll again.
             Err(_) => thread::sleep(ACCEPT_POLL),
         }
     }
