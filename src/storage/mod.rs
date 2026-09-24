@@ -235,3 +235,47 @@ impl std::error::Error for Error {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error as _;
+    use std::io;
+    use std::path::PathBuf;
+
+    use super::Error;
+
+    #[test]
+    fn only_a_failed_sync_is_fatal_and_every_error_explains_itself() {
+        let sync = Error::Sync {
+            path: PathBuf::from("/data/log"),
+            source: io::Error::other("EIO"),
+        };
+        let io = Error::Io {
+            path: PathBuf::from("/data/meta.0"),
+            source: io::Error::other("EACCES"),
+        };
+        let corrupt = Error::Corrupt {
+            detail: "bad crc".into(),
+        };
+        let too_large = Error::RecordTooLarge { bytes: 5 };
+
+        assert!(sync.is_fatal());
+        for err in [&io, &corrupt, &too_large] {
+            assert!(!err.is_fatal(), "{err} is not fatal");
+        }
+
+        assert_eq!(sync.to_string(), "fsync failed on /data/log (fatal): EIO");
+        assert_eq!(io.to_string(), "io error on /data/meta.0: EACCES");
+        assert_eq!(corrupt.to_string(), "persistent state is corrupt: bad crc");
+        assert_eq!(
+            too_large.to_string(),
+            "log record of 5 bytes exceeds the 4 GiB frame limit"
+        );
+
+        let source = |err: &Error| err.source().map(ToString::to_string);
+        assert_eq!(source(&sync), Some("EIO".into()));
+        assert_eq!(source(&io), Some("EACCES".into()));
+        assert_eq!(source(&corrupt), None);
+        assert_eq!(source(&too_large), None);
+    }
+}
