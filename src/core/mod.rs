@@ -1537,7 +1537,10 @@ impl RaftNode {
             .append(LogEntry::config(self.current_term, new_config.clone()));
         let config_index = self.log.last_index();
         self.recompute_config();
-        self.sync_replication_maps();
+        // `next_index` / `match_index` stay as they are: a promoted learner
+        // already has entries, and a peer being removed keeps its own until the
+        // removal commits (`check_config_committed` drops them), so it is sent
+        // the entry that removes it and does not sit there timing out.
         self.pending_change = Some(PendingChange {
             change,
             phase: ChangePhase::Committing { config_index },
@@ -1643,44 +1646,6 @@ impl RaftNode {
         if !self.config.contains(self.id) && self.is_leader() {
             self.leader_id = None;
             self.role = Role::Follower;
-        }
-    }
-
-    /// Reconciles the leader's `next_index` / `match_index` with the current
-    /// configuration after it changes: drops entries for servers no longer
-    /// voting (a removed peer), keeps a promoted learner's, and seeds any new
-    /// voter.
-    fn sync_replication_maps(&mut self) {
-        let mut keep: BTreeSet<NodeId> = self
-            .config
-            .voters()
-            .iter()
-            .copied()
-            .filter(|&voter| voter != self.id)
-            .collect();
-        // Keep replicating to a peer being removed until the removal commits,
-        // so it learns it is no longer in the cluster (and does not sit there
-        // timing out and disrupting elections).
-        if let Some(PendingChange {
-            change: MembershipChange::RemoveServer(id),
-            phase: ChangePhase::Committing { .. },
-        }) = &self.pending_change
-            && *id != self.id
-        {
-            keep.insert(*id);
-        }
-        let next = self.log.last_index().next();
-        if let Role::Leader {
-            next_index,
-            match_index,
-        } = &mut self.role
-        {
-            next_index.retain(|peer, _| keep.contains(peer));
-            match_index.retain(|peer, _| keep.contains(peer));
-            for &voter in &keep {
-                next_index.entry(voter).or_insert(next);
-                match_index.entry(voter).or_insert(LogIndex::ZERO);
-            }
         }
     }
 
@@ -4073,6 +4038,29 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Effect::PersistLog { .. }))
         );
+    }
+
+    #[test]
+    fn a_removed_peer_is_replicated_to_until_its_removal_commits() {
+        let mut n = three_node_leader();
+        let removed = NodeId::new(3);
+        let sends_to = |effects: &[Effect], peer: NodeId| {
+            effects.iter().any(|e| {
+                matches!(e, Effect::SendRpc { to, message: Message::AppendEntries(_) } if *to == peer)
+            })
+        };
+
+        // The config entry that removes node 3 goes to node 3 as well.
+        let effects = n.step(change(MembershipChange::RemoveServer(removed)), NOW);
+        assert!(!n.config().contains(removed));
+        assert!(sends_to(&effects, removed));
+        assert!(sends_to(&n.step(Input::HeartbeatTick, NOW), removed));
+
+        // Once the removal commits on {1, 2}, node 3 is dropped.
+        let config_index = n.log().last_index().get();
+        drive(&mut n, deliver(2, ae_reply(2, true, config_index)));
+        assert_eq!(n.commit_index().get(), config_index);
+        assert!(!sends_to(&n.step(Input::HeartbeatTick, NOW), removed));
     }
 
     #[test]
