@@ -137,18 +137,12 @@ impl FileStorage {
         // The 8-byte start-index header. A file too short to hold it is a
         // fresh or torn header: reset it to "starts at index 1".
         let mut header_bytes = [0u8; 8];
-        match read_exact_or_eof(&mut self.log, &mut header_bytes)
-            .map_err(|source| self.io(source))?
-        {
-            ReadOutcome::Full => {
-                self.log_start = u64::from_le_bytes(header_bytes).max(1);
-            }
-            ReadOutcome::Eof | ReadOutcome::Short => {
-                self.rewrite_log(1, &[])?;
-                self.record_ends = Vec::new();
-                return Ok(Vec::new());
-            }
+        if !read_full(&mut self.log, &mut header_bytes).map_err(|source| self.io(source))? {
+            self.rewrite_log(1, &[])?;
+            self.record_ends = Vec::new();
+            return Ok(Vec::new());
         }
+        self.log_start = u64::from_le_bytes(header_bytes).max(1);
 
         let mut entries = Vec::new();
         let mut ends = Vec::new();
@@ -156,21 +150,16 @@ impl FileStorage {
 
         loop {
             let mut header = [0u8; 8];
-            match read_exact_or_eof(&mut self.log, &mut header).map_err(|source| self.io(source))? {
-                // Clean end of file, or a torn header at the tail.
-                ReadOutcome::Eof | ReadOutcome::Short => break,
-                ReadOutcome::Full => {}
+            if !read_full(&mut self.log, &mut header).map_err(|source| self.io(source))? {
+                break; // clean end of file, or a torn header at the tail
             }
             let payload_len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
             let want_crc = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
             let payload_len = payload_len as usize;
 
             let mut payload = vec![0u8; payload_len];
-            match read_exact_or_eof(&mut self.log, &mut payload)
-                .map_err(|source| self.io(source))?
-            {
-                ReadOutcome::Full => {}
-                ReadOutcome::Eof | ReadOutcome::Short => break, // torn payload
+            if !read_full(&mut self.log, &mut payload).map_err(|source| self.io(source))? {
+                break; // torn payload
             }
             if crc32c(&payload) != want_crc {
                 break; // torn / corrupt tail
@@ -688,23 +677,18 @@ fn sync_dir(dir: &Path) -> Result<(), Error> {
         })
 }
 
-enum ReadOutcome {
-    Full,
-    Short,
-    Eof,
-}
-
-/// Fills `buf`, distinguishing a clean end-of-file from a partial (torn) read.
-fn read_exact_or_eof(file: &mut File, buf: &mut [u8]) -> std::io::Result<ReadOutcome> {
+/// Fills `buf` unless the file ends first, and says which happened. Recovery
+/// treats a clean end of file and a torn partial read the same way (stop
+/// there), so the two are not told apart.
+fn read_full(file: &mut File, buf: &mut [u8]) -> std::io::Result<bool> {
     let mut filled = 0;
     while filled < buf.len() {
         match file.read(&mut buf[filled..])? {
-            0 if filled == 0 => return Ok(ReadOutcome::Eof),
-            0 => return Ok(ReadOutcome::Short),
+            0 => return Ok(false),
             n => filled += n,
         }
     }
-    Ok(ReadOutcome::Full)
+    Ok(true)
 }
 
 #[cfg(target_os = "linux")]
