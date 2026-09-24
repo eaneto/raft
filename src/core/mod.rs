@@ -28,7 +28,7 @@ mod message;
 
 pub use message::{
     AppendEntriesArgs, AppendEntriesReply, InstallSnapshotArgs, InstallSnapshotReply, Message,
-    PreVoteArgs, PreVoteReply, RequestVoteArgs, RequestVoteReply,
+    PreVoteArgs, PreVoteReply, RequestVoteArgs, RequestVoteReply, TimeoutNowArgs,
 };
 
 /// A Raft term: a logical clock that increases monotonically over the life of
@@ -583,7 +583,23 @@ pub enum Role {
         next_index: BTreeMap<NodeId, LogIndex>,
         /// For each peer, the highest log index known to be replicated on it.
         match_index: BTreeMap<NodeId, LogIndex>,
+        /// The leadership transfer this leader is running, if any (thesis
+        /// §3.10). While it is `Some` the leader accepts no new proposals.
+        transfer: Option<LeadershipTransfer>,
     },
+}
+
+/// A leader's progress on handing leadership to another server (thesis §3.10).
+///
+/// The leader stops taking new proposals, brings `target`'s log up to date
+/// through ordinary replication, and once `target` holds the whole log sends it
+/// a [`Message::TimeoutNow`] so it starts an election at once. Kept inside
+/// [`Role::Leader`], so a leader that steps down for any reason drops the
+/// transfer with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeadershipTransfer {
+    /// The voter leadership is being handed to.
+    pub target: NodeId,
 }
 
 /// A single-server membership change (thesis §4): one server added or removed
@@ -723,11 +739,20 @@ pub enum Input {
         up_to_index: LogIndex,
     },
     /// An administrator asks the leader to add or remove one server. Ignored by
-    /// any other role, and by a leader that already has a change in flight or a
-    /// still-uncommitted configuration entry.
+    /// any other role, by a leader that already has a change in flight or a
+    /// still-uncommitted configuration entry, and by one transferring
+    /// leadership.
     ChangeMembership {
         /// The change to make.
         change: MembershipChange,
+    },
+    /// An administrator asks the leader to hand leadership to `target` (thesis
+    /// §3.10). Ignored by any other role, and by a leader that is already
+    /// transferring, has a membership change in flight, or is asked to transfer
+    /// to itself or to a server that is not a voter.
+    TransferLeadership {
+        /// The voter that should become leader.
+        target: NodeId,
     },
 }
 
@@ -1008,6 +1033,9 @@ impl RaftNode {
                 Message::InstallSnapshotReply(reply) => {
                     self.handle_install_snapshot_reply(from, reply)
                 }
+                // Starting the election a `TimeoutNow` asks for comes in the
+                // next step; for now it is dropped.
+                Message::TimeoutNow(_) => Vec::new(),
             },
             Input::ElectionTimeout => self.handle_election_timeout(),
             Input::HeartbeatTick => self.handle_heartbeat_tick(),
@@ -1019,6 +1047,7 @@ impl RaftNode {
             } => self.handle_snapshot_installed(last_included_index, last_included_term, config),
             Input::CompactLog { up_to_index } => self.handle_compact_log(up_to_index),
             Input::ChangeMembership { change } => self.handle_change_membership(change),
+            Input::TransferLeadership { target } => self.handle_transfer_leadership(target),
         }
     }
 
@@ -1335,6 +1364,7 @@ impl RaftNode {
             self.record_match(from, reply.match_index);
             self.maybe_advance_commit_index(&mut effects);
             self.advance_catch_up(from, &mut effects);
+            effects.extend(self.timeout_now_if_caught_up(from));
         } else {
             self.back_off(from);
             effects.push(self.replicate_to(from));
@@ -1414,6 +1444,7 @@ impl RaftNode {
 
         self.record_match(from, reply.last_included_index);
         self.maybe_advance_commit_index(&mut effects);
+        effects.extend(self.timeout_now_if_caught_up(from));
         effects
     }
 
@@ -1469,6 +1500,7 @@ impl RaftNode {
     /// as a non-voting learner (see [`ChangePhase::CatchingUp`]).
     fn handle_change_membership(&mut self, change: MembershipChange) -> Vec<Effect> {
         if !self.is_leader()
+            || self.is_transferring()
             || self.pending_change.is_some()
             || self.latest_config_index() > self.commit_index
         {
@@ -1484,6 +1516,7 @@ impl RaftNode {
                 if let Role::Leader {
                     next_index,
                     match_index,
+                    ..
                 } = &mut self.role
                 {
                     next_index.insert(id, next);
@@ -1506,6 +1539,56 @@ impl RaftNode {
                 self.append_config(change, new_config)
             }
         }
+    }
+
+    /// Handles [`Input::TransferLeadership`] (thesis §3.10). A no-op unless this
+    /// server leads, is not already transferring, has no membership change in
+    /// flight (one could remove `target` under us), and `target` is a voter
+    /// other than itself. Otherwise the leader stops accepting proposals and
+    /// either sends `target` a [`Message::TimeoutNow`] straight away, when it
+    /// already holds the whole log, or replicates to it and waits for the ack
+    /// that says it does.
+    fn handle_transfer_leadership(&mut self, target: NodeId) -> Vec<Effect> {
+        if !self.is_leader()
+            || self.is_transferring()
+            || self.pending_change.is_some()
+            || target == self.id
+            || !self.config.contains(target)
+        {
+            return Vec::new();
+        }
+        if let Role::Leader { transfer, .. } = &mut self.role {
+            *transfer = Some(LeadershipTransfer { target });
+        }
+        self.timeout_now_if_caught_up(target)
+            .map_or_else(|| vec![self.replicate_to(target)], |effect| vec![effect])
+    }
+
+    /// While transferring leadership to `peer`, the [`Message::TimeoutNow`] to
+    /// send it once its `matchIndex` has reached the end of our log — the point
+    /// at which it would win an election (§5.4.1). `None` otherwise.
+    ///
+    /// Called on every ack from the target, not just the first that reaches
+    /// the end, so a `TimeoutNow` the network loses is sent again on the next
+    /// heartbeat's ack. A duplicate is harmless: by the time it lands the
+    /// target has moved to a newer term and drops it as stale.
+    fn timeout_now_if_caught_up(&self, peer: NodeId) -> Option<Effect> {
+        let Role::Leader {
+            match_index,
+            transfer: Some(LeadershipTransfer { target }),
+            ..
+        } = &self.role
+        else {
+            return None;
+        };
+        let matched = match_index.get(&peer).copied().unwrap_or(LogIndex::ZERO);
+        (peer == *target && matched >= self.log.last_index()).then(|| Effect::SendRpc {
+            to: peer,
+            message: Message::TimeoutNow(TimeoutNowArgs {
+                term: self.current_term,
+                leader_id: self.id,
+            }),
+        })
     }
 
     /// The index of the last configuration entry in the log, or the compaction
@@ -1607,6 +1690,7 @@ impl RaftNode {
             && let Role::Leader {
                 next_index,
                 match_index,
+                ..
             } = &mut self.role
         {
             next_index.remove(&id);
@@ -1636,6 +1720,7 @@ impl RaftNode {
             && let Role::Leader {
                 next_index,
                 match_index,
+                ..
             } = &mut self.role
         {
             next_index.remove(&id);
@@ -1656,6 +1741,7 @@ impl RaftNode {
         if let Role::Leader {
             next_index,
             match_index,
+            ..
         } = &mut self.role
         {
             if let Some(m) = match_index.get_mut(&peer) {
@@ -1783,14 +1869,16 @@ impl RaftNode {
     /// Only a leader acts: it appends one entry for `command` at its current
     /// term, makes the new tail durable with [`Effect::PersistLog`], then
     /// sends every peer the entries it is missing. Any other role drops the
-    /// proposal — redirecting the client to the leader is future work.
+    /// proposal — redirecting the client to the leader is future work — and so
+    /// does a leader transferring leadership (thesis §3.10), so the target can
+    /// catch up with a log that has stopped growing.
     ///
     /// A majority still has to store the entry before it commits (§5.4.2), so
     /// on a multi-node cluster nothing is applied until the acks come back. A
     /// lone leader is its own majority, so `maybe_advance_commit_index` commits
     /// and applies the entry in this same step.
     fn handle_propose(&mut self, command: Bytes) -> Vec<Effect> {
-        if !self.is_leader() {
+        if !self.is_leader() || self.is_transferring() {
             return Vec::new();
         }
 
@@ -1874,6 +1962,7 @@ impl RaftNode {
         self.role = Role::Leader {
             next_index,
             match_index,
+            transfer: None,
         };
         self.adopt_pending_config_change();
     }
@@ -1900,6 +1989,7 @@ impl RaftNode {
             if let Role::Leader {
                 next_index,
                 match_index,
+                ..
             } = &mut self.role
             {
                 next_index.entry(affected).or_insert(next);
@@ -2190,6 +2280,19 @@ impl RaftNode {
         matches!(self.role, Role::Leader { .. })
     }
 
+    /// Whether this server leads and is handing leadership to another server
+    /// (thesis §3.10). A transferring leader accepts no proposals.
+    #[must_use]
+    pub const fn is_transferring(&self) -> bool {
+        matches!(
+            self.role,
+            Role::Leader {
+                transfer: Some(_),
+                ..
+            }
+        )
+    }
+
     /// The current term.
     #[must_use]
     pub const fn current_term(&self) -> Term {
@@ -2243,7 +2346,7 @@ mod tests {
         AppendEntriesArgs, AppendEntriesReply, CATCH_UP_TICKS, ClusterConfig, Effect, Input,
         InstallSnapshotArgs, InstallSnapshotReply, Log, LogEntry, LogIndex, LogicalInstant,
         MembershipChange, Message, NodeId, PreVoteArgs, PreVoteReply, PreVoteRound, RaftNode,
-        RequestVoteArgs, RequestVoteReply, Role, Term,
+        RequestVoteArgs, RequestVoteReply, Role, Term, TimeoutNowArgs,
     };
 
     /// The core does not consult the clock under this timer model, so every
@@ -3913,6 +4016,7 @@ mod tests {
         if let Role::Leader {
             next_index,
             match_index,
+            ..
         } = n.role()
         {
             assert_eq!(next_index[&NodeId::new(2)], LogIndex::new(5));
@@ -3935,6 +4039,7 @@ mod tests {
         if let Role::Leader {
             next_index,
             match_index,
+            ..
         } = n.role()
         {
             assert_eq!(next_index[&NodeId::new(2)], LogIndex::new(1));
@@ -4515,5 +4620,177 @@ mod tests {
                 command: Bytes::from_static(b"cmd"),
             }],
         );
+    }
+
+    // --- leadership transfer (thesis §3.10) --------------------------------
+
+    fn transfer_to(target: u64) -> Input {
+        Input::TransferLeadership {
+            target: NodeId::new(target),
+        }
+    }
+
+    fn timeout_now(to: u64, term: u64, leader: u64) -> Effect {
+        send(
+            to,
+            Message::TimeoutNow(TimeoutNowArgs {
+                term: Term::new(term),
+                leader_id: NodeId::new(leader),
+            }),
+        )
+    }
+
+    #[test]
+    fn a_transfer_to_a_caught_up_voter_sends_timeout_now_at_once() {
+        let mut n = three_node_leader(); // node 2 has acked index 1
+
+        let effects = n.step(transfer_to(2), NOW);
+
+        assert_eq!(effects, vec![timeout_now(2, 2, 1)]);
+        assert!(n.is_transferring());
+        assert!(
+            n.is_leader(),
+            "the leader keeps office until it hears a newer term"
+        );
+    }
+
+    #[test]
+    fn a_transfer_to_a_lagging_voter_replicates_first() {
+        let mut n = three_node_leader(); // node 3 has acked nothing
+
+        let effects = n.step(transfer_to(3), NOW);
+
+        assert_eq!(
+            effects,
+            vec![send(
+                3,
+                append_entries(2, 1, 0, 0, vec![entry_cmd(2, b"c0")], 1)
+            )],
+        );
+        assert!(n.is_transferring());
+    }
+
+    #[test]
+    fn timeout_now_goes_out_only_once_the_target_holds_the_whole_log() {
+        let mut n = three_node_leader();
+        drive(&mut n, deliver(2, ae_reply(2, true, 1))); // node 2 stays current
+        drive(&mut n, propose(b"c1")); // index 2
+        drive(&mut n, transfer_to(3));
+
+        // An ack short of the log end is not enough.
+        let effects = n.step(deliver(3, ae_reply(2, true, 1)), NOW);
+        assert!(!effects.contains(&timeout_now(3, 2, 1)));
+
+        // Reaching the end is.
+        let effects = n.step(deliver(3, ae_reply(2, true, 2)), NOW);
+        assert!(effects.contains(&timeout_now(3, 2, 1)));
+    }
+
+    #[test]
+    fn an_ack_from_another_peer_does_not_send_timeout_now() {
+        let mut n = three_node_leader();
+        drive(&mut n, transfer_to(3));
+
+        let effects = n.step(deliver(2, ae_reply(2, true, 1)), NOW);
+
+        assert!(effects.iter().all(|e| !matches!(
+            e,
+            Effect::SendRpc {
+                message: Message::TimeoutNow(_),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn every_ack_from_a_caught_up_target_resends_timeout_now() {
+        let mut n = three_node_leader();
+        drive(&mut n, transfer_to(2)); // first TimeoutNow, assume lost
+
+        // The next heartbeat's ack brings another.
+        let effects = n.step(deliver(2, ae_reply(2, true, 1)), NOW);
+
+        assert!(effects.contains(&timeout_now(2, 2, 1)));
+    }
+
+    #[test]
+    fn an_install_snapshot_reply_can_complete_the_catch_up() {
+        let mut n = leader_with_compacted_log(5); // whole log is the snapshot
+        if let Role::Leader { next_index, .. } = &mut n.role {
+            next_index.insert(NodeId::new(2), LogIndex::new(1));
+        }
+        drive(&mut n, transfer_to(2));
+
+        let effects = n.step(deliver(2, snapshot_reply_msg(2, 5)), NOW);
+
+        assert!(effects.contains(&timeout_now(2, 2, 1)));
+    }
+
+    #[test]
+    fn a_transferring_leader_drops_proposals() {
+        let mut n = three_node_leader();
+        drive(&mut n, transfer_to(3));
+        let before = n.log().last_index();
+
+        let effects = n.step(propose(b"late"), NOW);
+
+        assert!(effects.is_empty());
+        assert_eq!(n.log().last_index(), before);
+    }
+
+    #[test]
+    fn a_transferring_leader_starts_no_membership_change() {
+        let mut n = three_node_leader();
+        drive(&mut n, transfer_to(3));
+
+        let effects = n.step(change(MembershipChange::RemoveServer(NodeId::new(2))), NOW);
+
+        assert!(effects.is_empty());
+        assert!(n.pending_change.is_none());
+    }
+
+    #[test]
+    fn a_transfer_is_refused_to_self_a_non_voter_or_a_second_target() {
+        let mut n = three_node_leader();
+
+        for target in [1, 4] {
+            assert!(n.step(transfer_to(target), NOW).is_empty());
+            assert!(!n.is_transferring());
+        }
+
+        drive(&mut n, transfer_to(3));
+        assert!(n.step(transfer_to(2), NOW).is_empty());
+        assert!(matches!(
+            n.role(),
+            Role::Leader { transfer: Some(t), .. } if t.target == NodeId::new(3)
+        ));
+    }
+
+    #[test]
+    fn a_transfer_is_refused_during_a_membership_change() {
+        let mut n = three_node_leader();
+        drive(&mut n, change(MembershipChange::AddServer(NodeId::new(4))));
+
+        assert!(n.step(transfer_to(2), NOW).is_empty());
+        assert!(!n.is_transferring());
+    }
+
+    #[test]
+    fn a_transfer_is_ignored_by_a_non_leader() {
+        let mut n = node(1, &[2, 3]);
+
+        assert!(n.step(transfer_to(2), NOW).is_empty());
+        assert!(!n.is_transferring());
+    }
+
+    #[test]
+    fn stepping_down_ends_the_transfer() {
+        let mut n = three_node_leader();
+        drive(&mut n, transfer_to(2));
+
+        drive(&mut n, deliver(2, vote_reply(3, false))); // term 3 exists
+
+        assert!(n.is_follower());
+        assert!(!n.is_transferring());
     }
 }

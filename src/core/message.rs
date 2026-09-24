@@ -147,8 +147,23 @@ pub struct InstallSnapshotReply {
     pub last_included_index: LogIndex,
 }
 
+/// Arguments for the `TimeoutNow` RPC (thesis §3.10), sent by a leader that is
+/// handing leadership over, once the target holds the leader's whole log.
+///
+/// It asks the target to start an election at once, as if its election timer
+/// had fired, skipping the pre-vote round. It has no reply: the leader learns
+/// the outcome from the new term the target's election brings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TimeoutNowArgs {
+    /// The leader's term.
+    pub term: Term,
+    /// The leader handing over.
+    pub leader_id: NodeId,
+}
+
 /// A message between peers: the four RPCs of Figure 2, the `PreVote` straw poll
-/// (thesis §9.6), and `InstallSnapshot` (Figure 13).
+/// (thesis §9.6), `InstallSnapshot` (Figure 13), and `TimeoutNow` (thesis
+/// §3.10).
 ///
 /// The core emits these inside [`Effect::SendRpc`](super::Effect::SendRpc) and
 /// receives them inside [`Input::Deliver`](super::Input::Deliver).
@@ -175,4 +190,7 @@ pub enum Message {
     InstallSnapshot(InstallSnapshotArgs),
     /// A response to [`Message::InstallSnapshot`].
     InstallSnapshotReply(InstallSnapshotReply),
+    /// A leader transferring leadership telling its caught-up target to start
+    /// an election now.
+    TimeoutNow(TimeoutNowArgs),
 }
