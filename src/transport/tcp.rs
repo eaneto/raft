@@ -263,10 +263,13 @@ impl TcpTransport {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{SocketAddr, TcpListener};
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::sync::mpsc;
+    use std::time::Duration;
 
-    use super::{NodeId, TcpTransport};
+    use super::{NodeId, TcpTransport, encode_frame};
+    use crate::core::{Message, RequestVoteReply, Term};
 
     #[track_caller]
     fn ok<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
@@ -308,5 +311,37 @@ mod tests {
         transport.set_peers(&[(NodeId::new(1), free_addr()), b]);
         let ids: Vec<NodeId> = transport.peers().collect();
         assert_eq!(ids, vec![NodeId::new(3)]);
+    }
+
+    #[test]
+    fn dropping_the_transport_closes_its_connections_and_frees_its_port() {
+        let (tx, rx) = mpsc::channel();
+        let listen = free_addr();
+        let transport = ok(TcpTransport::start(NodeId::new(1), &[], listen, tx));
+
+        // A peer connects and gets one frame through, so a reader thread is
+        // now parked in `read` on this connection.
+        let message = Message::RequestVoteReply(RequestVoteReply {
+            term: Term::new(1),
+            vote_granted: false,
+        });
+        let Some(frame) = encode_frame(NodeId::new(2), &message) else {
+            unreachable!("a small message always encodes");
+        };
+        let mut peer = ok(TcpStream::connect(listen));
+        ok(peer.write_all(&frame));
+        assert_eq!(
+            ok(rx.recv_timeout(Duration::from_secs(5))),
+            (NodeId::new(2), message)
+        );
+
+        drop(transport);
+
+        // The connection was closed from our side, not left hanging...
+        ok(peer.set_read_timeout(Some(Duration::from_secs(2))));
+        let mut buf = [0u8; 1];
+        assert_eq!(ok(peer.read(&mut buf)), 0, "connection still open");
+        // ...and the listening socket is gone.
+        drop(ok(TcpListener::bind(listen)));
     }
 }
