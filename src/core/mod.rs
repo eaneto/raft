@@ -1236,9 +1236,12 @@ impl RaftNode {
         }
 
         // Receiver rule 5: adopt the leader's commit point, bounded by what
-        // this RPC actually covered.
-        if args.leader_commit > self.commit_index {
-            self.commit_index = args.leader_commit.min(last_covered);
+        // this RPC actually covered. Compare *after* bounding: an RPC anchored
+        // below our `commitIndex` covers less than we already know is
+        // committed, and `commitIndex` never moves back (§9.9).
+        let leader_commit = args.leader_commit.min(last_covered);
+        if leader_commit > self.commit_index {
+            self.commit_index = leader_commit;
             self.apply_committed(&mut effects);
         }
 
@@ -3536,6 +3539,22 @@ mod tests {
                 ack(2, 1, 1),
             ],
         );
+    }
+
+    #[test]
+    fn an_rpc_anchored_below_commit_index_does_not_move_it_back() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(1);
+        let entries = (0..5).map(|_| entry(1)).collect();
+        drive(&mut n, deliver(2, append_entries(1, 2, 0, 0, entries, 5)));
+        assert_eq!(n.commit_index(), LogIndex::new(5));
+
+        // Anchored at 2 with nothing attached: it vouches only through 2.
+        let effects = n.step(deliver(2, append_entries(1, 2, 2, 1, Vec::new(), 6)), NOW);
+
+        assert_eq!(n.commit_index(), LogIndex::new(5));
+        assert_eq!(n.last_applied(), LogIndex::new(5));
+        assert_eq!(effects, vec![Effect::ResetElectionTimer, ack(2, 1, 2)]);
     }
 
     // --- 5b: leader ack handling -----------------------------------------
