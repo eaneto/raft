@@ -1,0 +1,20 @@
+# cargo-mutants configuration.
+#
+# Each exclusion is an *equivalent* mutant: no input can tell the mutated code
+# from the original, so no test can catch it. Every entry says why. Patterns
+# omit line numbers so they survive edits; each one matches exactly the
+# mutants named in its comment (check with `cargo mutants --list`).
+exclude_re = [
+    # `args.term > currentTerm` -> `>=`: at an equal term `become_follower` is
+    # a no-op on a follower, and a leader seeing a same-term leader would break
+    # Election Safety. `leader_commit > commitIndex` -> `>=` re-assigns the
+    # same commitIndex, and applying through it is then a no-op.
+    'replace > with >= in RaftNode::handle_append_entries$',
+    # Same term argument as for AppendEntries.
+    'replace > with >= in RaftNode::handle_install_snapshot$',
+    # Compacting at the current base is already a no-op inside `Log::compact`.
+    'replace > with >= in RaftNode::handle_compact_log$',
+    # Re-committing the current commitIndex: nothing new to apply, and a
+    # committed config change was already finished when it first committed.
+    'replace > with >= in RaftNode::maybe_advance_commit_index$',
+]
