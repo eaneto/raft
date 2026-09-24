@@ -699,41 +699,50 @@ fn warn_if_unusual_filesystem(dir: &Path) {
     let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
         return;
     };
+    let Some((fstype, mount_point)) = filesystem_of(&mountinfo, &canonical) else {
+        return;
+    };
 
-    // Pick the mount whose mount point is the longest prefix of our directory.
-    let mut best: Option<(usize, String, String)> = None;
+    let tier1 = matches!(fstype, "ext4" | "xfs");
+    if tier1 {
+        log::info!(
+            "raft data dir {} is on {fstype} ({mount_point})",
+            dir.display()
+        );
+    } else {
+        log::warn!(
+            "raft data dir {} is on {fstype} ({mount_point}), which is outside the \
+             CI-exercised tier (ext4, xfs); durability is expected to work but is not tested",
+            dir.display(),
+        );
+    }
+}
+
+/// The filesystem type and mount point holding `path`, read from the text of
+/// `/proc/self/mountinfo`: the mount whose mount point is the longest prefix
+/// of `path`. Mounts are listed in the order they were made, and a later
+/// mount on the same point hides the earlier one, so the last of equally long
+/// matches wins.
+#[cfg(any(target_os = "linux", test))]
+fn filesystem_of<'a>(mountinfo: &'a str, path: &Path) -> Option<(&'a str, &'a str)> {
+    let mut best: Option<(&str, &str)> = None;
     for line in mountinfo.lines() {
         let Some((before, after)) = line.split_once(" - ") else {
             continue;
         };
-        let mount_point = before.split_whitespace().nth(4).unwrap_or("");
-        let fstype = after.split_whitespace().next().unwrap_or("");
-        if canonical.starts_with(mount_point)
-            && mount_point.len() > best.as_ref().map_or(0, |b| b.0)
+        let (Some(mount_point), Some(fstype)) = (
+            before.split_whitespace().nth(4),
+            after.split_whitespace().next(),
+        ) else {
+            continue;
+        };
+        if path.starts_with(mount_point)
+            && mount_point.len() >= best.map_or(0, |(_, point)| point.len())
         {
-            best = Some((
-                mount_point.len(),
-                fstype.to_string(),
-                mount_point.to_string(),
-            ));
+            best = Some((fstype, mount_point));
         }
     }
-
-    if let Some((_, fstype, mount_point)) = best {
-        let tier1 = matches!(fstype.as_str(), "ext4" | "xfs");
-        if tier1 {
-            log::info!(
-                "raft data dir {} is on {fstype} ({mount_point})",
-                dir.display()
-            );
-        } else {
-            log::warn!(
-                "raft data dir {} is on {fstype} ({mount_point}), which is outside the \
-                 CI-exercised tier (ext4, xfs); durability is expected to work but is not tested",
-                dir.display(),
-            );
-        }
-    }
+    best
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -748,7 +757,7 @@ mod tests {
     use bytes::Bytes;
     use tempfile::{TempDir, tempdir};
 
-    use super::{FileStorage, encode_metadata, encode_snapshot};
+    use super::{FileStorage, encode_metadata, encode_snapshot, filesystem_of};
     use crate::core::{ClusterConfig, LogEntry, LogIndex, NodeId, Term};
     use crate::storage::{Error, PersistentState, SnapshotMeta, Storage};
 
@@ -783,6 +792,42 @@ mod tests {
     fn reload(dir: &Path) -> PersistentState {
         let mut store = ok(FileStorage::open(dir));
         ok(store.load())
+    }
+
+    const MOUNTINFO: &str = "\
+22 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw
+30 22 0:26 / /home rw,relatime shared:2 - xfs /dev/sda1 rw
+41 30 0:31 / /home/user/data rw - btrfs /dev/sdb rw
+40 22 0:30 / /tmp rw shared:3 - tmpfs tmpfs rw
+50 22 0:40 / /tmp rw shared:4 - ext4 /dev/sdc rw
+not a mountinfo line
+60 22 0:50 / - short
+";
+
+    #[test]
+    fn the_longest_matching_mount_point_names_the_filesystem() {
+        let fs = |path: &str| filesystem_of(MOUNTINFO, Path::new(path));
+
+        assert_eq!(fs("/var/lib/raft"), Some(("ext4", "/")));
+        assert_eq!(fs("/home/user/raft"), Some(("xfs", "/home")));
+        assert_eq!(
+            fs("/home/user/data/raft"),
+            Some(("btrfs", "/home/user/data"))
+        );
+        // `/homework` is not under `/home`.
+        assert_eq!(fs("/homework"), Some(("ext4", "/")));
+    }
+
+    #[test]
+    fn a_later_mount_on_the_same_point_hides_the_earlier_one() {
+        let fs = filesystem_of(MOUNTINFO, Path::new("/tmp/raft"));
+        assert_eq!(fs, Some(("ext4", "/tmp")));
+    }
+
+    #[test]
+    fn no_matching_mount_names_no_filesystem() {
+        assert_eq!(filesystem_of("", Path::new("/var")), None);
+        assert_eq!(filesystem_of("garbage", Path::new("/var")), None);
     }
 
     #[test]
