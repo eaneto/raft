@@ -2492,6 +2492,19 @@ mod tests {
         assert_eq!(Term::new(7).to_string(), "7");
         assert_eq!(LogIndex::new(7).to_string(), "7");
         assert_eq!(NodeId::new(7).to_string(), "7");
+        assert_eq!(PreVoteRound::new(7).to_string(), "7");
+    }
+
+    #[test]
+    fn pre_vote_rounds_count_up_from_zero() {
+        assert_eq!(PreVoteRound::ZERO.get(), 0);
+        assert_eq!(PreVoteRound::ZERO.next().next().get(), 2);
+    }
+
+    #[test]
+    fn a_logical_instant_round_trips_its_millis() {
+        assert_eq!(LogicalInstant::START.as_millis(), 0);
+        assert_eq!(LogicalInstant::from_millis(42).as_millis(), 42);
     }
 
     #[test]
@@ -2614,6 +2627,8 @@ mod tests {
 
         log.compact(LogIndex::new(5), Term::new(4));
 
+        // No entries in memory, but the snapshot still represents five.
+        assert!(!log.is_empty());
         assert_eq!(log.snapshot_last_index(), LogIndex::new(5));
         assert_eq!(log.last_index(), LogIndex::new(5));
         assert_eq!(log.last_term(), Term::new(4));
@@ -2624,6 +2639,20 @@ mod tests {
         log.append(entry(6));
         assert_eq!(log.get(LogIndex::new(6)), Some(&entry(6)));
         assert_eq!(log.last_index(), LogIndex::new(6));
+    }
+
+    #[test]
+    fn a_second_compaction_drops_only_the_entries_past_the_first() {
+        let mut log = Log::new();
+        for term in 1..=6 {
+            log.append(entry(term));
+        }
+        log.compact(LogIndex::new(2), Term::new(2));
+
+        log.compact(LogIndex::new(4), Term::new(4));
+
+        assert_eq!(log.snapshot_last_index(), LogIndex::new(4));
+        assert_eq!(log.entries_from(LogIndex::new(1)), &[entry(5), entry(6)]);
     }
 
     #[test]
@@ -2680,6 +2709,26 @@ mod tests {
         assert!(node.log().is_empty());
         assert_eq!(node.commit_index(), LogIndex::ZERO);
         assert_eq!(node.last_applied(), LogIndex::ZERO);
+    }
+
+    #[test]
+    fn exactly_one_role_predicate_holds() {
+        let roles = |n: &RaftNode| {
+            [
+                n.is_follower(),
+                n.is_pre_candidate(),
+                n.is_candidate(),
+                n.is_leader(),
+            ]
+        };
+        let mut n = node(1, &[2, 3]);
+        assert_eq!(roles(&n), [true, false, false, false]);
+        drive(&mut n, Input::ElectionTimeout);
+        assert_eq!(roles(&n), [false, true, false, false]);
+        drive(&mut n, deliver(2, pre_vote_reply(0, true)));
+        assert_eq!(roles(&n), [false, false, true, false]);
+        drive(&mut n, deliver(2, vote_reply(1, true)));
+        assert_eq!(roles(&n), [false, false, false, true]);
     }
 
     #[test]
@@ -2814,6 +2863,20 @@ mod tests {
         drive(&mut n, deliver(2, pre_vote_reply_in(2, 5, true)));
         assert!(n.is_candidate());
         assert_eq!(n.current_term(), Term::new(6));
+    }
+
+    #[test]
+    fn a_pre_vote_grant_from_a_peer_a_term_behind_is_not_counted() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(5);
+        drive(&mut n, Input::ElectionTimeout); // round 1
+
+        // Node 2 lags at term 4. Its "yes" carries its own term, so it is left
+        // for a later round, by which time our reply will have caught it up.
+        drive(&mut n, deliver(2, pre_vote_reply(4, true)));
+
+        assert!(n.is_pre_candidate());
+        assert_eq!(n.current_term(), Term::new(5));
     }
 
     #[test]
@@ -3026,6 +3089,41 @@ mod tests {
 
         assert!(effects.is_empty());
         assert!(n.is_leader());
+    }
+
+    #[test]
+    fn a_vote_granted_in_an_earlier_term_does_not_count_toward_a_later_one() {
+        let mut n = node(1, &[2, 3]);
+        time_out(&mut n); // candidate, term 1
+        time_out(&mut n); // candidate again, term 2
+
+        let effects = n.step(deliver(2, vote_reply(1, true)), NOW);
+
+        assert!(effects.is_empty());
+        assert!(n.is_candidate());
+        assert_eq!(n.current_term(), Term::new(2));
+    }
+
+    #[test]
+    fn a_same_term_request_vote_does_not_unseat_a_leader_or_a_candidate() {
+        let mut leader = node(1, &[2, 3]);
+        time_out(&mut leader); // term 1
+        drive(&mut leader, deliver(2, vote_reply(1, true)));
+        assert!(leader.is_leader());
+
+        let mut candidate = node(1, &[2, 3]);
+        time_out(&mut candidate); // term 1
+        assert!(candidate.is_candidate());
+
+        for n in [&mut leader, &mut candidate] {
+            // Node 3 campaigned in term 1 too; its request can arrive late.
+            let effects = n.step(deliver(3, request_vote(1, 3, 0, 0)), NOW);
+            assert_eq!(effects, vec![send(3, vote_reply(1, false))]);
+            assert!(!n.is_follower());
+            assert_eq!(n.voted_for(), Some(NodeId::new(1)));
+        }
+        assert!(leader.is_leader());
+        assert!(candidate.is_candidate());
     }
 
     #[test]
@@ -3643,6 +3741,12 @@ mod tests {
         assert!(effects.is_empty());
         assert_eq!(n.commit_index(), LogIndex::ZERO);
         assert!(n.is_leader());
+        // It vouches for node 2's log in a term we no longer lead.
+        if let Role::Leader { match_index, .. } = n.role() {
+            assert_eq!(match_index[&NodeId::new(2)], LogIndex::ZERO);
+        } else {
+            unreachable!("still a leader");
+        }
     }
 
     #[test]
@@ -3819,6 +3923,28 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_install_snapshot_reply_is_ignored() {
+        let mut n = leader_with_compacted_log(3); // leader, term 2
+        if let Role::Leader { next_index, .. } = &mut n.role {
+            next_index.insert(NodeId::new(2), LogIndex::new(1));
+        }
+
+        let effects = n.step(deliver(2, snapshot_reply_msg(1, 4)), NOW);
+
+        assert!(effects.is_empty());
+        if let Role::Leader {
+            next_index,
+            match_index,
+        } = n.role()
+        {
+            assert_eq!(next_index[&NodeId::new(2)], LogIndex::new(1));
+            assert_eq!(match_index[&NodeId::new(2)], LogIndex::ZERO);
+        } else {
+            unreachable!("still a leader");
+        }
+    }
+
+    #[test]
     fn install_snapshot_stores_the_chunk_and_defers_the_reply() {
         let mut n = node(1, &[2, 3]);
         n.current_term = Term::new(1);
@@ -3931,7 +4057,9 @@ mod tests {
 
     #[test]
     fn cluster_config_add_remove_and_membership() {
+        assert!(config(&[]).is_empty());
         let base = config(&[1, 2, 3]);
+        assert!(!base.is_empty());
         assert_eq!(base.len(), 3);
         assert!(base.contains(NodeId::new(2)));
         assert!(!base.contains(NodeId::new(9)));
@@ -4168,6 +4296,143 @@ mod tests {
         } else {
             unreachable!("still leader");
         }
+    }
+
+    /// Node 2 with `log` and `commit_index`, elected leader of term 2 by fiat:
+    /// arranges exactly the state `become_leader` inherits from a predecessor.
+    fn leader_inheriting(log: Log, commit_index: u64) -> RaftNode {
+        let mut n = node(2, &[1, 3]);
+        n.current_term = Term::new(2);
+        n.log = log;
+        n.commit_index = LogIndex::new(commit_index);
+        n.recompute_config();
+        n.become_leader();
+        n
+    }
+
+    fn pending(n: &RaftNode) -> Option<(MembershipChange, LogIndex)> {
+        match n.pending_change {
+            Some(super::PendingChange {
+                change,
+                phase: super::ChangePhase::Committing { config_index },
+            }) => Some((change, config_index)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_new_leader_adopts_an_uncommitted_add_server() {
+        let mut log = Log::new();
+        log.append(LogEntry::config(Term::new(1), config(&[1, 2, 3, 4])));
+
+        let n = leader_inheriting(log, 0);
+
+        assert_eq!(
+            pending(&n),
+            Some((
+                MembershipChange::AddServer(NodeId::new(4)),
+                LogIndex::new(1)
+            ))
+        );
+        if let Role::Leader { next_index, .. } = n.role() {
+            assert!(next_index.contains_key(&NodeId::new(4)));
+        } else {
+            unreachable!("still leader");
+        }
+    }
+
+    #[test]
+    fn a_new_leader_diffs_against_the_previous_config_entry() {
+        // Bootstrap {1,2,3} -> {1,2,3,4} (committed) -> {1,2,4} (not yet).
+        // Only the last step is in flight; diffing against the bootstrap set
+        // would see two changes at once.
+        let mut log = Log::new();
+        log.append(LogEntry::config(Term::new(1), config(&[1, 2, 3, 4])));
+        log.append(LogEntry::config(Term::new(1), config(&[1, 2, 4])));
+
+        let n = leader_inheriting(log.clone(), 1);
+        assert_eq!(
+            pending(&n),
+            Some((
+                MembershipChange::RemoveServer(NodeId::new(3)),
+                LogIndex::new(2)
+            ))
+        );
+
+        // With that entry committed too there is nothing left to finish.
+        let n = leader_inheriting(log, 2);
+        assert!(n.pending_change.is_none());
+    }
+
+    #[test]
+    fn a_new_leader_finds_its_config_entry_past_the_compaction_base() {
+        // Indices 1..=3 are in the snapshot; the entries are 4, 5 and 6.
+        let log = Log::from_snapshot(
+            LogIndex::new(3),
+            Term::new(1),
+            vec![
+                entry(1),
+                entry(1),
+                LogEntry::config(Term::new(1), config(&[1, 2])),
+            ],
+        );
+
+        let n = leader_inheriting(log, 5);
+
+        assert_eq!(
+            pending(&n),
+            Some((
+                MembershipChange::RemoveServer(NodeId::new(3)),
+                LogIndex::new(6)
+            ))
+        );
+    }
+
+    #[test]
+    fn a_learner_that_overtakes_its_round_target_is_promoted() {
+        let mut n = three_node_leader();
+        let new = NodeId::new(4);
+        drive(&mut n, change(MembershipChange::AddServer(new))); // target: index 1
+        drive(&mut n, propose(b"c1")); // index 2, sent to the learner too
+
+        // The learner acks the whole log in one go, past the round's target.
+        drive(&mut n, deliver(4, ae_reply(2, true, 2)));
+
+        assert!(n.config().contains(new));
+    }
+
+    #[test]
+    fn a_removal_finishes_only_when_its_own_entry_commits() {
+        let mut n = three_node_leader();
+        drive(&mut n, propose(b"c1")); // index 2
+        drive(
+            &mut n,
+            change(MembershipChange::RemoveServer(NodeId::new(3))),
+        ); // index 3
+        let removal = Some((
+            MembershipChange::RemoveServer(NodeId::new(3)),
+            LogIndex::new(3),
+        ));
+
+        // Committing the entry *before* the config entry is not enough.
+        let effects = n.step(deliver(2, ae_reply(2, true, 2)), NOW);
+        assert_eq!(n.commit_index(), LogIndex::new(2));
+        assert_eq!(pending(&n), removal);
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::MembershipChanged { .. }))
+        );
+
+        let effects = n.step(deliver(2, ae_reply(2, true, 3)), NOW);
+        assert!(n.pending_change.is_none());
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::MembershipChanged { .. }))
+        );
+        // Removing someone else does not make the leader step down.
+        assert!(n.is_leader());
     }
 
     #[test]
