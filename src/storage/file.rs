@@ -770,7 +770,7 @@ mod tests {
 
     use super::{DIR_SYNCS, FileStorage, encode_metadata, encode_snapshot, filesystem_of};
     use crate::core::{ClusterConfig, LogEntry, LogIndex, NodeId, Term};
-    use crate::storage::{Error, PersistentState, SnapshotMeta, Storage};
+    use crate::storage::{Error, PersistentState, SnapshotMeta, Storage, crc32c};
 
     fn snap_meta(index: u64, term: u64) -> SnapshotMeta {
         SnapshotMeta {
@@ -1048,6 +1048,87 @@ not a mountinfo line
         let state = reload(dir.path());
         assert_eq!(state.current_term, Term::new(7));
         assert_eq!(state.voted_for, None);
+    }
+
+    #[test]
+    fn copies_that_agree_on_the_term_but_not_the_vote_drop_the_vote() {
+        let dir = scratch();
+        {
+            let mut store = ok(FileStorage::open(dir.path()));
+            ok(store.load());
+            ok(store.persist_metadata(Term::new(5), Some(NodeId::new(2))));
+        }
+        // A crash between the two writes of "vote for 2 in term 5": meta.1
+        // still holds the vote-less record from before.
+        ok(fs::write(
+            dir.path().join("meta.1"),
+            encode_metadata(Term::new(5), None),
+        )
+        .map_err(|source| Error::Io {
+            path: dir.path().join("meta.1"),
+            source,
+        }));
+
+        let state = reload(dir.path());
+        assert_eq!(state.current_term, Term::new(5));
+        assert_eq!(state.voted_for, None);
+    }
+
+    /// Replaces `name` in `dir` with a directory, so reading it fails with an
+    /// error other than "not found".
+    fn make_unreadable(dir: &Path, name: &str) {
+        let path = dir.join(name);
+        let _ = fs::remove_file(&path);
+        ok(fs::create_dir(&path).map_err(|source| Error::Io { path, source }));
+    }
+
+    #[test]
+    fn an_unreadable_metadata_copy_is_an_io_error_not_a_missing_one() {
+        let dir = scratch();
+        {
+            let mut store = ok(FileStorage::open(dir.path()));
+            ok(store.load());
+            ok(store.persist_metadata(Term::new(5), Some(NodeId::new(2))));
+        }
+        // Mistaking both copies for missing would load term 0 with no vote:
+        // the node would forget a vote it may already have cast.
+        make_unreadable(dir.path(), "meta.0");
+        make_unreadable(dir.path(), "meta.1");
+
+        let mut store = ok(FileStorage::open(dir.path()));
+        match store.load() {
+            Err(Error::Io { path, .. }) => assert_eq!(path, dir.path().join("meta.0")),
+            other => unreachable!("expected Io, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unreadable_snapshot_is_an_io_error_not_a_missing_one() {
+        let dir = scratch();
+        make_unreadable(dir.path(), "snapshot");
+
+        let mut store = ok(FileStorage::open(dir.path()));
+        match store.load() {
+            Err(Error::Io { path, .. }) => assert_eq!(path, dir.path().join("snapshot")),
+            other => unreachable!("expected Io, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_snapshot_shorter_than_its_header_is_a_corrupt_error() {
+        let dir = scratch();
+        // A checksum that matches, so only the length check can reject it.
+        let body = [0u8; 6];
+        let mut bytes = crc32c(&body).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&body);
+        let path = dir.path().join("snapshot");
+        ok(fs::write(&path, bytes).map_err(|source| Error::Io { path, source }));
+
+        let mut store = ok(FileStorage::open(dir.path()));
+        match store.load() {
+            Err(Error::Corrupt { .. }) => {}
+            other => unreachable!("expected Corrupt, got {other:?}"),
+        }
     }
 
     #[test]
