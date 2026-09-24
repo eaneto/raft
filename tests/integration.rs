@@ -314,6 +314,54 @@ fn the_leader_removes_a_follower_from_the_cluster() {
 }
 
 #[test]
+fn the_leader_hands_leadership_to_a_chosen_follower() {
+    let (nodes, sms, _addrs, _dirs) = start_cluster(3);
+
+    assert!(
+        wait_until(Duration::from_secs(3), || leader_index(&nodes).is_some()),
+        "no leader elected",
+    );
+    let leader = unwrap(leader_index(&nodes).ok_or("no leader"));
+    assert!(nodes[leader].propose(Bytes::from_static(b"before")).is_ok());
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            sms.iter().all(|sm| sm.applied().len() == 1)
+        }),
+        "the first command did not commit",
+    );
+
+    let target = (0..3).find(|&i| i != leader).unwrap_or(0);
+    assert!(
+        nodes[leader]
+            .transfer_leadership(NodeId::new(target as u64 + 1))
+            .is_ok()
+    );
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            leader_index(&nodes) == Some(target)
+        }),
+        "leadership did not move to node {}: leader is {:?}",
+        target + 1,
+        leader_index(&nodes).map(|i| i + 1),
+    );
+
+    // The new leader commits, and every node applies both commands in order.
+    assert!(nodes[target].propose(Bytes::from_static(b"after")).is_ok());
+    let expected = vec![Bytes::from_static(b"before"), Bytes::from_static(b"after")];
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            sms.iter().all(|sm| sm.applied() == expected)
+        }),
+        "nodes did not converge after the handoff: {:?}",
+        sms.iter().map(SharedSm::applied).collect::<Vec<_>>(),
+    );
+
+    for node in nodes {
+        let _ = node.shutdown();
+    }
+}
+
+#[test]
 fn the_leader_adds_a_learner_that_catches_up_and_starts_voting() {
     let (nodes, _sms, addrs, dirs) = start_cluster(3);
 

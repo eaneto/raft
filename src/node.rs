@@ -175,6 +175,8 @@ enum Event {
     /// A membership change; `SocketAddr` is `Some` only for `AddServer`, so the
     /// driver can reach the new server.
     Membership(MembershipChange, Option<SocketAddr>),
+    /// A request to hand leadership to the given voter.
+    TransferLeadership(NodeId),
     /// A request for a status snapshot, answered on the given channel.
     Describe(Sender<NodeStatus>),
     Shutdown,
@@ -256,8 +258,9 @@ impl Node {
         self.id
     }
 
-    /// Submits a client command. It is accepted only while this node leads;
-    /// otherwise the core drops it (client redirect is a later feature).
+    /// Submits a client command. It is accepted only while this node leads
+    /// and is not handing leadership over; otherwise the core drops it (client
+    /// redirect is a later feature).
     ///
     /// # Errors
     ///
@@ -292,6 +295,22 @@ impl Node {
     pub fn remove_server(&self, id: NodeId) -> Result<(), NodeGone> {
         self.events
             .send(Event::Membership(MembershipChange::RemoveServer(id), None))
+            .map_err(|_| NodeGone)
+    }
+
+    /// Asks the leader to hand leadership to the voter `target` (thesis
+    /// §3.10). The leader stops accepting proposals, brings `target` up to
+    /// date, and tells it to start an election; if `target` has not taken over
+    /// within about an election timeout the leader gives up and carries on.
+    /// Ignored unless this node leads, and while a membership change or
+    /// another transfer is under way.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeGone`] if the event loop has already stopped.
+    pub fn transfer_leadership(&self, target: NodeId) -> Result<(), NodeGone> {
+        self.events
+            .send(Event::TransferLeadership(target))
             .map_err(|_| NodeGone)
     }
 
@@ -500,6 +519,11 @@ impl<S: Storage, M: StateMachine, T: PeerTransport> Driver<S, M, T> {
                         self.transport.set_peers(&wanted);
                     }
                     if let Err(fatal) = self.step(Input::ChangeMembership { change }, now) {
+                        return Stopped::FatalStorage(fatal);
+                    }
+                }
+                Ok(Event::TransferLeadership(target)) => {
+                    if let Err(fatal) = self.step(Input::TransferLeadership { target }, now) {
                         return Stopped::FatalStorage(fatal);
                     }
                 }
