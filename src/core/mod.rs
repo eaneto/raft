@@ -4239,6 +4239,28 @@ mod tests {
     }
 
     #[test]
+    fn adding_a_current_member_is_a_no_op() {
+        let mut n = three_node_leader();
+
+        let effects = n.step(change(MembershipChange::AddServer(NodeId::new(2))), NOW);
+
+        assert!(effects.is_empty());
+        assert!(n.pending_change.is_none());
+    }
+
+    #[test]
+    fn an_add_server_keeps_catching_up_until_its_budget_runs_out() {
+        let mut n = three_node_leader();
+        drive(&mut n, change(MembershipChange::AddServer(NodeId::new(4))));
+
+        for _ in 1..CATCH_UP_TICKS {
+            drive(&mut n, Input::HeartbeatTick);
+        }
+
+        assert!(n.pending_change.is_some(), "abandoned before the last tick");
+    }
+
+    #[test]
     fn a_stuck_add_server_is_abandoned_after_the_tick_budget() {
         let mut n = three_node_leader();
         let new = NodeId::new(4);
