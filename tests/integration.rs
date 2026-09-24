@@ -5,6 +5,7 @@
 //! and few — deep behavioural coverage belongs in `simulation.rs`.
 
 use std::net::{SocketAddr, TcpListener};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -363,4 +364,98 @@ fn the_leader_adds_a_learner_that_catches_up_and_starts_voting() {
         let _ = node.shutdown();
     }
     drop(dirs);
+}
+
+#[test]
+fn a_node_that_starts_late_catches_up_from_a_chunked_snapshot() {
+    // Nodes 1 and 2 form a quorum of {1, 2, 3} and compact their logs; node 3
+    // only starts afterwards, so the leader can bring it up to date only by
+    // streaming a snapshot, in many small chunks.
+    const N: usize = 3;
+    let ids: Vec<NodeId> = (1..=N as u64).map(NodeId::new).collect();
+    let addrs: Vec<SocketAddr> = (0..N).map(|_| free_addr()).collect();
+    let dirs: Vec<TempDir> = (0..N).map(|_| unwrap(tempfile::tempdir())).collect();
+    let sms: Vec<SharedSm> = (0..N).map(|_| SharedSm::new()).collect();
+    let start = |i: usize| {
+        let peers = (0..N)
+            .filter(|&j| j != i)
+            .map(|j| (ids[j], addrs[j]))
+            .collect();
+        let mut config = Config::new(ids[i], addrs[i], dirs[i].path())
+            .with_peers(peers)
+            .with_seed(i as u64 + 1)
+            .with_snapshot_threshold(3);
+        config.snapshot_chunk_size = 16;
+        unwrap(Node::start(
+            config,
+            unwrap(FileStorage::open(dirs[i].path())),
+            sms[i].clone(),
+        ))
+    };
+
+    let nodes = vec![start(0), start(1)];
+    assert!(
+        wait_until(Duration::from_secs(5), || leader_index(&nodes).is_some()),
+        "no leader elected",
+    );
+    let leader = unwrap(leader_index(&nodes).ok_or("no leader"));
+    let commands: Vec<Bytes> = (0..10)
+        .map(|k| Bytes::from(format!("cmd-{k}").into_bytes()))
+        .collect();
+    for command in &commands {
+        let _ = nodes[leader].propose(command.clone());
+    }
+    assert!(
+        wait_until(Duration::from_secs(10), || sms[leader].applied()
+            == commands),
+        "the leader did not apply every command: {:?}",
+        sms[leader].applied(),
+    );
+
+    let late = start(2);
+    assert!(
+        wait_until(Duration::from_secs(10), || sms[2].applied() == commands),
+        "the late node did not catch up: {:?}",
+        sms[2].applied(),
+    );
+
+    let _ = late.shutdown();
+    for node in nodes {
+        let _ = node.shutdown();
+    }
+}
+
+/// A state machine that only records that the driver dropped it.
+struct DropFlag(Arc<AtomicBool>);
+
+impl StateMachine for DropFlag {
+    fn apply(&mut self, _index: LogIndex, _command: &Bytes) {}
+
+    fn snapshot(&self) -> Bytes {
+        Bytes::new()
+    }
+
+    fn restore(&mut self, _snapshot: &Bytes) {}
+}
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn dropping_a_node_stops_its_event_loop() {
+    let dir = unwrap(tempfile::tempdir());
+    let dropped = Arc::new(AtomicBool::new(false));
+    let node = unwrap(Node::start(
+        Config::new(NodeId::new(1), free_addr(), dir.path()),
+        unwrap(FileStorage::open(dir.path())),
+        DropFlag(Arc::clone(&dropped)),
+    ));
+
+    drop(node);
+
+    // The loop owns the state machine, so it is gone once the loop has exited.
+    assert!(dropped.load(Ordering::SeqCst));
 }
