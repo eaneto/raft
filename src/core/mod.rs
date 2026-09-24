@@ -600,7 +600,22 @@ pub enum Role {
 pub struct LeadershipTransfer {
     /// The voter leadership is being handed to.
     pub target: NodeId,
+    /// Heartbeat ticks left before the transfer is abandoned and the leader
+    /// takes proposals again.
+    ///
+    /// DEVIATION: thesis §3.10 aborts a transfer that has not completed within
+    /// an election timeout. The pure core has no clock, so it counts heartbeat
+    /// ticks instead; see [`TRANSFER_TICKS`].
+    pub ticks_left: u32,
 }
+
+/// Heartbeat ticks a leadership transfer has to complete in before it is
+/// abandoned.
+///
+/// With the default 50 ms heartbeat and 150–300 ms election timeout
+/// that is one maximal election timeout, the bound thesis §3.10 asks for. See
+/// [`LeadershipTransfer::ticks_left`].
+pub const TRANSFER_TICKS: u32 = 6;
 
 /// A single-server membership change (thesis §4): one server added or removed
 /// per configuration entry. Joint consensus is deliberately not used.
@@ -1586,7 +1601,10 @@ impl RaftNode {
             return Vec::new();
         }
         if let Role::Leader { transfer, .. } = &mut self.role {
-            *transfer = Some(LeadershipTransfer { target });
+            *transfer = Some(LeadershipTransfer {
+                target,
+                ticks_left: TRANSFER_TICKS,
+            });
         }
         self.timeout_now_if_caught_up(target)
             .map_or_else(|| vec![self.replicate_to(target)], |effect| vec![effect])
@@ -1603,7 +1621,7 @@ impl RaftNode {
     fn timeout_now_if_caught_up(&self, peer: NodeId) -> Option<Effect> {
         let Role::Leader {
             match_index,
-            transfer: Some(LeadershipTransfer { target }),
+            transfer: Some(LeadershipTransfer { target, .. }),
             ..
         } = &self.role
         else {
@@ -1874,10 +1892,20 @@ impl RaftNode {
     /// `AppendEntries` to reassert authority (carrying any entries a peer, or a
     /// catching-up learner, has yet to acknowledge); every other role ignores
     /// it. Each tick also spends one of a pending `AddServer`'s catch-up
-    /// budget, abandoning it if the new server never keeps up.
+    /// budget, abandoning it if the new server never keeps up, and one of a
+    /// leadership transfer's, abandoning the transfer — and taking proposals
+    /// again — if the target has not taken over by then (thesis §3.10).
     fn handle_heartbeat_tick(&mut self) -> Vec<Effect> {
         if !self.is_leader() {
             return Vec::new();
+        }
+        if let Role::Leader { transfer, .. } = &mut self.role
+            && let Some(pending) = transfer
+        {
+            pending.ticks_left = pending.ticks_left.saturating_sub(1);
+            if pending.ticks_left == 0 {
+                *transfer = None;
+            }
         }
         if let Some(PendingChange {
             phase: ChangePhase::CatchingUp { ticks_left, .. },
@@ -2376,7 +2404,7 @@ mod tests {
         AppendEntriesArgs, AppendEntriesReply, CATCH_UP_TICKS, ClusterConfig, Effect, Input,
         InstallSnapshotArgs, InstallSnapshotReply, Log, LogEntry, LogIndex, LogicalInstant,
         MembershipChange, Message, NodeId, PreVoteArgs, PreVoteReply, PreVoteRound, RaftNode,
-        RequestVoteArgs, RequestVoteReply, Role, Term, TimeoutNowArgs,
+        RequestVoteArgs, RequestVoteReply, Role, TRANSFER_TICKS, Term, TimeoutNowArgs,
     };
 
     /// The core does not consult the clock under this timer model, so every
@@ -4945,5 +4973,35 @@ mod tests {
 
         assert_eq!(n.voted_for(), None);
         assert!(effects.contains(&send(2, vote_reply(5, false))));
+    }
+
+    #[test]
+    fn a_transfer_survives_until_its_last_tick() {
+        let mut n = three_node_leader();
+        drive(&mut n, transfer_to(3));
+
+        for _ in 1..TRANSFER_TICKS {
+            drive(&mut n, Input::HeartbeatTick);
+        }
+
+        assert!(n.is_transferring(), "abandoned before the last tick");
+    }
+
+    #[test]
+    fn a_stalled_transfer_is_abandoned_and_proposals_resume() {
+        let mut n = three_node_leader();
+        drive(&mut n, transfer_to(3));
+
+        for _ in 0..TRANSFER_TICKS {
+            drive(&mut n, Input::HeartbeatTick);
+        }
+
+        assert!(n.is_leader());
+        assert!(!n.is_transferring());
+        let before = n.log().last_index();
+        drive(&mut n, propose(b"after"));
+        assert_eq!(n.log().last_index(), before.next());
+        // And a fresh transfer may start.
+        assert!(!n.step(transfer_to(2), NOW).is_empty());
     }
 }
