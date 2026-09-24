@@ -237,7 +237,7 @@ impl Node {
 
         let id = config.id;
         let raft_thread = thread::spawn(move || {
-            match Driver::restore(config, transport, storage, state_machine) {
+            match Driver::restore(config, transport, storage, state_machine, Instant::now()) {
                 Ok(driver) => driver.run(&events_rx),
                 Err(stopped) => stopped,
             }
@@ -331,6 +331,26 @@ impl Drop for Node {
     }
 }
 
+/// What the driver needs from its transport: sending ([`Transport`]) plus
+/// reconciling the outbound peer set when the membership changes. A trait so
+/// the driver's logic can be tested against a recording fake.
+trait PeerTransport: Transport {
+    /// The peers this transport currently sends to.
+    fn peers(&self) -> Vec<NodeId>;
+    /// Sends to exactly `peers` from now on.
+    fn set_peers(&mut self, peers: &[(NodeId, SocketAddr)]);
+}
+
+impl PeerTransport for TcpTransport {
+    fn peers(&self) -> Vec<NodeId> {
+        Self::peers(self).collect()
+    }
+
+    fn set_peers(&mut self, peers: &[(NodeId, SocketAddr)]) {
+        Self::set_peers(self, peers);
+    }
+}
+
 /// A snapshot being reassembled from a leader's `InstallSnapshot` chunk stream.
 struct IncomingSnapshot {
     meta: SnapshotMeta,
@@ -338,9 +358,13 @@ struct IncomingSnapshot {
 }
 
 /// Everything the event loop owns.
-struct Driver<S, M> {
+///
+/// Only [`Driver::run`] and the thread that calls [`Driver::restore`] read the
+/// real clock; every other method takes the current `now`, so the timer logic
+/// is testable without sleeping.
+struct Driver<S, M, T> {
     config: Config,
-    transport: TcpTransport,
+    transport: T,
     storage: S,
     state_machine: M,
     clock: MonotonicClock,
@@ -359,12 +383,13 @@ struct Driver<S, M> {
     peer_addrs: BTreeMap<NodeId, SocketAddr>,
 }
 
-impl<S: Storage, M: StateMachine> Driver<S, M> {
+impl<S: Storage, M: StateMachine, T: PeerTransport> Driver<S, M, T> {
     fn restore(
         config: Config,
-        transport: TcpTransport,
+        transport: T,
         mut storage: S,
         mut state_machine: M,
+        now: Instant,
     ) -> Result<Self, Stopped> {
         let state = match storage.load() {
             Ok(state) => state,
@@ -419,7 +444,7 @@ impl<S: Storage, M: StateMachine> Driver<S, M> {
         };
 
         let mut rng = StdRng::seed_from_u64(config.seed);
-        let first_election = Instant::now() + random_timeout(&mut rng, &config);
+        let first_election = now + random_timeout(&mut rng, &config);
         Ok(Self {
             config,
             transport,
@@ -443,17 +468,19 @@ impl<S: Storage, M: StateMachine> Driver<S, M> {
                     deadline.saturating_duration_since(Instant::now())
                 });
 
-            match events.recv_timeout(wait) {
+            let event = events.recv_timeout(wait);
+            let now = Instant::now();
+            match event {
                 Ok(Event::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
                     return Stopped::ShutDown;
                 }
                 Ok(Event::Deliver { from, message }) => {
-                    if let Err(fatal) = self.step(Input::Deliver { from, message }) {
+                    if let Err(fatal) = self.step(Input::Deliver { from, message }, now) {
                         return Stopped::FatalStorage(fatal);
                     }
                 }
                 Ok(Event::Propose(command)) => {
-                    if let Err(fatal) = self.step(Input::Propose { command }) {
+                    if let Err(fatal) = self.step(Input::Propose { command }, now) {
                         return Stopped::FatalStorage(fatal);
                     }
                 }
@@ -466,12 +493,13 @@ impl<S: Storage, M: StateMachine> Driver<S, M> {
                         let mut wanted: Vec<(NodeId, SocketAddr)> = self
                             .transport
                             .peers()
+                            .into_iter()
                             .filter_map(|peer| self.peer_addrs.get(&peer).map(|a| (peer, *a)))
                             .collect();
                         wanted.push((id, addr));
                         self.transport.set_peers(&wanted);
                     }
-                    if let Err(fatal) = self.step(Input::ChangeMembership { change }) {
+                    if let Err(fatal) = self.step(Input::ChangeMembership { change }, now) {
                         return Stopped::FatalStorage(fatal);
                     }
                 }
@@ -485,20 +513,20 @@ impl<S: Storage, M: StateMachine> Driver<S, M> {
                 Err(RecvTimeoutError::Timeout) => {}
             }
 
-            if let Err(fatal) = self.fire_due_timers() {
+            if let Err(fatal) = self.fire_due_timers(now) {
                 return Stopped::FatalStorage(fatal);
             }
-            self.reconcile_timers();
+            self.reconcile_timers(now);
         }
     }
 
-    fn step(&mut self, input: Input) -> Result<(), storage::Error> {
+    fn step(&mut self, input: Input, now: Instant) -> Result<(), storage::Error> {
         let effects = self.node.step(input, self.clock.now());
-        self.perform(effects)?;
-        self.maybe_compact()
+        self.perform(effects, now)?;
+        self.maybe_compact(now)
     }
 
-    fn perform(&mut self, effects: Vec<Effect>) -> Result<(), storage::Error> {
+    fn perform(&mut self, effects: Vec<Effect>, now: Instant) -> Result<(), storage::Error> {
         for effect in effects {
             match effect {
                 Effect::SendRpc { to, message } => self.transport.send(to, &message),
@@ -515,7 +543,7 @@ impl<S: Storage, M: StateMachine> Driver<S, M> {
                 }
                 Effect::ResetElectionTimer => {
                     self.election_deadline =
-                        Some(Instant::now() + random_timeout(&mut self.rng, &self.config));
+                        Some(now + random_timeout(&mut self.rng, &self.config));
                 }
                 Effect::SendSnapshot { to } => self.send_snapshot(to),
                 Effect::StoreSnapshotChunk {
@@ -531,7 +559,7 @@ impl<S: Storage, M: StateMachine> Driver<S, M> {
                         last_included_term,
                         config,
                     };
-                    self.receive_snapshot_chunk(meta, offset, &data, done)?;
+                    self.receive_snapshot_chunk(meta, offset, &data, done, now)?;
                 }
                 Effect::MembershipChanged { config } => self.reconcile_transport(&config),
             }
@@ -598,6 +626,7 @@ impl<S: Storage, M: StateMachine> Driver<S, M> {
         offset: u64,
         data: &[u8],
         done: bool,
+        now: Instant,
     ) -> Result<(), storage::Error> {
         let expected = self
             .incoming_snapshot
@@ -631,11 +660,14 @@ impl<S: Storage, M: StateMachine> Driver<S, M> {
                 config,
             } = meta.clone();
             self.snapshot = Some((meta, bytes));
-            return self.step(Input::SnapshotInstalled {
-                last_included_index,
-                last_included_term,
-                config,
-            });
+            return self.step(
+                Input::SnapshotInstalled {
+                    last_included_index,
+                    last_included_term,
+                    config,
+                },
+                now,
+            );
         }
         Ok(())
     }
@@ -643,7 +675,7 @@ impl<S: Storage, M: StateMachine> Driver<S, M> {
     /// If the log has grown `snapshot_threshold` entries past the last
     /// snapshot, ask the state machine to snapshot itself through `lastApplied`,
     /// persist that, and have the core drop the covered log prefix.
-    fn maybe_compact(&mut self) -> Result<(), storage::Error> {
+    fn maybe_compact(&mut self, now: Instant) -> Result<(), storage::Error> {
         let Some(threshold) = self.config.snapshot_threshold else {
             return Ok(());
         };
@@ -663,36 +695,37 @@ impl<S: Storage, M: StateMachine> Driver<S, M> {
         let data = self.state_machine.snapshot();
         self.storage.persist_snapshot(meta.clone(), &data)?;
         self.snapshot = Some((meta, data));
-        self.step(Input::CompactLog {
-            up_to_index: last_applied,
-        })
+        self.step(
+            Input::CompactLog {
+                up_to_index: last_applied,
+            },
+            now,
+        )
     }
 
-    fn fire_due_timers(&mut self) -> Result<(), storage::Error> {
-        let now = Instant::now();
+    fn fire_due_timers(&mut self, now: Instant) -> Result<(), storage::Error> {
         if !self.node.is_leader() && self.election_deadline.is_some_and(|d| now >= d) {
-            self.step(Input::ElectionTimeout)?;
+            self.step(Input::ElectionTimeout, now)?;
         }
         if self.node.is_leader() && self.heartbeat_deadline.is_some_and(|d| now >= d) {
-            self.heartbeat_deadline = Some(Instant::now() + self.config.heartbeat_interval);
-            self.step(Input::HeartbeatTick)?;
+            self.heartbeat_deadline = Some(now + self.config.heartbeat_interval);
+            self.step(Input::HeartbeatTick, now)?;
         }
         Ok(())
     }
 
     /// The core emits `ResetElectionTimer` but no "stop timer"; reconcile the
     /// armed deadlines against the current role, as the simulator does.
-    fn reconcile_timers(&mut self) {
+    fn reconcile_timers(&mut self, now: Instant) {
         if self.node.is_leader() {
             self.election_deadline = None;
             if self.heartbeat_deadline.is_none() {
-                self.heartbeat_deadline = Some(Instant::now());
+                self.heartbeat_deadline = Some(now);
             }
         } else {
             self.heartbeat_deadline = None;
             if self.election_deadline.is_none() {
-                self.election_deadline =
-                    Some(Instant::now() + random_timeout(&mut self.rng, &self.config));
+                self.election_deadline = Some(now + random_timeout(&mut self.rng, &self.config));
             }
         }
     }
