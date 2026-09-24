@@ -484,6 +484,24 @@ impl Sim {
         self.check_invariants();
     }
 
+    /// Asks the sole leader to hand leadership to the server with id
+    /// `target_id` (thesis §3.10).
+    pub fn transfer_leadership(&mut self, target_id: u64) {
+        let leader = self.sole_leader();
+        assert!(
+            leader.is_some(),
+            "seed={}: no leader to transfer from",
+            self.seed,
+        );
+        self.step(
+            leader.unwrap_or(0),
+            Input::TransferLeadership {
+                target: NodeId::new(target_id),
+            },
+        );
+        self.check_invariants();
+    }
+
     /// Whether every currently-connected node that considers itself a voter
     /// agrees `id` is (or is not) a voter. Nodes cut off by a partition are
     /// skipped, and so is a removed node that never heard the change: it keeps
