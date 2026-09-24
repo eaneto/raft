@@ -746,7 +746,7 @@ mod tests {
     use std::error::Error as _;
     use std::io;
     use std::net::SocketAddr;
-    use std::sync::{Mutex, PoisonError};
+    use std::sync::{Mutex, PoisonError, mpsc};
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;
@@ -755,7 +755,7 @@ mod tests {
     use crate::core::{ClusterConfig, Effect, Input, LogIndex, Message, NodeId, Term};
     use crate::statemachine::{RecordingStateMachine, StateMachine};
     use crate::storage::{self, MemStorage, Snapshot, SnapshotMeta};
-    use crate::transport::{self, Transport};
+    use crate::transport::{self, TcpTransport, Transport};
 
     /// A transport that records what it is asked to send and to whom.
     #[derive(Default)]
@@ -1162,6 +1162,20 @@ mod tests {
             now,
         ));
         assert_eq!(d.transport.peers, [NodeId::new(2), NodeId::new(3)]);
+    }
+
+    #[test]
+    fn the_tcp_transport_reports_its_peers_to_the_driver() {
+        let (inbound, _) = mpsc::channel();
+        let listen = SocketAddr::from(([127, 0, 0, 1], 0));
+        let peers = [(NodeId::new(2), addr(2)), (NodeId::new(3), addr(3))];
+        let Ok(mut tcp) = TcpTransport::start(NodeId::new(1), &peers, listen, inbound) else {
+            unreachable!("binding an ephemeral localhost port");
+        };
+
+        assert_eq!(PeerTransport::peers(&tcp), [NodeId::new(2), NodeId::new(3)]);
+        PeerTransport::set_peers(&mut tcp, &peers[..1]);
+        assert_eq!(PeerTransport::peers(&tcp), [NodeId::new(2)]);
     }
 
     // --- errors --------------------------------------------------------------
