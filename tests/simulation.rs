@@ -13,6 +13,7 @@ mod harness;
 
 use bytes::Bytes;
 use harness::{HEARTBEAT_PERIOD, JITTER5, NEVER, Net, Sim, seeds};
+use raft::core::TRANSFER_TICKS;
 
 fn assert_converges_to_one_stable_leader(node_count: usize, seed: u64) {
     let mut sim = Sim::new(node_count, seed);
@@ -876,5 +877,120 @@ fn assert_reconnected_removed_server_does_not_disrupt(seed: u64) {
 fn a_reconnected_removed_server_does_not_disrupt() {
     for seed in seeds(&[1, 2, 3, 42, 1_000, 0x5EED]) {
         assert_reconnected_removed_server_does_not_disrupt(seed);
+    }
+}
+
+/// Logical ms between checks while waiting for a handoff: finer than a
+/// heartbeat, so the deadline check is tight.
+const NET_STEP: u64 = 10;
+
+/// Leadership transfer (thesis §3.10), happy path. The leader is asked to hand
+/// over to a follower that has not yet acked its latest entries. It stops
+/// taking proposals, catches the target up, and sends `TimeoutNow`; the target
+/// wins at exactly the next term -- no pre-vote, no rival election -- even
+/// though every voter was still hearing from the old leader. Nothing committed
+/// before the handoff is lost, and the new leader commits.
+fn assert_leader_hands_off_to_a_chosen_voter(seed: u64) {
+    let node_count = 5;
+    let mut sim = Sim::new(node_count, seed).with_net(JITTER5);
+    let leader = sim.run_until_leader(5_000);
+    sim.propose_at(leader, b"a");
+    sim.run_until(sim.now + 300);
+    let term = sim.nodes[leader].current_term().get();
+
+    // Transfer right after a proposal, so the target is behind at first.
+    let target = (0..node_count).find(|&i| i != leader).unwrap_or(1);
+    sim.propose_at(leader, b"b");
+    sim.transfer_leadership(sim.ids[target].get());
+    assert!(
+        sim.nodes[leader].is_transferring(),
+        "seed={seed}: the transfer did not start",
+    );
+
+    let deadline = sim.now + u64::from(TRANSFER_TICKS) * HEARTBEAT_PERIOD;
+    while sim.now < deadline && !sim.nodes[target].is_leader() {
+        sim.run_until(sim.now + NET_STEP);
+    }
+    assert!(
+        sim.nodes[target].is_leader(),
+        "seed={seed}: the target did not take over within the transfer budget",
+    );
+    assert_eq!(
+        sim.nodes[target].current_term().get(),
+        term + 1,
+        "seed={seed}: the handoff took more than one election",
+    );
+
+    sim.run_until(sim.now + 200);
+    assert!(
+        !sim.nodes[leader].is_leader(),
+        "seed={seed}: the old leader kept office",
+    );
+    sim.propose_at(target, b"c");
+    sim.run_until(sim.now + 1_000);
+    let commands = sim.applied_commands(target);
+    assert_eq!(
+        commands,
+        vec![
+            Bytes::from_static(b"a"),
+            Bytes::from_static(b"b"),
+            Bytes::from_static(b"c"),
+        ],
+        "seed={seed}: the new leader lost or reordered a command",
+    );
+}
+
+#[test]
+fn a_leader_hands_off_to_a_chosen_voter() {
+    for seed in seeds(&[1, 2, 3, 42, 1_000, 0x5EED, 7, 99]) {
+        assert_leader_hands_off_to_a_chosen_voter(seed);
+    }
+}
+
+/// Leadership transfer (thesis §3.10), abort path. The target is cut off, so
+/// it never catches up and never receives `TimeoutNow`. After `TRANSFER_TICKS`
+/// heartbeats the leader abandons the transfer and takes proposals again --
+/// same node, same term -- and the four connected servers keep committing.
+fn assert_transfer_to_an_unreachable_voter_is_abandoned(seed: u64) {
+    let node_count = 5;
+    let mut sim = Sim::new(node_count, seed).with_net(JITTER5);
+    let leader = sim.run_until_leader(5_000);
+    sim.propose_at(leader, b"a");
+    sim.run_until(sim.now + 300);
+    let term = sim.nodes[leader].current_term().get();
+
+    let target = (0..node_count).find(|&i| i != leader).unwrap_or(1);
+    let mut groups = vec![0usize; node_count];
+    groups[target] = 1;
+    sim.set_groups(groups);
+    sim.transfer_leadership(sim.ids[target].get());
+    assert!(
+        sim.nodes[leader].is_transferring(),
+        "seed={seed}: the transfer did not start",
+    );
+
+    sim.run_until(sim.now + u64::from(TRANSFER_TICKS + 1) * HEARTBEAT_PERIOD);
+    assert!(
+        sim.nodes[leader].is_leader() && sim.nodes[leader].current_term().get() == term,
+        "seed={seed}: an abandoned transfer disturbed the leader",
+    );
+    assert!(
+        !sim.nodes[leader].is_transferring(),
+        "seed={seed}: the transfer outlived its budget",
+    );
+
+    let commit_before = sim.nodes[leader].commit_index().get();
+    sim.propose_at(leader, b"b");
+    sim.run_until(sim.now + 1_000);
+    assert!(
+        sim.nodes[leader].commit_index().get() > commit_before,
+        "seed={seed}: the leader did not commit after the transfer was abandoned",
+    );
+}
+
+#[test]
+fn a_transfer_to_an_unreachable_voter_is_abandoned() {
+    for seed in seeds(&[1, 2, 3, 42, 1_000, 0x5EED]) {
+        assert_transfer_to_an_unreachable_voter_is_abandoned(seed);
     }
 }

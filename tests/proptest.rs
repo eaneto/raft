@@ -9,7 +9,8 @@
 //! identical applied sequence.
 //!
 //! The schedules stay within Raft's fault budget — partitions and message loss
-//! (which Raft tolerates), plus *learner additions* (a passive node). Node
+//! (which Raft tolerates), plus *learner additions* (a passive node) and
+//! leadership transfers. Node
 //! wipes and server removals can legitimately exceed the budget when combined
 //! with a partition, so their recovery is covered by the curated
 //! `tests/simulation.rs` batteries instead.
@@ -37,6 +38,10 @@ enum Op {
     Heal,
     /// Ask the leader to add a fresh passive learner.
     AddServer,
+    /// Ask the leader to hand leadership to the node at this position (modulo
+    /// the node count). The core refuses a target that is itself, a learner,
+    /// or mid-change, so any position is a valid op.
+    Transfer(usize),
 }
 
 const CHURN_NET: Net = Net {
@@ -54,6 +59,7 @@ fn op_strategy(allow_add: bool) -> impl Strategy<Value = Op> {
         3 => prop::collection::vec(any::<bool>(), 5).prop_map(Op::Partition),
         3 => Just(Op::Heal),
         add_weight => Just(Op::AddServer),
+        2 => (0usize..8).prop_map(Op::Transfer),
     ]
 }
 
@@ -87,6 +93,12 @@ fn run_schedule(node_count: usize, seed: u64, ops: &[Op]) -> Sim {
                 if sim.sole_leader().is_some() {
                     sim.add_server(next_id);
                     next_id += 1;
+                }
+            }
+            Op::Transfer(position) => {
+                if sim.sole_leader().is_some() {
+                    let target = sim.ids[position % sim.ids.len()];
+                    sim.transfer_leadership(target.get());
                 }
             }
         }
