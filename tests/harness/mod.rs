@@ -281,10 +281,13 @@ impl Sim {
                 }
                 // The simulator has no durability model, so persistence
                 // effects are dropped; membership is read straight off the
-                // nodes, so the announcement is informational.
+                // nodes, so the announcement is informational. No test issues
+                // reads yet.
                 Effect::Persist { .. }
                 | Effect::PersistLog { .. }
-                | Effect::MembershipChanged { .. } => {}
+                | Effect::MembershipChanged { .. }
+                | Effect::ReadReady { .. }
+                | Effect::ReadFailed { .. } => {}
                 // The leader streams its whole snapshot as one `InstallSnapshot`
                 // message (offset 0, done); the network can still drop it.
                 Effect::SendSnapshot { to } => {

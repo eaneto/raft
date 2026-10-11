@@ -18,7 +18,7 @@
 //! from via [`Input::Deliver`](super::Input::Deliver)'s `from`, which the
 //! transport always knows, so the messages stay faithful to the paper.
 
-use super::{ClusterConfig, LogEntry, LogIndex, NodeId, PreVoteRound, Term};
+use super::{ClusterConfig, HeartbeatRound, LogEntry, LogIndex, NodeId, PreVoteRound, Term};
 
 /// Arguments for the `RequestVote` RPC (Figure 2), sent by a candidate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -100,6 +100,9 @@ pub struct AppendEntriesArgs {
     pub entries: Vec<LogEntry>,
     /// The leader's `commitIndex`.
     pub leader_commit: LogIndex,
+    /// The leader's current round, echoed in the reply so the leader can
+    /// confirm for a read that it still leads (thesis §6.4).
+    pub heartbeat_round: HeartbeatRound,
 }
 
 /// Reply to an `AppendEntries` RPC (Figure 2).
@@ -122,6 +125,8 @@ pub struct AppendEntriesReply {
     /// round trip instead of one entry (paper §5.3). `None` on `success` and
     /// on a rejection for a stale term.
     pub conflict: Option<Conflict>,
+    /// The `heartbeat_round` of the `AppendEntries` this answers.
+    pub heartbeat_round: HeartbeatRound,
 }
 
 /// The hint a follower attaches to a failed `AppendEntries` consistency check.
