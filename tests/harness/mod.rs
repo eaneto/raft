@@ -18,8 +18,8 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use raft::core::{
-    Effect, Input, InstallSnapshotArgs, LogIndex, LogicalInstant, MembershipChange, Message,
-    NodeId, RaftNode, Term,
+    Effect, Input, InstallSnapshotArgs, LogEntry, LogIndex, LogicalInstant, MembershipChange,
+    Message, NodeId, RaftNode, ReplicationConfig, Term,
 };
 
 // Timer and network constants, in logical milliseconds. The heartbeat period
@@ -93,6 +93,9 @@ pub struct Sim {
     /// Per node, the snapshot it currently holds. Mirrors the driver's cached
     /// snapshot, and is what a `SendSnapshot` effect streams to a follower.
     pub snapshot: Vec<Option<SimSnapshot>>,
+    /// The leader-side streaming limits every node (including wiped and newly
+    /// added ones) runs with. `send` checks each `AppendEntries` against them.
+    pub replication: ReplicationConfig,
     pub rng: StdRng,
 
     // --- invariant bookkeeping (Raft safety properties) ---
@@ -131,6 +134,7 @@ impl Sim {
             applied: vec![Vec::new(); node_count],
             snapshot_threshold: None,
             snapshot: vec![None; node_count],
+            replication: ReplicationConfig::default(),
             rng,
             prev_commit: vec![0; node_count],
             prev_applied: vec![0; node_count],
@@ -155,6 +159,16 @@ impl Sim {
     /// past its last snapshot. Chainable after [`Sim::new`].
     pub const fn with_snapshot_threshold(mut self, threshold: u64) -> Self {
         self.snapshot_threshold = Some(threshold);
+        self
+    }
+
+    /// Runs every node with `replication` instead of the default limits.
+    pub fn with_replication(mut self, replication: ReplicationConfig) -> Self {
+        self.replication = replication;
+        self.nodes = std::mem::take(&mut self.nodes)
+            .into_iter()
+            .map(|node| node.with_replication(replication))
+            .collect();
         self
     }
 
@@ -359,7 +373,18 @@ impl Sim {
     }
 
     /// Queues a message on the network, applying drop / jitter / duplication.
+    /// Every `AppendEntries` is first checked against the byte cap.
     pub fn send(&mut self, from_idx: usize, to: NodeId, message: Message) {
+        if let Message::AppendEntries(args) = &message {
+            let bytes: usize = args.entries.iter().map(payload_len).sum();
+            assert!(
+                args.entries.len() <= 1 || bytes <= self.replication.max_append_bytes,
+                "seed={}: an AppendEntries of {} entries carries {bytes} bytes, over the {}-byte cap",
+                self.seed,
+                args.entries.len(),
+                self.replication.max_append_bytes,
+            );
+        }
         if self.net.drop_permille > 0 && self.rng.gen_ratio(self.net.drop_permille, 1000) {
             return;
         }
@@ -429,7 +454,7 @@ impl Sim {
     /// baseline restarts, because it is a new incarnation.
     pub fn wipe_node(&mut self, i: usize) {
         let peers = self.ids.iter().copied().filter(|&id| id != self.ids[i]);
-        self.nodes[i] = RaftNode::new(self.ids[i], peers);
+        self.nodes[i] = RaftNode::new(self.ids[i], peers).with_replication(self.replication);
         self.applied[i].clear();
         self.snapshot[i] = None;
         self.prev_commit[i] = 0;
@@ -443,7 +468,8 @@ impl Sim {
     pub fn add_server(&mut self, new_id: u64) {
         let id = NodeId::new(new_id);
         self.ids.push(id);
-        self.nodes.push(RaftNode::new_learner(id));
+        self.nodes
+            .push(RaftNode::new_learner(id).with_replication(self.replication));
         self.election_deadline.push(NEVER); // passive until it joins
         self.heartbeat_deadline.push(self.now + HEARTBEAT_PERIOD);
         self.groups.push(0);
@@ -571,6 +597,13 @@ impl Sim {
 
     /// Feeds `command` to node `idx`, which must currently believe it leads.
     pub fn propose_at(&mut self, idx: usize, command: &[u8]) {
+        self.propose_batch_at(idx, &[command]);
+    }
+
+    /// Feeds `commands` to node `idx` as one batched proposal (one
+    /// `Input::Propose`), as the driver does with queued proposals. Node `idx`
+    /// must currently believe it leads.
+    pub fn propose_batch_at(&mut self, idx: usize, commands: &[&[u8]]) {
         assert!(
             self.nodes[idx].is_leader(),
             "seed={}: node {idx} is not a leader",
@@ -579,7 +612,10 @@ impl Sim {
         self.step(
             idx,
             Input::Propose {
-                commands: vec![Bytes::copy_from_slice(command)],
+                commands: commands
+                    .iter()
+                    .map(|command| Bytes::copy_from_slice(command))
+                    .collect(),
             },
         );
         self.check_invariants();
@@ -789,6 +825,16 @@ impl Sim {
 
 /// Serializes an applied prefix so it can ride inside an `InstallSnapshot`
 /// message's `data`, standing in for real state-machine bytes.
+/// An entry's payload size as the core counts it against
+/// `ReplicationConfig::max_append_bytes`: the command's length, or eight bytes
+/// per voter for a configuration.
+pub fn payload_len(entry: &LogEntry) -> usize {
+    entry.command_bytes().map_or_else(
+        || entry.as_config().map_or(0, |config| config.len() * 8),
+        Bytes::len,
+    )
+}
+
 pub fn encode_applied(prefix: &[(u64, Bytes)]) -> Vec<u8> {
     let owned: Vec<(u64, Vec<u8>)> = prefix.iter().map(|(i, c)| (*i, c.to_vec())).collect();
     bincode::serialize(&owned).unwrap_or_default()

@@ -6,7 +6,10 @@
 //! Safety, Log Matching, Leader Completeness, State Machine Safety, and
 //! `commitIndex` / `lastApplied` monotonicity throughout. On top of that these
 //! tests assert liveness: once the network heals the cluster converges to one
-//! identical applied sequence.
+//! identical applied sequence. Each case also draws its own `AppendEntries`
+//! streaming limits — down to one batch in flight and a byte cap smaller than
+//! a single command — so pipelining and batch splitting run under the same
+//! churn.
 //!
 //! The schedules stay within Raft's fault budget — partitions and message loss
 //! (which Raft tolerates), plus *learner additions* (a passive node) and
@@ -24,12 +27,15 @@ mod harness;
 
 use harness::{NEVER, Net, Sim};
 use proptest::prelude::*;
+use raft::core::ReplicationConfig;
 
 /// One step in a generated schedule.
 #[derive(Clone, Debug)]
 enum Op {
     /// Propose a command to the current leader, if there is one.
     Propose,
+    /// Propose this many commands to the current leader as one batch.
+    ProposeBurst(usize),
     /// Advance the logical clock by this many milliseconds.
     Tick(u64),
     /// Split the cluster: each node goes to group 0 or 1.
@@ -55,6 +61,7 @@ fn op_strategy(allow_add: bool) -> impl Strategy<Value = Op> {
     let add_weight = u32::from(allow_add);
     prop_oneof![
         5 => Just(Op::Propose),
+        2 => (2usize..8).prop_map(Op::ProposeBurst),
         4 => (40u64..500).prop_map(Op::Tick),
         3 => prop::collection::vec(any::<bool>(), 5).prop_map(Op::Partition),
         3 => Just(Op::Heal),
@@ -63,9 +70,20 @@ fn op_strategy(allow_add: bool) -> impl Strategy<Value = Op> {
     ]
 }
 
+/// Streaming limits from one batch in flight with a 0-byte cap (one entry per
+/// batch) up to roomy ones.
+fn replication_strategy() -> impl Strategy<Value = ReplicationConfig> {
+    (1usize..=4, 0usize..=24).prop_map(|(max_inflight, max_append_bytes)| ReplicationConfig {
+        max_inflight,
+        max_append_bytes,
+    })
+}
+
 /// Runs `ops` against a fresh cluster and returns the final [`Sim`].
-fn run_schedule(node_count: usize, seed: u64, ops: &[Op]) -> Sim {
-    let mut sim = Sim::new(node_count, seed).with_net(CHURN_NET);
+fn run_schedule(node_count: usize, seed: u64, replication: ReplicationConfig, ops: &[Op]) -> Sim {
+    let mut sim = Sim::new(node_count, seed)
+        .with_net(CHURN_NET)
+        .with_replication(replication);
     sim.run_until_leader(15_000);
 
     let mut next_id = node_count as u64 + 1;
@@ -75,6 +93,16 @@ fn run_schedule(node_count: usize, seed: u64, ops: &[Op]) -> Sim {
             Op::Propose => {
                 if let Some(leader) = sim.sole_leader() {
                     sim.propose_at(leader, format!("p{proposed}").as_bytes());
+                    proposed += 1;
+                }
+            }
+            Op::ProposeBurst(count) => {
+                if let Some(leader) = sim.sole_leader() {
+                    let burst: Vec<Vec<u8>> = (0..*count)
+                        .map(|k| format!("p{proposed}.{k}").into_bytes())
+                        .collect();
+                    let commands: Vec<&[u8]> = burst.iter().map(Vec::as_slice).collect();
+                    sim.propose_batch_at(leader, &commands);
                     proposed += 1;
                 }
             }
@@ -149,9 +177,10 @@ proptest! {
     fn proptest_safety_holds_under_random_schedules(
         node_count in 3usize..=5,
         seed in any::<u64>(),
+        replication in replication_strategy(),
         ops in prop::collection::vec(op_strategy(false), 0..40),
     ) {
-        let _ = run_schedule(node_count, seed, &ops);
+        let _ = run_schedule(node_count, seed, replication, &ops);
     }
 
     /// After any partition churn, a healed cluster converges to one identical
@@ -160,9 +189,10 @@ proptest! {
     fn proptest_cluster_converges_after_churn(
         node_count in 3usize..=5,
         seed in any::<u64>(),
+        replication in replication_strategy(),
         ops in prop::collection::vec(op_strategy(false), 0..32),
     ) {
-        let mut sim = run_schedule(node_count, seed, &ops);
+        let mut sim = run_schedule(node_count, seed, replication, &ops);
         heal_and_settle(&mut sim);
         assert_converged(&sim);
     }
@@ -172,9 +202,10 @@ proptest! {
     #[test]
     fn proptest_membership_changes_preserve_safety(
         seed in any::<u64>(),
+        replication in replication_strategy(),
         ops in prop::collection::vec(op_strategy(true), 0..32),
     ) {
-        let mut sim = run_schedule(3, seed, &ops);
+        let mut sim = run_schedule(3, seed, replication, &ops);
         heal_and_settle(&mut sim);
         assert_converged(&sim);
     }

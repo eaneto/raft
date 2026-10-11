@@ -13,7 +13,7 @@ mod harness;
 
 use bytes::Bytes;
 use harness::{HEARTBEAT_PERIOD, JITTER5, NEVER, Net, Sim, seeds};
-use raft::core::TRANSFER_TICKS;
+use raft::core::{ReplicationConfig, TRANSFER_TICKS};
 
 fn assert_converges_to_one_stable_leader(node_count: usize, seed: u64) {
     let mut sim = Sim::new(node_count, seed);
@@ -992,5 +992,107 @@ fn assert_transfer_to_an_unreachable_voter_is_abandoned(seed: u64) {
 fn a_transfer_to_an_unreachable_voter_is_abandoned() {
     for seed in seeds(&[1, 2, 3, 42, 1_000, 0x5EED]) {
         assert_transfer_to_an_unreachable_voter_is_abandoned(seed);
+    }
+}
+
+// --- Phase 2: AppendEntries batching / pipelining ------------------------------
+
+/// Tight streaming limits: two batches in flight, each at most eight bytes of
+/// payload (two of the `b-<k>-<j>` commands at most), so every catch-up is
+/// split into many batches and the window is full most of the time.
+const TIGHT: ReplicationConfig = ReplicationConfig {
+    max_inflight: 2,
+    max_append_bytes: 8,
+};
+
+/// Under loss, duplication and reordering, bursts of batched proposals stream
+/// through a tight pipelining window and all commit. One follower is cut off
+/// for part of the run, so it falls far behind and must be walked back and
+/// refilled in capped batches after the heal. The harness checks the byte cap
+/// on every `AppendEntries` sent.
+fn assert_bursts_commit_through_a_tight_window(node_count: usize, seed: u64) {
+    let net = Net {
+        drop_permille: 60,
+        dup_permille: 100,
+        jitter: 25,
+        repartition_every: 0,
+    };
+    let mut sim = Sim::new(node_count, seed)
+        .with_net(net)
+        .with_replication(TIGHT);
+
+    let bursts: Vec<Vec<Vec<u8>>> = (0..10)
+        .map(|k| (0..4).map(|j| format!("b-{k}-{j}").into_bytes()).collect())
+        .collect();
+    let mut lagger = None;
+    for (k, burst) in bursts.iter().enumerate() {
+        let leader = sim.run_until_leader(10_000);
+        if k == 2 {
+            // Isolate a follower for the next four bursts.
+            let victim = (leader + 1) % node_count;
+            let mut groups = vec![0usize; node_count];
+            groups[victim] = 1;
+            sim.set_groups(groups);
+            lagger = Some(victim);
+        }
+        if k == 6 {
+            sim.set_groups(vec![0; node_count]);
+        }
+        let leader = sim.run_until_leader(10_000);
+        let commands: Vec<&[u8]> = burst.iter().map(Vec::as_slice).collect();
+        sim.propose_batch_at(leader, &commands);
+        sim.run_until(sim.now + 400);
+    }
+    sim.run_until(sim.now + 30_000); // long settle
+
+    let want: Vec<Bytes> = bursts
+        .iter()
+        .flatten()
+        .map(|c| Bytes::copy_from_slice(c))
+        .collect();
+    for i in 0..node_count {
+        assert_eq!(
+            sim.applied_commands(i),
+            want,
+            "seed={seed}: node {i} (lagger {lagger:?}) did not converge to every burst",
+        );
+    }
+}
+
+#[test]
+fn bursts_commit_through_a_tight_pipelining_window() {
+    for seed in seeds(&[1, 2, 3, 42, 1_000, 0x5EED, 7, 99]) {
+        assert_bursts_commit_through_a_tight_window(3, seed);
+        assert_bursts_commit_through_a_tight_window(5, seed);
+    }
+}
+
+/// A wiped follower (empty log, but the leader still remembers a high
+/// `matchIndex` for it) is walked back past that stale `matchIndex` and
+/// refilled under tight limits.
+#[test]
+fn a_wiped_follower_recovers_through_a_tight_window() {
+    for seed in seeds(&[1, 2, 3, 42, 1_000, 0x5EED]) {
+        let node_count = 3;
+        let mut sim = Sim::new(node_count, seed)
+            .with_net(JITTER5)
+            .with_replication(TIGHT);
+        let leader = sim.run_until_leader(5_000);
+        sim.propose_batch_at(leader, &[b"w-0", b"w-1", b"w-2", b"w-3", b"w-4"]);
+        sim.run_until(sim.now + 1_000);
+
+        let victim = (leader + 1) % node_count;
+        sim.wipe_node(victim);
+        let leader = sim.run_until_leader(5_000);
+        sim.propose_batch_at(leader, &[b"w-5", b"w-6"]);
+        sim.run_until(sim.now + 5_000);
+
+        let reference = sim.applied_commands(leader);
+        assert_eq!(reference.len(), 7, "seed={seed}: not everything committed");
+        assert_eq!(
+            sim.applied_commands(victim),
+            reference,
+            "seed={seed}: the wiped follower did not catch up",
+        );
     }
 }
