@@ -38,6 +38,7 @@ this file just tracks the sequence of small steps and what's done.
 | `AppendEntries` flow control | etcd-style per-peer `Progress { next_index, match_index, flow }` on `Role::Leader`. `Flow::Probe { paused }`: one `AppendEntries` at a time, `next_index` moves only on a reply. A success switches to `Flow::Replicate { inflight }`: each batch goes out at once and advances `next_index` optimistically, ≤ `max_inflight` unacked. A rejection drops back to `Probe` from `match_index + 1`; probing is **not** floored at `match_index`, so a wiped follower is still walked back. Heartbeats always go out — to a full window, empty and anchored past the in-flight batches, so a lost batch surfaces as a rejection. `Flow::Snapshot { ticks_left }`: a peer sent the snapshot gets nothing else (not even heartbeats — chunks are contact) until its `InstallSnapshotReply`, or until `snapshot_retry_ticks` heartbeats pass and it is resent — **DEVIATION**: a tick budget, not a real-time timeout, since the core has no clock |
 | Batch caps | `ReplicationConfig { max_inflight, max_append_bytes, snapshot_retry_ticks }` (defaults 8 / 1 MiB / 20), set via `RaftNode::with_replication` and `node::Config::replication`. Bytes = command payload (8 per voter for a config), always ≥ 1 entry per batch. A streaming peer that is behind gets batches until its window fills |
 | Proposal batching | `Input::Propose { commands: Vec<Bytes> }` → one `PersistLog` + one round of `AppendEntries`. The driver drains proposals queued behind the first (≤ `MAX_PROPOSALS_PER_STEP`) and stashes the first other event so ordering holds |
+| Fast log backtracking (§5.3) | a failed consistency check's `AppendEntriesReply` carries `conflict: Option<Conflict { term, index }>`: the follower's term at `prev_log_index` and the first index of it (floored at its snapshot base), or `term: None` and its last index + 1 for a short log. The leader resumes past its own last entry of that term if it has one, else at `conflict.index`. The hint is advisory: `back_off` takes the **lower** of it and the plain rule (Probe: one step; Replicate: `match_index + 1`), so a stale or duplicated hint never skips an entry. `None` on success and on stale-term rejections |
 | `PreVoteRound` | pre-vote rounds are numbered (`PreVoteArgs.round`, echoed by the reply) and a grant counts only for the round it answers. Rounds at one term are otherwise indistinguishable — `currentTerm` deliberately does not move — so a late "yes" from an earlier round would be spent in a later one, promoting on consent the peer no longer gives; the term bump that follows unseats a healthy leader via `AppendEntriesReply`. This is why `PreVote` gets its own structs instead of reusing `RequestVoteArgs` / `RequestVoteReply` |
 
 ## Done
@@ -178,8 +179,16 @@ TCP transport. `just check` is green. Every module rustdoc is self-contained.
       follower's snapshot was spliced over it, and `CompactLog` reverted the
       configuration to the bootstrap set (`RaftNode::config_at`). —
       `665da3f..`
-- [ ] Fast log backtracking (`AppendEntriesReply` carries a conflict
-      index/term so the leader skips a whole term per rejection — paper §5.3)
+- [x] **Fast log backtracking (paper §5.3).** Branch `fast-backtracking`,
+      stacked on `append-entries-batching`. `AppendEntriesReply.conflict`
+      (`Conflict { term, index }`), `Log::term_start` /
+      `Log::last_index_of_term`, hint-aware `back_off`. Unit tests for every
+      hint shape, including one below the snapshot base and stale hints that
+      must not move `nextIndex` forward. Sim battery
+      (`a_divergent_tail_is_skipped_a_term_at_a_time`, a Figure 7-style
+      60-entry stale tail): 1 rejection to repair, against ~67 without
+      hints. The harness counts failed `AppendEntriesReply`s per node.
+      `cargo mutants` over the new/changed functions: every mutant caught.
 - [ ] Read-index / lease reads (thesis §6.4)
 
 ## Module layout (`AGENTS.md` §5)
