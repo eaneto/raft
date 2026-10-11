@@ -96,6 +96,8 @@ pub struct Sim {
     /// The leader-side streaming limits every node (including wiped and newly
     /// added ones) runs with. `send` checks each `AppendEntries` against them.
     pub replication: ReplicationConfig,
+    /// How many `SendSnapshot` effects every leader has emitted, in total.
+    pub snapshots_sent: usize,
     pub rng: StdRng,
 
     // --- invariant bookkeeping (Raft safety properties) ---
@@ -135,6 +137,7 @@ impl Sim {
             snapshot_threshold: None,
             snapshot: vec![None; node_count],
             replication: ReplicationConfig::default(),
+            snapshots_sent: 0,
             rng,
             prev_commit: vec![0; node_count],
             prev_applied: vec![0; node_count],
@@ -280,7 +283,10 @@ impl Sim {
                 | Effect::MembershipChanged { .. } => {}
                 // The leader streams its whole snapshot as one `InstallSnapshot`
                 // message (offset 0, done); the network can still drop it.
-                Effect::SendSnapshot { to } => self.send_snapshot(i, to),
+                Effect::SendSnapshot { to } => {
+                    self.snapshots_sent += 1;
+                    self.send_snapshot(i, to);
+                }
                 // Every chunk the harness produces is terminal: restore the
                 // "state machine" from the applied prefix it carries and tell
                 // the core so it adopts the snapshot and acks the leader.

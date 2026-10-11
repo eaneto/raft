@@ -677,6 +677,23 @@ pub enum Flow {
         /// peer back to [`Flow::Probe`] to resend it.
         inflight: VecDeque<LogIndex>,
     },
+    /// `next_index` fell to or below the compaction base, so the peer has been
+    /// sent the snapshot ([`Effect::SendSnapshot`]). Nothing else goes to it —
+    /// not even heartbeats, since the snapshot chunks are leader contact —
+    /// until its `InstallSnapshotReply` switches it to [`Flow::Replicate`]
+    /// (or to [`Flow::Probe`], which sends the newer snapshot, if the leader
+    /// has compacted past the installed one meanwhile), or until `ticks_left`
+    /// runs out and it drops back to [`Flow::Probe`], which sends the snapshot
+    /// again on the assumption it was lost. Stale `AppendEntries` replies do
+    /// not end the wait.
+    Snapshot {
+        /// Heartbeat ticks left before the snapshot is presumed lost.
+        ///
+        /// DEVIATION: a real-time retry timeout would fit better, but the pure
+        /// core has no clock, so it counts heartbeat ticks instead; see
+        /// [`ReplicationConfig::snapshot_retry_ticks`].
+        ticks_left: u32,
+    },
 }
 
 /// Tunables for how a leader streams its log to followers. None of them
@@ -690,6 +707,11 @@ pub struct ReplicationConfig {
     /// [`LogEntry`]'s payload sizes). A single entry larger than this is still
     /// sent, alone, so no entry can stall replication.
     pub max_append_bytes: usize,
+    /// Heartbeat ticks a leader waits for an `InstallSnapshotReply` before it
+    /// presumes the snapshot lost and sends it again (see [`Flow::Snapshot`]).
+    /// Set it above the time a whole snapshot takes to transfer and install.
+    /// Values below 1 act as 1.
+    pub snapshot_retry_ticks: u32,
 }
 
 impl Default for ReplicationConfig {
@@ -697,6 +719,8 @@ impl Default for ReplicationConfig {
         Self {
             max_inflight: 8,
             max_append_bytes: 1024 * 1024,
+            // One second at the default 50 ms heartbeat.
+            snapshot_retry_ticks: 20,
         }
     }
 }
@@ -1622,6 +1646,14 @@ impl RaftNode {
         }
 
         self.record_match(from, reply.last_included_index);
+        // The snapshot was installed, so the wait is over even if we have
+        // compacted past it since: probe again, which sends the newer one.
+        if let Role::Leader { progress, .. } = &mut self.role
+            && let Some(p) = progress.get_mut(&from)
+            && matches!(p.flow, Flow::Snapshot { .. })
+        {
+            p.flow = Flow::Probe { paused: false };
+        }
         self.maybe_advance_commit_index(&mut effects);
         effects.extend(self.timeout_now_if_caught_up(from));
         effects.extend(self.replicate_to(from, false));
@@ -1905,8 +1937,11 @@ impl RaftNode {
     /// Records a successful ack: `match_index[peer]` only moves forward (a
     /// reordered older ack cannot pull it back) and `next_index[peer]` follows.
     /// The peer's log is now known to match ours up to there, so it streams
-    /// ([`Flow::Replicate`]), with every batch the ack covers freed.
+    /// ([`Flow::Replicate`]), with every batch the ack covers freed. A peer
+    /// waiting on a snapshot keeps waiting unless the ack carries it past the
+    /// compaction base: a stale `AppendEntries` ack must not trigger a resend.
     fn record_match(&mut self, peer: NodeId, matched: LogIndex) {
+        let base = self.log.snapshot_last_index();
         if let Role::Leader { progress, .. } = &mut self.role
             && let Some(p) = progress.get_mut(&peer)
         {
@@ -1918,7 +1953,8 @@ impl RaftNode {
                         inflight.pop_front();
                     }
                 }
-                Flow::Probe { .. } => {
+                Flow::Snapshot { .. } if p.next_index <= base => {}
+                Flow::Probe { .. } | Flow::Snapshot { .. } => {
                     p.flow = Flow::Replicate {
                         inflight: VecDeque::new(),
                     };
@@ -1937,6 +1973,10 @@ impl RaftNode {
     /// storage (or a stale rejection) can send `next_index` below it, and a
     /// floor there would leave such a follower rejecting the same probe
     /// forever.
+    ///
+    /// A peer waiting on a snapshot ignores the rejection: it can only answer
+    /// an `AppendEntries` sent before the snapshot, which the snapshot
+    /// supersedes.
     fn back_off(&mut self, peer: NodeId) {
         if let Role::Leader { progress, .. } = &mut self.role
             && let Some(p) = progress.get_mut(&peer)
@@ -1944,6 +1984,7 @@ impl RaftNode {
             let retry_from = match p.flow {
                 Flow::Probe { .. } => p.next_index.prev(),
                 Flow::Replicate { .. } => p.match_index.next(),
+                Flow::Snapshot { .. } => return,
             };
             p.next_index = retry_from.max(LogIndex::new(1));
             p.flow = Flow::Probe { paused: false };
@@ -2058,6 +2099,7 @@ impl RaftNode {
                 self.abort_catch_up();
             }
         }
+        self.expire_snapshot_waits();
         self.replicate_to_peers(true)
     }
 
@@ -2268,6 +2310,22 @@ impl RaftNode {
         effects
     }
 
+    /// Spends one heartbeat tick of every [`Flow::Snapshot`] wait. A peer whose
+    /// budget runs out drops back to [`Flow::Probe`], so the replication that
+    /// follows sends it the snapshot again.
+    fn expire_snapshot_waits(&mut self) {
+        if let Role::Leader { progress, .. } = &mut self.role {
+            for p in progress.values_mut() {
+                if let Flow::Snapshot { ticks_left } = &mut p.flow {
+                    *ticks_left = ticks_left.saturating_sub(1);
+                    if *ticks_left == 0 {
+                        p.flow = Flow::Probe { paused: false };
+                    }
+                }
+            }
+        }
+    }
+
     /// Replicates to every peer (see [`RaftNode::replicate_to`]). With
     /// `force` (on winning an election and on `HeartbeatTick`) every peer is
     /// sent something, a heartbeat at least; without it (on `Propose` and on a
@@ -2295,7 +2353,8 @@ impl RaftNode {
     /// [`ReplicationConfig::max_append_bytes`] of them. If `next_index` has
     /// fallen to or below the compaction base, the leader no longer has
     /// `prev_log_term`, so it sends the snapshot instead
-    /// ([`Effect::SendSnapshot`]).
+    /// ([`Effect::SendSnapshot`]) and the peer waits in [`Flow::Snapshot`],
+    /// sent nothing at all — even with `force` — until that resolves.
     ///
     /// A [`Flow::Probe`] peer gets one `AppendEntries`, and nothing while it
     /// is waiting on a reply. A [`Flow::Replicate`] peer gets successive
@@ -2306,13 +2365,19 @@ impl RaftNode {
     fn replicate_to(&mut self, peer: NodeId, force: bool) -> Vec<Effect> {
         let max_inflight = self.replication.max_inflight.max(1);
         let max_bytes = self.replication.max_append_bytes;
+        let snapshot_retry_ticks = self.replication.snapshot_retry_ticks.max(1);
         let last_index = self.log.last_index();
         let mut effects = Vec::new();
         while let Role::Leader { progress, .. } = &mut self.role
             && let Some(p) = progress.get_mut(&peer)
         {
             if p.next_index <= self.log.snapshot_last_index() {
-                effects.push(Effect::SendSnapshot { to: peer });
+                if !matches!(p.flow, Flow::Snapshot { .. }) {
+                    p.flow = Flow::Snapshot {
+                        ticks_left: snapshot_retry_ticks,
+                    };
+                    effects.push(Effect::SendSnapshot { to: peer });
+                }
                 break;
             }
 
@@ -2338,6 +2403,10 @@ impl RaftNode {
                         break;
                     }
                 }
+                // Only entered with `next_index` at or below the base, and
+                // left (by `record_match`) as soon as it is past it, so the
+                // check above has already handled it.
+                Flow::Snapshot { .. } => break,
             };
             effects.push(self.append_entries(peer, next, batch_end));
             if !more {
@@ -3941,10 +4010,11 @@ mod tests {
     }
 
     /// At most `max_inflight` batches of at most `max_append_bytes` each.
-    const fn limits(max_inflight: usize, max_append_bytes: usize) -> ReplicationConfig {
+    fn limits(max_inflight: usize, max_append_bytes: usize) -> ReplicationConfig {
         ReplicationConfig {
             max_inflight,
             max_append_bytes,
+            ..ReplicationConfig::default()
         }
     }
 
@@ -4777,6 +4847,96 @@ mod tests {
         let effects = n.step(Input::HeartbeatTick, NOW);
 
         assert!(effects.contains(&Effect::SendSnapshot { to: NodeId::new(3) }));
+    }
+
+    /// A term-2 leader with entries 1–3 compacted (of 5) whose peer 3 has
+    /// just been sent the snapshot by a heartbeat, with a retry budget of
+    /// `retry_ticks`.
+    fn leader_awaiting_a_snapshot_ack(retry_ticks: u32) -> RaftNode {
+        let mut n = leader_with_compacted_log(3).with_replication(ReplicationConfig {
+            snapshot_retry_ticks: retry_ticks,
+            ..ReplicationConfig::default()
+        });
+        if let Role::Leader { progress, .. } = &mut n.role {
+            progress.insert(NodeId::new(3), Progress::new(LogIndex::new(1)));
+        }
+        let effects = n.step(Input::HeartbeatTick, NOW);
+        assert!(effects.contains(&Effect::SendSnapshot { to: NodeId::new(3) }));
+        n
+    }
+
+    fn sends_to(effects: &[Effect], peer: u64) -> bool {
+        effects.iter().any(|e| match e {
+            Effect::SendRpc { to, .. } | Effect::SendSnapshot { to } => *to == NodeId::new(peer),
+            _ => false,
+        })
+    }
+
+    #[test]
+    fn a_peer_sent_the_snapshot_waits_for_its_reply() {
+        let mut n = leader_awaiting_a_snapshot_ack(3);
+        assert_eq!(progress_of(&n, 3).flow, Flow::Snapshot { ticks_left: 3 });
+
+        // Neither heartbeats nor proposals send it anything more.
+        assert!(!sends_to(&n.step(Input::HeartbeatTick, NOW), 3));
+        assert!(!sends_to(&n.step(propose(b"cmd"), NOW), 3));
+        assert_eq!(progress_of(&n, 3).flow, Flow::Snapshot { ticks_left: 2 });
+    }
+
+    #[test]
+    fn a_snapshot_with_no_reply_is_sent_again_once_the_budget_runs_out() {
+        let mut n = leader_awaiting_a_snapshot_ack(2);
+
+        assert!(!sends_to(&n.step(Input::HeartbeatTick, NOW), 3));
+        let effects = n.step(Input::HeartbeatTick, NOW);
+
+        assert!(effects.contains(&Effect::SendSnapshot { to: NodeId::new(3) }));
+        assert_eq!(progress_of(&n, 3).flow, Flow::Snapshot { ticks_left: 2 });
+    }
+
+    #[test]
+    fn a_snapshot_reply_switches_the_peer_to_streaming_the_rest() {
+        let mut n = leader_awaiting_a_snapshot_ack(3);
+
+        let effects = n.step(deliver(3, snapshot_reply_msg(2, 3)), NOW);
+
+        assert_eq!(
+            effects,
+            vec![send(
+                3,
+                append_entries(2, 1, 3, 1, vec![entry(1), entry(1)], 5)
+            )],
+        );
+        assert_eq!(progress_of(&n, 3).flow, streaming(&[5]));
+    }
+
+    #[test]
+    fn stale_append_entries_replies_do_not_disturb_a_snapshot_wait() {
+        let mut n = leader_awaiting_a_snapshot_ack(3);
+
+        // A rejection and an ack, both from before the snapshot went out.
+        assert!(n.step(deliver(3, ae_reply(2, false, 0)), NOW).is_empty());
+        assert!(rpcs(n.step(deliver(3, ae_reply(2, true, 1)), NOW)).is_empty());
+
+        assert_eq!(progress_of(&n, 3).flow, Flow::Snapshot { ticks_left: 3 });
+        assert_eq!(progress_of(&n, 3).match_index, LogIndex::new(1));
+    }
+
+    #[test]
+    fn a_peer_compacted_past_again_mid_wait_is_sent_the_newer_snapshot() {
+        let mut n = leader_awaiting_a_snapshot_ack(3);
+        drive(
+            &mut n,
+            Input::CompactLog {
+                up_to_index: LogIndex::new(5),
+            },
+        );
+
+        // The reply covers only the old snapshot, still behind the new base.
+        let effects = n.step(deliver(3, snapshot_reply_msg(2, 3)), NOW);
+
+        assert_eq!(effects, vec![Effect::SendSnapshot { to: NodeId::new(3) }]);
+        assert_eq!(progress_of(&n, 3).flow, Flow::Snapshot { ticks_left: 3 });
     }
 
     #[test]

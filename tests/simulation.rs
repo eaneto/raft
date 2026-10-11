@@ -532,6 +532,63 @@ fn assert_lagging_follower_caught_up_by_snapshot(seed: u64) {
     }
 }
 
+/// A follower cut off behind the leader's compaction base is sent the
+/// snapshot once per retry budget, not on every heartbeat and proposal; after
+/// the heal one more send repairs it.
+fn assert_snapshot_is_resent_only_per_retry_budget(seed: u64) {
+    const RETRY_TICKS: u32 = 10;
+    let node_count = 3;
+    let mut sim = Sim::new(node_count, seed)
+        .with_net(JITTER5)
+        .with_snapshot_threshold(3)
+        .with_replication(ReplicationConfig {
+            snapshot_retry_ticks: RETRY_TICKS,
+            ..ReplicationConfig::default()
+        });
+    let leader = sim.run_until_leader(5_000);
+    sim.propose_at(leader, b"pre");
+    sim.run_until(sim.now + 300);
+
+    let victim = (leader + 1) % node_count;
+    let mut groups = vec![0usize; node_count];
+    groups[victim] = 1;
+    sim.set_groups(groups);
+    let cut_at = sim.now;
+    for k in 0..20 {
+        let current = sim.run_until_leader(5_000);
+        sim.propose_at(current, format!("x-{k}").as_bytes());
+        sim.run_until(sim.now + 150);
+    }
+    let cut_ticks = (sim.now - cut_at) / HEARTBEAT_PERIOD;
+    sim.set_groups(vec![0; node_count]);
+    sim.run_until(sim.now + 3_000);
+
+    // At most one send per budget while cut off, plus slack for the first
+    // send and the one that lands after the heal.
+    let bound = cut_ticks / u64::from(RETRY_TICKS) + 3;
+    assert!(
+        sim.snapshots_sent as u64 <= bound,
+        "seed={seed}: {} snapshots sent over {cut_ticks} cut-off heartbeats (bound {bound})",
+        sim.snapshots_sent,
+    );
+    assert!(sim.nodes[victim].snapshot_last_index().get() > 0);
+    let reference = sim.applied_commands(leader);
+    for i in 0..node_count {
+        assert_eq!(
+            sim.applied_commands(i),
+            reference,
+            "seed={seed}: node {i} did not converge after the snapshot repair",
+        );
+    }
+}
+
+#[test]
+fn a_snapshot_is_resent_only_once_per_retry_budget() {
+    for seed in seeds(&[1, 2, 3, 42, 1_000, 0x5EED]) {
+        assert_snapshot_is_resent_only_per_retry_budget(seed);
+    }
+}
+
 #[test]
 fn a_lagging_follower_is_caught_up_by_a_snapshot() {
     for seed in seeds(&[1, 2, 3, 42, 1_000, 0x5EED, 7]) {
@@ -1067,6 +1124,7 @@ fn a_transfer_to_an_unreachable_voter_is_abandoned() {
 const TIGHT: ReplicationConfig = ReplicationConfig {
     max_inflight: 2,
     max_append_bytes: 8,
+    snapshot_retry_ticks: 20,
 };
 
 /// Under loss, duplication and reordering, bursts of batched proposals stream
