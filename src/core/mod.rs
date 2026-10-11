@@ -27,8 +27,8 @@ use bytes::Bytes;
 mod message;
 
 pub use message::{
-    AppendEntriesArgs, AppendEntriesReply, InstallSnapshotArgs, InstallSnapshotReply, Message,
-    PreVoteArgs, PreVoteReply, RequestVoteArgs, RequestVoteReply, TimeoutNowArgs,
+    AppendEntriesArgs, AppendEntriesReply, Conflict, InstallSnapshotArgs, InstallSnapshotReply,
+    Message, PreVoteArgs, PreVoteReply, RequestVoteArgs, RequestVoteReply, TimeoutNowArgs,
 };
 
 /// A Raft term: a logical clock that increases monotonically over the life of
@@ -520,6 +520,35 @@ impl Log {
             count += 1;
         }
         LogIndex::new(index.get() + count).prev()
+    }
+
+    /// The first index of the run of `term_at(index)` entries that ends at
+    /// `index`, walking back no further than the compaction base. `index`
+    /// itself when the log cannot answer for it.
+    fn term_start(&self, index: LogIndex) -> LogIndex {
+        let Some(term) = self.term_at(index) else {
+            return index;
+        };
+        let mut start = index;
+        while start > self.snapshot_last_index && self.term_at(start.prev()) == Some(term) {
+            start = start.prev();
+        }
+        start
+    }
+
+    /// The highest index holding an entry of `term`, or `None` if the log
+    /// (including its compaction base) has none. Terms never decrease along
+    /// the log, so the scan stops at the first older entry.
+    fn last_index_of_term(&self, term: Term) -> Option<LogIndex> {
+        let mut index = self.last_index();
+        while index >= self.snapshot_last_index && index > LogIndex::ZERO {
+            match self.term_at(index) {
+                Some(t) if t == term => return Some(index),
+                Some(t) if t < term => return None,
+                _ => index = index.prev(),
+            }
+        }
+        None
     }
 
     /// Appends one entry to the end of the log.
@@ -1409,7 +1438,7 @@ impl RaftNode {
         // Receiver rule 1: reply false to a leader from an older term, and do
         // not treat it as leader contact.
         if args.term < self.current_term {
-            effects.push(self.append_entries_reply(args.leader_id, false, LogIndex::ZERO));
+            effects.push(self.append_entries_reply(args.leader_id, false, LogIndex::ZERO, None));
             return effects;
         }
 
@@ -1435,8 +1464,14 @@ impl RaftNode {
             || args.prev_log_index < self.log.snapshot_last_index()
             || self.log.term_at(args.prev_log_index) == Some(args.prev_log_term);
         if !consistent {
+            let conflict = self.conflict_at(args.prev_log_index);
             effects.push(Effect::ResetElectionTimer);
-            effects.push(self.append_entries_reply(args.leader_id, false, LogIndex::ZERO));
+            effects.push(self.append_entries_reply(
+                args.leader_id,
+                false,
+                LogIndex::ZERO,
+                Some(conflict),
+            ));
             return effects;
         }
 
@@ -1472,8 +1507,22 @@ impl RaftNode {
         }
 
         effects.push(Effect::ResetElectionTimer);
-        effects.push(self.append_entries_reply(args.leader_id, true, last_covered));
+        effects.push(self.append_entries_reply(args.leader_id, true, last_covered, None));
         effects
+    }
+
+    /// The hint for a rejected `AppendEntries` anchored at `prev_log_index`
+    /// (paper §5.3): our term there and the first index we hold at that term,
+    /// so the leader can step back over the whole term at once; or, when our
+    /// log ends before `prev_log_index`, just past our last entry.
+    fn conflict_at(&self, prev_log_index: LogIndex) -> Conflict {
+        let term = self.log.term_at(prev_log_index);
+        let index = if term.is_some() {
+            self.log.term_start(prev_log_index)
+        } else {
+            self.log.last_index().next()
+        };
+        Conflict { term, index }
     }
 
     /// Applies `AppendEntries` receiver rules 3 & 4. Walks `entries` against
@@ -1543,7 +1592,8 @@ impl RaftNode {
     /// the leader for the reply's term: `success` moves `match_index[from]` /
     /// `next_index[from]` forward, may advance `commit_index` (§5.4.2), and
     /// sends `from` whatever it is still missing; failure steps
-    /// `next_index[from]` back and retries straight away.
+    /// `next_index[from]` back — over a whole conflicting term when the reply
+    /// carries a hint — and retries straight away.
     fn handle_append_entries_reply(
         &mut self,
         from: NodeId,
@@ -1569,7 +1619,7 @@ impl RaftNode {
             self.advance_catch_up(from, &mut effects);
             effects.extend(self.timeout_now_if_caught_up(from));
         } else {
-            self.back_off(from);
+            self.back_off(from, reply.conflict);
         }
         effects.extend(self.replicate_to(from, false));
         effects
@@ -1969,6 +2019,14 @@ impl RaftNode {
     /// further back; one that was streaming restarts just past `match_index`,
     /// the last point it acknowledged.
     ///
+    /// A `conflict` hint (paper §5.3) can only pull that retry point further
+    /// back. With a conflicting term we hold too, the follower's entries of it
+    /// may match ours, so resume just past our last entry of that term;
+    /// otherwise the whole run is foreign and we resume at the follower's
+    /// `conflict.index` (or, for a short log, just past its end). Taking the
+    /// lower of the two rules means a stale or duplicated hint costs at most a
+    /// retransmission and never skips an entry the follower lacks.
+    ///
     /// Probing is not floored at `match_index`: a follower that lost its
     /// storage (or a stale rejection) can send `next_index` below it, and a
     /// floor there would leave such a follower rejecting the same probe
@@ -1977,15 +2035,23 @@ impl RaftNode {
     /// A peer waiting on a snapshot ignores the rejection: it can only answer
     /// an `AppendEntries` sent before the snapshot, which the snapshot
     /// supersedes.
-    fn back_off(&mut self, peer: NodeId) {
+    fn back_off(&mut self, peer: NodeId, conflict: Option<Conflict>) {
+        let hinted = conflict.map(|c| {
+            c.term
+                .and_then(|term| self.log.last_index_of_term(term))
+                .map_or(c.index, LogIndex::next)
+        });
         if let Role::Leader { progress, .. } = &mut self.role
             && let Some(p) = progress.get_mut(&peer)
         {
-            let retry_from = match p.flow {
+            let mut retry_from = match p.flow {
                 Flow::Probe { .. } => p.next_index.prev(),
                 Flow::Replicate { .. } => p.match_index.next(),
                 Flow::Snapshot { .. } => return,
             };
+            if let Some(hinted) = hinted {
+                retry_from = retry_from.min(hinted);
+            }
             p.next_index = retry_from.max(LogIndex::new(1));
             p.flow = Flow::Probe { paused: false };
         }
@@ -2481,12 +2547,14 @@ impl RaftNode {
     /// Builds an `AppendEntriesReply` effect addressed to `leader`.
     ///
     /// `match_index` is the highest index the follower has stored for this
-    /// leader on `success`, and [`LogIndex::ZERO`] otherwise.
+    /// leader on `success`, and [`LogIndex::ZERO`] otherwise; `conflict` is
+    /// the back-off hint on a failed consistency check.
     const fn append_entries_reply(
         &self,
         leader: NodeId,
         success: bool,
         match_index: LogIndex,
+        conflict: Option<Conflict>,
     ) -> Effect {
         Effect::SendRpc {
             to: leader,
@@ -2494,6 +2562,7 @@ impl RaftNode {
                 term: self.current_term,
                 success,
                 match_index,
+                conflict,
             }),
         }
     }
@@ -2662,11 +2731,11 @@ mod tests {
     use bytes::Bytes;
 
     use super::{
-        AppendEntriesArgs, AppendEntriesReply, CATCH_UP_TICKS, ClusterConfig, Effect, Flow, Input,
-        InstallSnapshotArgs, InstallSnapshotReply, Log, LogEntry, LogIndex, LogicalInstant,
-        MembershipChange, Message, NodeId, PreVoteArgs, PreVoteReply, PreVoteRound, Progress,
-        RaftNode, ReplicationConfig, RequestVoteArgs, RequestVoteReply, Role, TRANSFER_TICKS, Term,
-        TimeoutNowArgs,
+        AppendEntriesArgs, AppendEntriesReply, CATCH_UP_TICKS, ClusterConfig, Conflict, Effect,
+        Flow, Input, InstallSnapshotArgs, InstallSnapshotReply, Log, LogEntry, LogIndex,
+        LogicalInstant, MembershipChange, Message, NodeId, PreVoteArgs, PreVoteReply, PreVoteRound,
+        Progress, RaftNode, ReplicationConfig, RequestVoteArgs, RequestVoteReply, Role,
+        TRANSFER_TICKS, Term, TimeoutNowArgs,
     };
 
     /// The core does not consult the clock under this timer model, so every
@@ -2771,8 +2840,27 @@ mod tests {
                 term: Term::new(term),
                 success,
                 match_index: LogIndex::ZERO,
+                conflict: None,
             }),
         }
+    }
+
+    /// A failed `AppendEntriesReply` effect carrying a conflict hint.
+    fn rejection(to: u64, term: u64, conflict_term: Option<u64>, conflict_index: u64) -> Effect {
+        send(to, rejected(term, conflict_term, conflict_index))
+    }
+
+    /// An `AppendEntriesReply` message rejecting with a conflict hint.
+    fn rejected(term: u64, conflict_term: Option<u64>, conflict_index: u64) -> Message {
+        Message::AppendEntriesReply(AppendEntriesReply {
+            term: Term::new(term),
+            success: false,
+            match_index: LogIndex::ZERO,
+            conflict: Some(Conflict {
+                term: conflict_term.map(Term::new),
+                index: LogIndex::new(conflict_index),
+            }),
+        })
     }
 
     /// A successful `AppendEntriesReply` effect carrying `matched`.
@@ -2783,6 +2871,7 @@ mod tests {
                 term: Term::new(term),
                 success: true,
                 match_index: LogIndex::new(matched),
+                conflict: None,
             }),
         }
     }
@@ -2793,6 +2882,7 @@ mod tests {
             term: Term::new(term),
             success,
             match_index: LogIndex::new(matched),
+            conflict: None,
         })
     }
 
@@ -3127,6 +3217,56 @@ mod tests {
         assert!(log.entries_from(LogIndex::new(1)).is_empty());
         assert_eq!(log.last_index(), LogIndex::new(3));
         assert_eq!(log.last_term(), Term::new(3));
+    }
+
+    #[test]
+    fn term_start_walks_back_to_the_first_entry_of_the_term() {
+        let mut log = Log::new();
+        for term in [1, 2, 2, 3] {
+            log.append(entry(term));
+        }
+        assert_eq!(log.term_start(LogIndex::new(3)), LogIndex::new(2));
+        assert_eq!(log.term_start(LogIndex::new(2)), LogIndex::new(2));
+        assert_eq!(log.term_start(LogIndex::new(1)), LogIndex::new(1));
+        assert_eq!(log.term_start(LogIndex::new(4)), LogIndex::new(4));
+        // Past the end: nothing to walk back from.
+        assert_eq!(log.term_start(LogIndex::new(9)), LogIndex::new(9));
+    }
+
+    #[test]
+    fn term_start_stops_at_the_snapshot_base() {
+        let log = Log::from_snapshot(LogIndex::new(10), Term::new(4), vec![entry(4), entry(4)]);
+        assert_eq!(log.term_start(LogIndex::new(12)), LogIndex::new(10));
+        assert_eq!(log.term_start(LogIndex::new(10)), LogIndex::new(10));
+    }
+
+    #[test]
+    fn last_index_of_term_finds_the_end_of_a_run() {
+        let mut log = Log::new();
+        for term in [1, 1, 3, 3, 5] {
+            log.append(entry(term));
+        }
+        assert_eq!(log.last_index_of_term(Term::new(1)), Some(LogIndex::new(2)));
+        assert_eq!(log.last_index_of_term(Term::new(3)), Some(LogIndex::new(4)));
+        assert_eq!(log.last_index_of_term(Term::new(5)), Some(LogIndex::new(5)));
+        assert_eq!(log.last_index_of_term(Term::new(2)), None);
+        assert_eq!(log.last_index_of_term(Term::new(6)), None);
+        assert_eq!(Log::new().last_index_of_term(Term::ZERO), None);
+    }
+
+    #[test]
+    fn last_index_of_term_sees_the_snapshot_base_but_not_below_it() {
+        let log = Log::from_snapshot(LogIndex::new(10), Term::new(4), vec![entry(5)]);
+        assert_eq!(
+            log.last_index_of_term(Term::new(4)),
+            Some(LogIndex::new(10))
+        );
+        assert_eq!(log.last_index_of_term(Term::new(3)), None);
+        let bare = Log::from_snapshot(LogIndex::new(10), Term::new(4), vec![]);
+        assert_eq!(
+            bare.last_index_of_term(Term::new(4)),
+            Some(LogIndex::new(10))
+        );
     }
 
     #[test]
@@ -3805,8 +3945,47 @@ mod tests {
 
         assert_eq!(
             effects,
-            vec![Effect::ResetElectionTimer, append_reply(2, 1, false)],
+            vec![Effect::ResetElectionTimer, rejection(2, 1, Some(1), 1),],
         );
+    }
+
+    #[test]
+    fn a_rejection_names_the_first_index_of_the_conflicting_term() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(3);
+        for term in [1, 2, 2, 2] {
+            n.log.append(entry(term));
+        }
+
+        // The leader's entry 4 is from term 3; ours is from term 2, which we
+        // have held since index 2.
+        let effects = n.step(deliver(2, heartbeat(3, 2, 4, 3)), NOW);
+
+        assert!(effects.contains(&rejection(2, 3, Some(2), 2)));
+    }
+
+    #[test]
+    fn a_rejection_from_a_short_log_points_just_past_its_end() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(1);
+        n.log.append(entry(1));
+        n.log.append(entry(1));
+
+        let effects = n.step(deliver(2, heartbeat(1, 2, 7, 1)), NOW);
+
+        assert!(effects.contains(&rejection(2, 1, None, 3)));
+    }
+
+    #[test]
+    fn a_rejection_hint_stops_at_the_snapshot_base() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(3);
+        n.log = Log::from_snapshot(LogIndex::new(3), Term::new(2), vec![entry(2), entry(2)]);
+
+        // Term 2 runs back into the snapshot; the hint goes no lower than it.
+        let effects = n.step(deliver(2, heartbeat(3, 2, 5, 3)), NOW);
+
+        assert!(effects.contains(&rejection(2, 3, Some(2), 3)));
     }
 
     #[test]
@@ -4835,6 +5014,91 @@ mod tests {
             last = n.step(deliver(3, ae_reply(2, false, 0)), NOW);
         }
         assert_eq!(last, vec![Effect::SendSnapshot { to: NodeId::new(3) }]);
+    }
+
+    /// A term-4 leader whose log holds terms `[1, 1, 1, 3, 3]`, so every
+    /// peer starts probing at `nextIndex` 6.
+    fn leader_over_two_terms() -> RaftNode {
+        let mut n = node(1, &[2, 3]);
+        for term in [1, 1, 1, 3, 3] {
+            n.log.append(entry(term));
+        }
+        n.current_term = Term::new(3);
+        time_out(&mut n); // term 4
+        drive(&mut n, deliver(2, vote_reply(4, true)));
+        assert!(n.is_leader());
+        assert_eq!(progress_of(&n, 2).next_index, LogIndex::new(6));
+        n
+    }
+
+    /// The `prev_log_index` of every `AppendEntries` in `effects`.
+    fn anchors(effects: &[Effect]) -> Vec<u64> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::SendRpc {
+                    message: Message::AppendEntries(args),
+                    ..
+                } => Some(args.prev_log_index.get()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_hint_for_a_term_the_leader_lacks_skips_the_whole_run() {
+        let mut n = leader_over_two_terms();
+
+        // Peer 2 holds term 2 from index 4 on; we never had term 2.
+        let effects = n.step(deliver(2, rejected(4, Some(2), 4)), NOW);
+
+        assert_eq!(progress_of(&n, 2).next_index, LogIndex::new(4));
+        assert_eq!(anchors(&effects), vec![3]);
+    }
+
+    #[test]
+    fn a_hint_for_a_term_the_leader_holds_resumes_past_its_own_run() {
+        let mut n = leader_over_two_terms();
+
+        // Peer 2's entry 5 is from term 1, which it has held since index 1;
+        // our term-1 run ends at 3, so its first three entries may match.
+        let effects = n.step(deliver(2, rejected(4, Some(1), 1)), NOW);
+
+        assert_eq!(progress_of(&n, 2).next_index, LogIndex::new(4));
+        assert_eq!(anchors(&effects), vec![3]);
+    }
+
+    #[test]
+    fn a_hint_from_a_short_log_resumes_just_past_its_end() {
+        let mut n = leader_over_two_terms();
+
+        let effects = n.step(deliver(2, rejected(4, None, 2)), NOW);
+
+        assert_eq!(progress_of(&n, 2).next_index, LogIndex::new(2));
+        assert_eq!(anchors(&effects), vec![1]);
+    }
+
+    #[test]
+    fn a_hint_never_moves_next_index_past_the_plain_back_off() {
+        let mut n = leader_over_two_terms();
+
+        // A stale or bogus hint pointing past the probe is ignored: the probe
+        // still steps back by one.
+        drive(&mut n, deliver(2, rejected(4, None, 9)));
+        assert_eq!(progress_of(&n, 2).next_index, LogIndex::new(5));
+
+        // Same for a term run we end later than the probe point.
+        drive(&mut n, deliver(2, rejected(4, Some(3), 4)));
+        assert_eq!(progress_of(&n, 2).next_index, LogIndex::new(4));
+    }
+
+    #[test]
+    fn a_hint_below_the_snapshot_base_sends_the_snapshot() {
+        let mut n = leader_with_compacted_log(3); // base at index 3
+
+        let effects = n.step(deliver(3, rejected(2, None, 2)), NOW);
+
+        assert_eq!(effects, vec![Effect::SendSnapshot { to: NodeId::new(3) }]);
     }
 
     #[test]

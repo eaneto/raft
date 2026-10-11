@@ -117,6 +117,27 @@ pub struct AppendEntriesReply {
     /// Ongaro's TLA+ spec). Meaningless and set to [`LogIndex::ZERO`] when
     /// `success` is `false`.
     pub match_index: LogIndex,
+    /// On a failed consistency check, where the follower's log stops agreeing
+    /// with the leader's, so the leader can skip a whole conflicting term per
+    /// round trip instead of one entry (paper §5.3). `None` on `success` and
+    /// on a rejection for a stale term.
+    pub conflict: Option<Conflict>,
+}
+
+/// The hint a follower attaches to a failed `AppendEntries` consistency check.
+///
+/// The leader treats it as advice only: it never moves `nextIndex` further
+/// than the plain one-step back-off would, so a stale or duplicated hint can
+/// cost a retransmission but never skip an entry the follower lacks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Conflict {
+    /// The follower's term at `prev_log_index`, or `None` when its log ends
+    /// before `prev_log_index`.
+    pub term: Option<Term>,
+    /// With a `term`, the first index the follower holds at that term (no
+    /// lower than its snapshot base); without one, the follower's last index
+    /// plus one.
+    pub index: LogIndex,
 }
 
 /// Arguments for the `InstallSnapshot` RPC (Figure 13), sent by the leader to a
