@@ -98,6 +98,9 @@ pub struct Sim {
     pub replication: ReplicationConfig,
     /// How many `SendSnapshot` effects every leader has emitted, in total.
     pub snapshots_sent: usize,
+    /// Per node, how many failed `AppendEntriesReply`s it has sent — one per
+    /// round trip a leader spends walking its `nextIndex` back.
+    pub rejections_sent: Vec<usize>,
     pub rng: StdRng,
 
     // --- invariant bookkeeping (Raft safety properties) ---
@@ -138,6 +141,7 @@ impl Sim {
             snapshot: vec![None; node_count],
             replication: ReplicationConfig::default(),
             snapshots_sent: 0,
+            rejections_sent: vec![0; node_count],
             rng,
             prev_commit: vec![0; node_count],
             prev_applied: vec![0; node_count],
@@ -393,6 +397,11 @@ impl Sim {
                 self.replication.max_append_bytes,
             );
         }
+        if let Message::AppendEntriesReply(reply) = &message
+            && !reply.success
+        {
+            self.rejections_sent[from_idx] += 1;
+        }
         if self.net.drop_permille > 0 && self.rng.gen_ratio(self.net.drop_permille, 1000) {
             return;
         }
@@ -483,6 +492,7 @@ impl Sim {
         self.groups.push(0);
         self.applied.push(Vec::new());
         self.snapshot.push(None);
+        self.rejections_sent.push(0);
         self.prev_commit.push(0);
         self.prev_applied.push(0);
 
