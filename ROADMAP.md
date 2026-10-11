@@ -39,6 +39,9 @@ this file just tracks the sequence of small steps and what's done.
 | Batch caps | `ReplicationConfig { max_inflight, max_append_bytes, snapshot_retry_ticks }` (defaults 8 / 1 MiB / 20), set via `RaftNode::with_replication` and `node::Config::replication`. Bytes = command payload (8 per voter for a config), always ≥ 1 entry per batch. A streaming peer that is behind gets batches until its window fills |
 | Proposal batching | `Input::Propose { commands: Vec<Bytes> }` → one `PersistLog` + one round of `AppendEntries`. The driver drains proposals queued behind the first (≤ `MAX_PROPOSALS_PER_STEP`) and stashes the first other event so ordering holds |
 | Fast log backtracking (§5.3) | a failed consistency check's `AppendEntriesReply` carries `conflict: Option<Conflict { term, index }>`: the follower's term at `prev_log_index` and the first index of it (floored at its snapshot base), or `term: None` and its last index + 1 for a short log. The leader resumes past its own last entry of that term if it has one, else at `conflict.index`. The hint is advisory: `back_off` takes the **lower** of it and the plain rule (Probe: one step; Replicate: `match_index + 1`), so a stale or duplicated hint never skips an entry. `None` on success and on stale-term rejections |
+| Leader no-op (§6.4 / §8) | a new leader appends `LogEntryKind::Noop` at its term before its opening heartbeats (storage kind tag 2, never applied). `committed_in_current_term()` (= `term_at(commitIndex) == currentTerm`) gates both ReadIndex and membership changes — the latter is the fix for the 2015 single-server membership bug, and subsumes the old "latest config is committed" guard |
+| ReadIndex (§6.4) | `Input::ReadIndex { id: ReadId }` → `Effect::ReadReady { id, read_index }` / `ReadFailed { id }`. Each read bumps a per-leadership `HeartbeatRound` and broadcasts at once; `AppendEntriesArgs` carries the round and `AppendEntriesReply` echoes it (any reply at the leader's term counts); confirmed when a quorum of voters has echoed it. `read_index` = `commitIndex`, taken only after the no-op commits; ready when also `lastApplied >= read_index`. Pending reads live on `RaftNode`, and a settle pass after every input fails them all once the node isn't leader. Driver: `StateMachine::query`, blocking `Node::read(query) -> Result<Bytes, ReadError>` |
+| Read budget | a read not confirmed within `READ_TICKS` (6) heartbeats fails — **DEVIATION**: §6.4 sets no bound; it stands in for check-quorum, which the core lacks, so a partitioned leader's reads don't hang |
 | `PreVoteRound` | pre-vote rounds are numbered (`PreVoteArgs.round`, echoed by the reply) and a grant counts only for the round it answers. Rounds at one term are otherwise indistinguishable — `currentTerm` deliberately does not move — so a late "yes" from an earlier round would be spent in a later one, promoting on consent the peer no longer gives; the term bump that follows unseats a healthy leader via `AppendEntriesReply`. This is why `PreVote` gets its own structs instead of reusing `RequestVoteArgs` / `RequestVoteReply` |
 
 ## Done
@@ -189,7 +192,22 @@ TCP transport. `just check` is green. Every module rustdoc is self-contained.
       60-entry stale tail): 1 rejection to repair, against ~67 without
       hints. The harness counts failed `AppendEntriesReply`s per node.
       `cargo mutants` over the new/changed functions: every mutant caught.
-- [ ] Read-index / lease reads (thesis §6.4)
+- [x] **ReadIndex reads (thesis §6.4).** Branch `read-index`. Leader no-op
+      entry (+ the 2015 membership-bug gate), `HeartbeatRound` on
+      `AppendEntries`, `Input::ReadIndex` / `Effect::ReadReady` /
+      `ReadFailed`, `READ_TICKS` expiry, `StateMachine::query` +
+      `Node::read`. Harness checks every served read against the highest
+      index committed anywhere when it was issued; batteries
+      `reads_stay_linearizable_under_chaos`,
+      `a_deposed_leader_never_serves_a_stale_read`; proptest `Read` op; TCP
+      integration test. Verified against two deliberately broken cores (no
+      quorum confirmation; read index taken before the no-op commits).
+      `cargo mutants` over the new code: every mutant caught or the dead
+      code removed.
+- [ ] Lease reads (thesis §6.4.1) — serve reads without a round while a
+      lease holds; needs bounded clock drift, so a tick-based **DEVIATION**
+- [ ] Check-quorum (thesis §6.2) — a leader that hears from no quorum for an
+      election timeout steps down; would make `READ_TICKS` a backstop
 
 ## Module layout (`AGENTS.md` §5)
 
