@@ -1992,15 +1992,18 @@ impl RaftNode {
     }
 
     /// Handles [`Input::ChangeMembership`] (thesis §4). A no-op unless this
-    /// server leads, has no change already in flight, and the latest
-    /// configuration entry is committed. `RemoveServer` appends the new
-    /// configuration at once; `AddServer` first replicates to the new server
-    /// as a non-voting learner (see [`ChangePhase::CatchingUp`]).
+    /// server leads, has no change already in flight, and has committed an
+    /// entry of its own term. `RemoveServer` appends the new configuration at
+    /// once; `AddServer` first replicates to the new server as a non-voting
+    /// learner (see [`ChangePhase::CatchingUp`]).
+    ///
+    /// Together those also mean the latest configuration entry is committed:
+    /// this leader's own is in flight until it commits, and a predecessor's
+    /// sits below the no-op, so it commits no later than the no-op does.
     fn handle_change_membership(&mut self, change: MembershipChange) -> Vec<Effect> {
         if !self.is_leader()
             || self.is_transferring()
             || self.pending_change.is_some()
-            || self.latest_config_index() > self.commit_index
             || !self.committed_in_current_term()
         {
             return Vec::new();
