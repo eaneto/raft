@@ -5,6 +5,10 @@
 //! for each entry, one at a time in strictly increasing index order and never
 //! past `commitIndex`. The driver forwards that to a [`StateMachine`].
 //!
+//! A linearizable read ([`Node::read`](crate::node::Node::read)) is answered
+//! by [`StateMachine::query`], once the leader has confirmed the read is safe
+//! to serve from its current state (thesis §6.4).
+//!
 //! For log compaction the driver also asks the state machine to serialize its
 //! whole state ([`StateMachine::snapshot`]) and, on a restart or after
 //! receiving a leader's snapshot, to replace its state from such bytes
@@ -30,6 +34,12 @@ pub trait StateMachine: Send {
     /// Applies the committed entry at `index`. `command` is the opaque bytes
     /// the client proposed.
     fn apply(&mut self, index: LogIndex, command: &Bytes);
+
+    /// Answers a read-only `query` from the current state. Called on the raft
+    /// thread only once the leader has confirmed a linearizable read (thesis
+    /// §6.4), so the state reflects every write committed before the read was
+    /// asked. Must not change the state. Raft never inspects either bytes.
+    fn query(&self, query: &Bytes) -> Bytes;
 
     /// Serializes the entire current state. The driver persists the result as
     /// a snapshot and then has the core compact the log up to the last applied
@@ -68,6 +78,14 @@ impl RecordingStateMachine {
 impl StateMachine for RecordingStateMachine {
     fn apply(&mut self, index: LogIndex, command: &Bytes) {
         self.applied.push((index, command.clone()));
+    }
+
+    /// Ignores `query` and returns the most recently applied command, or
+    /// nothing before the first.
+    fn query(&self, _query: &Bytes) -> Bytes {
+        self.applied
+            .last()
+            .map_or_else(Bytes::new, |(_, command)| command.clone())
     }
 
     fn snapshot(&self) -> Bytes {
@@ -137,5 +155,17 @@ mod tests {
         sm.apply(LogIndex::new(1), &Bytes::from_static(b"x"));
         sm.restore(&Bytes::from_static(b"not bincode"));
         assert!(sm.applied().is_empty());
+    }
+
+    #[test]
+    fn query_returns_the_latest_command_or_nothing() {
+        let mut sm = RecordingStateMachine::new();
+        let query = Bytes::from_static(b"anything");
+        assert_eq!(sm.query(&query), Bytes::new());
+
+        sm.apply(LogIndex::new(1), &Bytes::from_static(b"a"));
+        sm.apply(LogIndex::new(2), &Bytes::from_static(b"b"));
+
+        assert_eq!(sm.query(&query), Bytes::from_static(b"b"));
     }
 }

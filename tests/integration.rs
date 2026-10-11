@@ -13,7 +13,7 @@ use bytes::Bytes;
 use tempfile::TempDir;
 
 use raft::core::{LogIndex, NodeId};
-use raft::node::{Config, Node};
+use raft::node::{Config, Node, ReadError};
 use raft::statemachine::StateMachine;
 use raft::storage::{FileStorage, Storage};
 
@@ -39,6 +39,11 @@ impl StateMachine for SharedSm {
         if let Ok(mut guard) = self.0.lock() {
             guard.push(command.clone());
         }
+    }
+
+    /// The most recently applied command, whatever the query.
+    fn query(&self, _query: &Bytes) -> Bytes {
+        self.applied().last().cloned().unwrap_or_default()
     }
 
     fn snapshot(&self) -> Bytes {
@@ -302,6 +307,38 @@ fn a_burst_of_proposals_commits_in_order_on_every_node() {
 }
 
 #[test]
+fn the_leader_serves_linearizable_reads_and_followers_refuse() {
+    let (nodes, sms, _addrs, _dirs) = start_cluster(3);
+    assert!(
+        wait_until(Duration::from_secs(3), || leader_index(&nodes).is_some()),
+        "no leader elected",
+    );
+    let leader = unwrap(leader_index(&nodes).ok_or("no leader"));
+    assert!(nodes[leader].propose(Bytes::from_static(b"x")).is_ok());
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            sms[leader].applied() == [Bytes::from_static(b"x")]
+        }),
+        "the leader never applied the write",
+    );
+
+    // Committed before the read was asked, so the read must see it.
+    assert_eq!(
+        nodes[leader].read(Bytes::from_static(b"latest?")),
+        Ok(Bytes::from_static(b"x")),
+    );
+    let follower = (leader + 1) % nodes.len();
+    assert_eq!(
+        nodes[follower].read(Bytes::from_static(b"latest?")),
+        Err(ReadError::NotLeader),
+    );
+
+    for node in nodes {
+        let _ = node.shutdown();
+    }
+}
+
+#[test]
 fn the_leader_removes_a_follower_from_the_cluster() {
     let (nodes, _sms, _addrs, _dirs) = start_cluster(4);
 
@@ -509,6 +546,10 @@ struct DropFlag(Arc<AtomicBool>);
 
 impl StateMachine for DropFlag {
     fn apply(&mut self, _index: LogIndex, _command: &Bytes) {}
+
+    fn query(&self, _query: &Bytes) -> Bytes {
+        Bytes::new()
+    }
 
     fn snapshot(&self) -> Bytes {
         Bytes::new()
