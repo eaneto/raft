@@ -33,7 +33,7 @@ use rand::{Rng, SeedableRng};
 use crate::clock::{Clock, MonotonicClock};
 use crate::core::{
     ClusterConfig, Effect, Input, InstallSnapshotArgs, LogIndex, MembershipChange, Message, NodeId,
-    RaftNode, ReplicationConfig,
+    RaftNode, ReadId, ReplicationConfig,
 };
 use crate::statemachine::StateMachine;
 use crate::storage::{self, PersistentState, SnapshotMeta, Storage};
@@ -171,6 +171,31 @@ impl fmt::Display for NodeGone {
 
 impl std::error::Error for NodeGone {}
 
+/// Why [`Node::read`] returned no answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadError {
+    /// This node could not serve the read: it is not the leader, stopped
+    /// leading before it confirmed the read, or could not reach a quorum to
+    /// confirm it in time. Retry, ideally against the current leader.
+    NotLeader,
+    /// The event loop has stopped.
+    NodeGone,
+}
+
+impl fmt::Display for ReadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotLeader => f.write_str("this node could not serve the read as leader"),
+            Self::NodeGone => NodeGone.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for ReadError {}
+
+/// Where [`Driver`] sends a read's answer.
+type ReadReply = Sender<Result<Bytes, ReadError>>;
+
 /// The most queued proposals stepped together; see [`drain_proposals`].
 const MAX_PROPOSALS_PER_STEP: usize = 1024;
 
@@ -185,6 +210,8 @@ enum Event {
     Membership(MembershipChange, Option<SocketAddr>),
     /// A request to hand leadership to the given voter.
     TransferLeadership(NodeId),
+    /// A linearizable read: the query, and where to send its answer.
+    Read(Bytes, ReadReply),
     /// A request for a status snapshot, answered on the given channel.
     Describe(Sender<NodeStatus>),
     Shutdown,
@@ -322,6 +349,24 @@ impl Node {
             .map_err(|_| NodeGone)
     }
 
+    /// Runs a linearizable read (thesis §6.4, `ReadIndex`): once this node
+    /// has confirmed it still leads and has applied every entry committed
+    /// before the call, it answers `query` with [`StateMachine::query`].
+    /// Nothing is written to the log. Blocks until then — at most about an
+    /// election timeout when no quorum can be reached.
+    ///
+    /// # Errors
+    ///
+    /// [`ReadError::NotLeader`] if this node could not serve the read as
+    /// leader; [`ReadError::NodeGone`] if the event loop has stopped.
+    pub fn read(&self, query: Bytes) -> Result<Bytes, ReadError> {
+        let (tx, rx) = mpsc::channel();
+        self.events
+            .send(Event::Read(query, tx))
+            .map_err(|_| ReadError::NodeGone)?;
+        rx.recv().map_err(|_| ReadError::NodeGone)?
+    }
+
     /// Returns a point-in-time [`NodeStatus`].
     ///
     /// # Errors
@@ -408,6 +453,11 @@ struct Driver<S, M, T> {
     /// [`Node::add_server`]. Used to reconcile the transport with a committed
     /// configuration.
     peer_addrs: BTreeMap<NodeId, SocketAddr>,
+    /// Reads handed to the core and not yet answered: the query, and where
+    /// to send the answer.
+    reads: BTreeMap<ReadId, (Bytes, ReadReply)>,
+    /// The id the next read gets.
+    next_read_id: u64,
 }
 
 impl<S: Storage, M: StateMachine, T: PeerTransport> Driver<S, M, T> {
@@ -486,6 +536,8 @@ impl<S: Storage, M: StateMachine, T: PeerTransport> Driver<S, M, T> {
             snapshot,
             incoming_snapshot: None,
             peer_addrs,
+            reads: BTreeMap::new(),
+            next_read_id: 0,
         })
     }
 
@@ -540,6 +592,11 @@ impl<S: Storage, M: StateMachine, T: PeerTransport> Driver<S, M, T> {
                         return Stopped::FatalStorage(fatal);
                     }
                 }
+                Ok(Event::Read(query, reply)) => {
+                    if let Err(fatal) = self.begin_read(query, reply, now) {
+                        return Stopped::FatalStorage(fatal);
+                    }
+                }
                 Ok(Event::Describe(reply)) => {
                     let _ = reply.send(NodeStatus {
                         is_leader: self.node.is_leader(),
@@ -555,6 +612,21 @@ impl<S: Storage, M: StateMachine, T: PeerTransport> Driver<S, M, T> {
             }
             self.reconcile_timers(now);
         }
+    }
+
+    /// Hands a read to the core under a fresh [`ReadId`]; `reply` gets the
+    /// answer when the core emits [`Effect::ReadReady`] or
+    /// [`Effect::ReadFailed`] for it.
+    fn begin_read(
+        &mut self,
+        query: Bytes,
+        reply: ReadReply,
+        now: Instant,
+    ) -> Result<(), storage::Error> {
+        let id = ReadId::new(self.next_read_id);
+        self.next_read_id += 1;
+        self.reads.insert(id, (query, reply));
+        self.step(Input::ReadIndex { id }, now)
     }
 
     fn step(&mut self, input: Input, now: Instant) -> Result<(), storage::Error> {
@@ -599,8 +671,17 @@ impl<S: Storage, M: StateMachine, T: PeerTransport> Driver<S, M, T> {
                     self.receive_snapshot_chunk(meta, offset, &data, done, now)?;
                 }
                 Effect::MembershipChanged { config } => self.reconcile_transport(&config),
-                // The driver issues no reads yet, so the core answers none.
-                Effect::ReadReady { .. } | Effect::ReadFailed { .. } => {}
+                // The caller may have given up waiting; then nobody listens.
+                Effect::ReadReady { id, .. } => {
+                    if let Some((query, reply)) = self.reads.remove(&id) {
+                        let _ = reply.send(Ok(self.state_machine.query(&query)));
+                    }
+                }
+                Effect::ReadFailed { id } => {
+                    if let Some((_, reply)) = self.reads.remove(&id) {
+                        let _ = reply.send(Err(ReadError::NotLeader));
+                    }
+                }
             }
         }
         Ok(())
@@ -815,8 +896,8 @@ mod tests {
     use bytes::Bytes;
 
     use super::{
-        Config, Driver, Event, MAX_PROPOSALS_PER_STEP, NodeGone, PeerTransport, StartError,
-        drain_proposals, random_timeout, soonest,
+        Config, Driver, Event, MAX_PROPOSALS_PER_STEP, NodeGone, PeerTransport, ReadError,
+        StartError, drain_proposals, random_timeout, soonest,
     };
     use crate::core::{ClusterConfig, Effect, Input, LogIndex, Message, NodeId, Term};
     use crate::statemachine::{RecordingStateMachine, StateMachine};
@@ -1326,5 +1407,66 @@ mod tests {
         );
 
         assert_eq!(NodeGone.to_string(), "the raft node has shut down");
+    }
+
+    // --- linearizable reads --------------------------------------------------
+
+    /// Starts a read of `d` and returns where its answer will arrive.
+    fn read(d: &mut TestDriver, now: Instant) -> Receiver<Result<Bytes, ReadError>> {
+        let (tx, rx) = mpsc::channel();
+        ok(d.begin_read(Bytes::from_static(b"latest?"), tx, now));
+        rx
+    }
+
+    #[test]
+    fn a_lone_leader_answers_a_read_from_its_state_machine() {
+        let now = Instant::now();
+        let mut d = lone_leader(config(&[]), now);
+        step(
+            &mut d,
+            Input::Propose {
+                commands: vec![Bytes::from_static(b"x")],
+            },
+            now,
+        );
+
+        let answer = read(&mut d, now);
+
+        assert_eq!(answer.try_recv(), Ok(Ok(Bytes::from_static(b"x"))));
+        assert!(d.reads.is_empty());
+    }
+
+    #[test]
+    fn a_follower_answers_a_read_with_not_leader() {
+        let now = Instant::now();
+        let mut d = driver(config(&[2, 3]), now);
+
+        let answer = read(&mut d, now);
+
+        assert_eq!(answer.try_recv(), Ok(Err(ReadError::NotLeader)));
+        assert!(d.reads.is_empty());
+    }
+
+    #[test]
+    fn each_read_gets_its_own_id() {
+        let now = Instant::now();
+        let mut d = driver(config(&[2, 3]), now);
+
+        let _first = read(&mut d, now);
+        let _second = read(&mut d, now);
+
+        assert_eq!(d.next_read_id, 2);
+    }
+
+    #[test]
+    fn a_read_error_explains_itself() {
+        assert_eq!(
+            ReadError::NotLeader.to_string(),
+            "this node could not serve the read as leader",
+        );
+        assert_eq!(
+            ReadError::NodeGone.to_string(),
+            "the raft node has shut down",
+        );
     }
 }
