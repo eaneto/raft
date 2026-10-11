@@ -1243,11 +1243,11 @@ mod tests {
             commands: vec![Bytes::from_static(command)],
         };
 
+        // The leader's opening no-op is entry 1.
         step(&mut d, propose(b"a"), now);
-        step(&mut d, propose(b"b"), now);
         assert_eq!(d.storage.durable().snapshot, None);
 
-        step(&mut d, propose(b"c"), now);
+        step(&mut d, propose(b"b"), now);
         let snapshot = d.storage.durable().snapshot.clone();
         assert_eq!(
             snapshot.map(|snapshot| snapshot.meta.last_included_index),
