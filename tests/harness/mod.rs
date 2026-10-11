@@ -579,7 +579,7 @@ impl Sim {
         self.step(
             idx,
             Input::Propose {
-                command: Bytes::copy_from_slice(command),
+                commands: vec![Bytes::copy_from_slice(command)],
             },
         );
         self.check_invariants();

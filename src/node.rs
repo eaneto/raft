@@ -6,7 +6,9 @@
 //! "raft thread" owns the [`RaftNode`] and is the only place [`RaftNode::step`]
 //! is called. Transport threads decode inbound frames and push them onto an
 //! [`mpsc`] channel; client proposals and the shutdown signal arrive on the
-//! same channel. Timers are `recv_timeout` deadlines, re-armed from a seeded
+//! same channel. Proposals already queued behind one another are stepped
+//! together, so a burst of them shares one `fsync` and one round of
+//! `AppendEntries`. Timers are `recv_timeout` deadlines, re-armed from a seeded
 //! [`StdRng`], so a given seed drives the same election jitter every run.
 //!
 //! A storage write that fails is fatal: a failed `fsync` can leave the OS
@@ -168,6 +170,9 @@ impl fmt::Display for NodeGone {
 }
 
 impl std::error::Error for NodeGone {}
+
+/// The most queued proposals stepped together; see [`drain_proposals`].
+const MAX_PROPOSALS_PER_STEP: usize = 1024;
 
 enum Event {
     Deliver {
@@ -485,13 +490,16 @@ impl<S: Storage, M: StateMachine, T: PeerTransport> Driver<S, M, T> {
     }
 
     fn run(mut self, events: &Receiver<Event>) -> Stopped {
+        // An event pulled off the channel while gathering proposals, to be
+        // handled next.
+        let mut stashed = None;
         loop {
             let wait = soonest(self.election_deadline, self.heartbeat_deadline)
                 .map_or(Duration::from_millis(50), |deadline| {
                     deadline.saturating_duration_since(Instant::now())
                 });
 
-            let event = events.recv_timeout(wait);
+            let event = stashed.take().map_or_else(|| events.recv_timeout(wait), Ok);
             let now = Instant::now();
             match event {
                 Ok(Event::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
@@ -503,7 +511,8 @@ impl<S: Storage, M: StateMachine, T: PeerTransport> Driver<S, M, T> {
                     }
                 }
                 Ok(Event::Propose(command)) => {
-                    if let Err(fatal) = self.step(Input::Propose { command }, now) {
+                    let commands = drain_proposals(command, events, &mut stashed);
+                    if let Err(fatal) = self.step(Input::Propose { commands }, now) {
                         return Stopped::FatalStorage(fatal);
                     }
                 }
@@ -759,6 +768,29 @@ impl<S: Storage, M: StateMachine, T: PeerTransport> Driver<S, M, T> {
     }
 }
 
+/// Gathers `first` and every proposal queued straight behind it (up to
+/// [`MAX_PROPOSALS_PER_STEP`]) into one batch, in arrival order, without
+/// blocking. The first other event met is left in `stashed` so it is still
+/// handled, in order, right after the batch.
+fn drain_proposals(
+    first: Bytes,
+    events: &Receiver<Event>,
+    stashed: &mut Option<Event>,
+) -> Vec<Bytes> {
+    let mut commands = vec![first];
+    while commands.len() < MAX_PROPOSALS_PER_STEP {
+        match events.try_recv() {
+            Ok(Event::Propose(command)) => commands.push(command),
+            Ok(other) => {
+                *stashed = Some(other);
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    commands
+}
+
 fn soonest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
     [a, b].into_iter().flatten().min()
 }
@@ -774,12 +806,16 @@ mod tests {
     use std::error::Error as _;
     use std::io;
     use std::net::SocketAddr;
-    use std::sync::{Mutex, PoisonError, mpsc};
+    use std::sync::mpsc::{self, Receiver};
+    use std::sync::{Mutex, PoisonError};
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;
 
-    use super::{Config, Driver, NodeGone, PeerTransport, StartError, random_timeout, soonest};
+    use super::{
+        Config, Driver, Event, MAX_PROPOSALS_PER_STEP, NodeGone, PeerTransport, StartError,
+        drain_proposals, random_timeout, soonest,
+    };
     use crate::core::{ClusterConfig, Effect, Input, LogIndex, Message, NodeId, Term};
     use crate::statemachine::{RecordingStateMachine, StateMachine};
     use crate::storage::{self, MemStorage, Snapshot, SnapshotMeta};
@@ -883,6 +919,58 @@ mod tests {
             "deadline {:?} after `from`, outside [150ms, 300ms)",
             deadline.saturating_duration_since(from),
         );
+    }
+
+    // --- proposal batching ---------------------------------------------------
+
+    fn queue(events: Vec<Event>) -> Receiver<Event> {
+        let (tx, rx) = mpsc::channel();
+        for event in events {
+            tx.send(event)
+                .unwrap_or_else(|_| unreachable!("the receiver is alive"));
+        }
+        rx
+    }
+
+    fn cmd(command: &'static [u8]) -> Event {
+        Event::Propose(Bytes::from_static(command))
+    }
+
+    #[test]
+    fn queued_proposals_are_gathered_in_arrival_order() {
+        let events = queue(vec![cmd(b"b"), cmd(b"c")]);
+        let mut stashed = None;
+
+        let commands = drain_proposals(Bytes::from_static(b"a"), &events, &mut stashed);
+
+        assert_eq!(commands, [&b"a"[..], b"b", b"c"]);
+        assert!(stashed.is_none());
+    }
+
+    #[test]
+    fn gathering_stops_at_the_first_other_event_and_keeps_it() {
+        let events = queue(vec![cmd(b"b"), Event::Shutdown, cmd(b"c")]);
+        let mut stashed = None;
+
+        let commands = drain_proposals(Bytes::from_static(b"a"), &events, &mut stashed);
+
+        assert_eq!(commands, [&b"a"[..], b"b"]);
+        assert!(matches!(stashed, Some(Event::Shutdown)));
+        // The proposal behind it stays queued for a later batch.
+        assert!(matches!(events.try_recv(), Ok(Event::Propose(c)) if c == b"c"[..]));
+    }
+
+    #[test]
+    fn a_batch_stops_at_max_proposals_per_step() {
+        let queued: Vec<Event> = (0..MAX_PROPOSALS_PER_STEP).map(|_| cmd(b"x")).collect();
+        let events = queue(queued);
+        let mut stashed = None;
+
+        let commands = drain_proposals(Bytes::from_static(b"x"), &events, &mut stashed);
+
+        assert_eq!(commands.len(), MAX_PROPOSALS_PER_STEP);
+        assert!(stashed.is_none());
+        assert!(events.try_recv().is_ok(), "the overflow stays queued");
     }
 
     // --- timers --------------------------------------------------------------
@@ -1152,7 +1240,7 @@ mod tests {
         let now = Instant::now();
         let mut d = lone_leader(config(&[]).with_snapshot_threshold(3), now);
         let propose = |command: &'static [u8]| Input::Propose {
-            command: Bytes::from_static(command),
+            commands: vec![Bytes::from_static(command)],
         };
 
         step(&mut d, propose(b"a"), now);
