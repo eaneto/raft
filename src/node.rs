@@ -31,7 +31,7 @@ use rand::{Rng, SeedableRng};
 use crate::clock::{Clock, MonotonicClock};
 use crate::core::{
     ClusterConfig, Effect, Input, InstallSnapshotArgs, LogIndex, MembershipChange, Message, NodeId,
-    RaftNode,
+    RaftNode, ReplicationConfig,
 };
 use crate::statemachine::StateMachine;
 use crate::storage::{self, PersistentState, SnapshotMeta, Storage};
@@ -64,6 +64,8 @@ pub struct Config {
     /// Start as a passive non-voting learner (a brand-new node joining an
     /// existing cluster). Only takes effect when there is no recovered state.
     pub join_as_learner: bool,
+    /// How a leader streams its log to followers (pipelining limits).
+    pub replication: ReplicationConfig,
 }
 
 impl Config {
@@ -82,6 +84,7 @@ impl Config {
             snapshot_threshold: None,
             snapshot_chunk_size: 64 * 1024,
             join_as_learner: false,
+            replication: ReplicationConfig::default(),
         }
     }
 
@@ -460,7 +463,8 @@ impl<S: Storage, M: StateMachine, T: PeerTransport> Driver<S, M, T> {
                 snapshot_base,
                 entries,
             )
-        };
+        }
+        .with_replication(config.replication);
 
         let mut rng = StdRng::seed_from_u64(config.seed);
         let first_election = now + random_timeout(&mut rng, &config);
