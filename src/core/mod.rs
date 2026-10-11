@@ -832,13 +832,15 @@ pub enum Input {
         /// The message itself.
         message: Message,
     },
-    /// A client asks the cluster to append and eventually commit a command.
-    /// Only a leader acts on it, and not while it is transferring leadership;
-    /// anyone else currently drops it (redirecting the client to the leader is
-    /// future work).
+    /// Clients ask the cluster to append and eventually commit commands, in
+    /// order. Only a leader acts on it, and not while it is transferring
+    /// leadership; anyone else currently drops it (redirecting the client to
+    /// the leader is future work). A driver that hands over every proposal
+    /// queued since its last step pays one [`Effect::PersistLog`] (one
+    /// `fsync`) and one round of `AppendEntries` for the lot.
     Propose {
-        /// The opaque command bytes.
-        command: Bytes,
+        /// The opaque command bytes, one log entry each. Empty is a no-op.
+        commands: Vec<Bytes>,
     },
     /// The election timer expired: no leader contact within the randomized
     /// window the driver chose. A follower or candidate starts a new election.
@@ -1175,7 +1177,7 @@ impl RaftNode {
             },
             Input::ElectionTimeout => self.handle_election_timeout(),
             Input::HeartbeatTick => self.handle_heartbeat_tick(),
-            Input::Propose { command } => self.handle_propose(command),
+            Input::Propose { commands } => self.handle_propose(commands),
             Input::SnapshotInstalled {
                 last_included_index,
                 last_included_term,
@@ -2045,11 +2047,12 @@ impl RaftNode {
         self.replicate_to_peers(true)
     }
 
-    /// Handles a client proposal (Figure 2, "Clients of Raft").
+    /// Handles client proposals (Figure 2, "Clients of Raft").
     ///
-    /// Only a leader acts: it appends one entry for `command` at its current
-    /// term, makes the new tail durable with [`Effect::PersistLog`], then
-    /// sends every peer the entries it is missing. Any other role drops the
+    /// Only a leader acts: it appends one entry per command, in order, at its
+    /// current term, makes the new tail durable with a single
+    /// [`Effect::PersistLog`], then sends every peer the entries it is missing.
+    /// Any other role drops the
     /// proposal — redirecting the client to the leader is future work — and so
     /// does a leader transferring leadership (thesis §3.10), so the target can
     /// catch up with a log that has stopped growing.
@@ -2058,14 +2061,16 @@ impl RaftNode {
     /// on a multi-node cluster nothing is applied until the acks come back. A
     /// lone leader is its own majority, so `maybe_advance_commit_index` commits
     /// and applies the entry in this same step.
-    fn handle_propose(&mut self, command: Bytes) -> Vec<Effect> {
-        if !self.is_leader() || self.is_transferring() {
+    fn handle_propose(&mut self, commands: Vec<Bytes>) -> Vec<Effect> {
+        if !self.is_leader() || self.is_transferring() || commands.is_empty() {
             return Vec::new();
         }
 
         let from_index = self.log.last_index().next();
-        self.log
-            .append(LogEntry::command(self.current_term, command));
+        for command in commands {
+            self.log
+                .append(LogEntry::command(self.current_term, command));
+        }
 
         let mut effects = vec![Effect::PersistLog {
             from_index,
@@ -2765,7 +2770,7 @@ mod tests {
 
     fn propose(command: &'static [u8]) -> Input {
         Input::Propose {
-            command: Bytes::from_static(command),
+            commands: vec![Bytes::from_static(command)],
         }
     }
 
@@ -3831,6 +3836,39 @@ mod tests {
                 send(3, append_entries(1, 1, 1, 1, vec![entry(1)], 0)),
             ],
         );
+    }
+
+    #[test]
+    fn a_batch_of_proposals_is_persisted_and_sent_together() {
+        let mut n = acked_leader();
+
+        let effects = n.step(
+            Input::Propose {
+                commands: vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+            },
+            NOW,
+        );
+
+        let tail = vec![entry_cmd(1, b"a"), entry_cmd(1, b"b")];
+        assert_eq!(
+            effects,
+            vec![
+                Effect::PersistLog {
+                    from_index: LogIndex::new(1),
+                    entries: tail.clone(),
+                },
+                send(2, append_entries(1, 1, 0, 0, tail.clone(), 0)),
+                send(3, append_entries(1, 1, 0, 0, tail, 0)),
+            ],
+        );
+    }
+
+    #[test]
+    fn an_empty_proposal_is_a_no_op() {
+        let mut n = acked_leader();
+
+        assert!(n.step(Input::Propose { commands: vec![] }, NOW).is_empty());
+        assert!(n.log().is_empty());
     }
 
     #[test]
