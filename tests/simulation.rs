@@ -83,7 +83,6 @@ fn assert_proposals_replicate_and_commit(node_count: usize, seed: u64) {
     sim.run_until(sim.now + 1_000); // and a few heartbeats to carry commit
 
     let want: Vec<Bytes> = commands.iter().map(|c| Bytes::copy_from_slice(c)).collect();
-    let n = commands.len() as u64;
 
     let leader = sim.sole_leader();
     assert!(
@@ -92,6 +91,8 @@ fn assert_proposals_replicate_and_commit(node_count: usize, seed: u64) {
     );
     let leader = leader.unwrap_or(0);
     let leader_log = sim.nodes[leader].log().clone();
+    // Every command plus each leader's opening no-op: the whole log.
+    let n = leader_log.last_index().get();
 
     for i in 0..node_count {
         let node = &sim.nodes[i];
@@ -220,11 +221,13 @@ fn assert_partition_isolates_then_heals(seed: u64) {
     sim.run_until(sim.now + 400);
     sim.propose_to_leader(b"b");
     sim.run_until(sim.now + 600);
+    let pre_partition: Vec<Bytes> = vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")];
     assert_eq!(
-        sim.nodes[old_leader].commit_index().get(),
-        2,
+        sim.applied_commands(old_leader),
+        pre_partition,
         "seed={seed}: cluster did not commit the pre-partition writes",
     );
+    let committed_before = sim.nodes[old_leader].commit_index().get();
 
     // Cut the old leader and its next-door node off from the other three.
     let mut groups = vec![0usize; node_count];
@@ -240,7 +243,7 @@ fn assert_partition_isolates_then_heals(seed: u64) {
     sim.run_until(sim.now + 2_000);
     assert_eq!(
         sim.nodes[old_leader].commit_index().get(),
-        2,
+        committed_before,
         "seed={seed}: an isolated minority leader committed a write",
     );
 
@@ -260,8 +263,9 @@ fn assert_partition_isolates_then_heals(seed: u64) {
     sim.run_until(sim.now + 400);
     sim.propose_at(maj_leader, b"d");
     sim.run_until(sim.now + 1_000);
-    assert!(
-        sim.nodes[maj_leader].commit_index().get() >= 4,
+    assert_eq!(
+        sim.applied_commands(maj_leader).len(),
+        4,
         "seed={seed}: majority side failed to commit during the partition",
     );
 

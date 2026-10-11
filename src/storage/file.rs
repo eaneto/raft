@@ -488,7 +488,7 @@ fn frame_record(payload: &[u8]) -> Result<Vec<u8>, Error> {
 
 /// `[u64 LE term][u8 kind]` then, for a command (kind 0), `[u32 LE length]
 /// [command bytes]`; for a configuration (kind 1), `[u32 LE voter count]
-/// [u64 LE voter id]*count`.
+/// [u64 LE voter id]*count`; for a leader's no-op (kind 2), nothing.
 fn encode_entry(entry: &LogEntry) -> Result<Vec<u8>, Error> {
     let mut out = Vec::with_capacity(13);
     out.extend_from_slice(&entry.term.get().to_le_bytes());
@@ -512,6 +512,7 @@ fn encode_entry(entry: &LogEntry) -> Result<Vec<u8>, Error> {
                 out.extend_from_slice(&id.get().to_le_bytes());
             }
         }
+        LogEntryKind::Noop => out.push(2),
     }
     Ok(out)
 }
@@ -543,6 +544,7 @@ fn decode_entry(payload: &[u8]) -> Option<LogEntry> {
             }
             Some(LogEntry::config(term, ClusterConfig::new(voters)))
         }
+        2 if rest.is_empty() => Some(LogEntry::noop(term)),
         _ => None,
     }
 }
@@ -768,7 +770,10 @@ mod tests {
     use bytes::Bytes;
     use tempfile::{TempDir, tempdir};
 
-    use super::{DIR_SYNCS, FileStorage, encode_metadata, encode_snapshot, filesystem_of};
+    use super::{
+        DIR_SYNCS, FileStorage, decode_entry, encode_entry, encode_metadata, encode_snapshot,
+        filesystem_of,
+    };
     use crate::core::{ClusterConfig, LogEntry, LogIndex, NodeId, Term};
     use crate::storage::{Error, PersistentState, SnapshotMeta, Storage, crc32c};
 
@@ -1129,6 +1134,36 @@ not a mountinfo line
             Err(Error::Corrupt { .. }) => {}
             other => unreachable!("expected Corrupt, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_noop_log_entry_round_trips_across_a_reopen() {
+        let dir = scratch();
+        {
+            let mut store = ok(FileStorage::open(dir.path()));
+            ok(store.load());
+            ok(store.persist_log(
+                LogIndex::new(1),
+                &[entry(1, b"a"), LogEntry::noop(Term::new(2)), entry(2, b"c")],
+            ));
+        }
+
+        let state = reload(dir.path());
+        assert_eq!(
+            state.entries,
+            vec![entry(1, b"a"), LogEntry::noop(Term::new(2)), entry(2, b"c")],
+        );
+    }
+
+    #[test]
+    fn a_noop_record_with_trailing_bytes_does_not_decode() {
+        let Ok(mut payload) = encode_entry(&LogEntry::noop(Term::new(2))) else {
+            unreachable!("a no-op always encodes");
+        };
+        assert_eq!(decode_entry(&payload), Some(LogEntry::noop(Term::new(2))));
+
+        payload.push(0);
+        assert_eq!(decode_entry(&payload), None);
     }
 
     #[test]

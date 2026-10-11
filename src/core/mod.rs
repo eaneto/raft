@@ -277,6 +277,11 @@ pub enum LogEntryKind {
     Command(Bytes),
     /// A cluster configuration — a membership change.
     Config(ClusterConfig),
+    /// The empty entry a new leader appends at the start of its term (thesis
+    /// §6.4). Committing it is how the leader learns which entries are
+    /// committed: until an entry of its own term commits, its `commitIndex`
+    /// may lag the cluster's. Never handed to the application state machine.
+    Noop,
 }
 
 /// One entry in the replicated log: a payload together with the [`Term`] of the
@@ -303,6 +308,15 @@ impl LogEntry {
         }
     }
 
+    /// A new leader's empty entry at `term`.
+    #[must_use]
+    pub const fn noop(term: Term) -> Self {
+        Self {
+            term,
+            kind: LogEntryKind::Noop,
+        }
+    }
+
     /// A configuration entry for `config` at `term`.
     #[must_use]
     pub const fn config(term: Term, config: ClusterConfig) -> Self {
@@ -312,31 +326,33 @@ impl LogEntry {
         }
     }
 
-    /// The command bytes, or `None` for a configuration entry.
+    /// The command bytes, or `None` for a configuration or no-op entry.
     #[must_use]
     pub const fn command_bytes(&self) -> Option<&Bytes> {
         match &self.kind {
             LogEntryKind::Command(command) => Some(command),
-            LogEntryKind::Config(_) => None,
+            LogEntryKind::Config(_) | LogEntryKind::Noop => None,
         }
     }
 
-    /// The configuration, or `None` for a command entry.
+    /// The configuration, or `None` for a command or no-op entry.
     #[must_use]
     pub const fn as_config(&self) -> Option<&ClusterConfig> {
         match &self.kind {
             LogEntryKind::Config(config) => Some(config),
-            LogEntryKind::Command(_) => None,
+            LogEntryKind::Command(_) | LogEntryKind::Noop => None,
         }
     }
 
     /// The payload's size in bytes, as counted against
     /// [`ReplicationConfig::max_append_bytes`]: the command's length, or eight
-    /// bytes per voter for a configuration. Framing overhead is not counted.
+    /// bytes per voter for a configuration, nothing for a no-op. Framing
+    /// overhead is not counted.
     fn payload_len(&self) -> usize {
         match &self.kind {
             LogEntryKind::Command(command) => command.len(),
             LogEntryKind::Config(config) => config.len() * size_of::<u64>(),
+            LogEntryKind::Noop => 0,
         }
     }
 }
@@ -1767,6 +1783,7 @@ impl RaftNode {
             || self.is_transferring()
             || self.pending_change.is_some()
             || self.latest_config_index() > self.commit_index
+            || !self.committed_in_current_term()
         {
             return Vec::new();
         }
@@ -2322,7 +2339,27 @@ impl RaftNode {
         }
 
         self.become_leader();
-        self.replicate_to_peers(true)
+        // Open the term with a no-op (thesis §6.4): `next_index` was set just
+        // past the old log, so the opening heartbeats already carry it.
+        let from_index = self.log.last_index().next();
+        self.log.append(LogEntry::noop(self.current_term));
+        let mut effects = vec![Effect::PersistLog {
+            from_index,
+            entries: self.log.entries_from(from_index).to_vec(),
+        }];
+        effects.extend(self.replicate_to_peers(true));
+        // A single-server cluster commits it on the spot.
+        self.maybe_advance_commit_index(&mut effects);
+        effects
+    }
+
+    /// Whether an entry of `currentTerm` has committed — on a leader, its
+    /// opening no-op. Terms never decrease along the log and a leader's own
+    /// entries sit at its tail, so that is exactly when the entry at
+    /// `commitIndex` is from this term. Until then a new leader's
+    /// `commitIndex` may lag the cluster's.
+    fn committed_in_current_term(&self) -> bool {
+        self.log.term_at(self.commit_index) == Some(self.current_term)
     }
 
     /// If we are a pre-candidate whose straw poll has reached a quorum of "yes"
@@ -2742,6 +2779,10 @@ mod tests {
 
     fn entry(term: u64) -> LogEntry {
         LogEntry::command(Term::new(term), Bytes::from_static(b"cmd"))
+    }
+
+    fn noop(term: u64) -> LogEntry {
+        LogEntry::noop(Term::new(term))
     }
 
     fn entry_cmd(term: u64, command: &'static [u8]) -> LogEntry {
@@ -3623,37 +3664,46 @@ mod tests {
         assert_eq!(
             effects,
             vec![
-                // Pre-vote reset, then the real election's persist + reset.
+                // Pre-vote reset, then the real election's persist + reset,
+                // then the opening no-op, which commits on the spot.
                 Effect::ResetElectionTimer,
                 Effect::Persist {
                     current_term: Term::new(1),
                     voted_for: Some(NodeId::new(1)),
                 },
                 Effect::ResetElectionTimer,
+                Effect::PersistLog {
+                    from_index: LogIndex::new(1),
+                    entries: vec![noop(1)],
+                },
             ],
         );
+        assert_eq!(n.commit_index(), LogIndex::new(1));
+        // The no-op is not the application's: nothing is applied.
+        assert_eq!(n.last_applied(), LogIndex::new(1));
     }
 
     #[test]
-    fn candidate_wins_on_a_quorum_and_sends_heartbeats() {
+    fn candidate_wins_on_a_quorum_and_opens_its_term_with_a_noop() {
         let mut n = node(1, &[2, 3]);
         time_out(&mut n);
 
         let effects = n.step(deliver(2, vote_reply(1, true)), NOW);
 
         assert!(n.is_leader());
-        let heartbeat = |to: u64| Effect::SendRpc {
-            to: NodeId::new(to),
-            message: Message::AppendEntries(AppendEntriesArgs {
-                term: Term::new(1),
-                leader_id: NodeId::new(1),
-                prev_log_index: LogIndex::ZERO,
-                prev_log_term: Term::ZERO,
-                entries: Vec::new(),
-                leader_commit: LogIndex::ZERO,
-            }),
-        };
-        assert_eq!(effects, vec![heartbeat(2), heartbeat(3)]);
+        assert_eq!(
+            effects,
+            vec![
+                Effect::PersistLog {
+                    from_index: LogIndex::new(1),
+                    entries: vec![noop(1)],
+                },
+                send(2, append_entries(1, 1, 0, 0, vec![noop(1)], 0)),
+                send(3, append_entries(1, 1, 0, 0, vec![noop(1)], 0)),
+            ],
+        );
+        // Not committed until a peer acks it.
+        assert_eq!(n.commit_index(), LogIndex::ZERO);
     }
 
     #[test]
@@ -3995,18 +4045,14 @@ mod tests {
 
         let effects = n.step(Input::HeartbeatTick, NOW);
 
-        let beat = |to: u64| Effect::SendRpc {
-            to: NodeId::new(to),
-            message: Message::AppendEntries(AppendEntriesArgs {
-                term: Term::new(1),
-                leader_id: NodeId::new(1),
-                prev_log_index: LogIndex::ZERO,
-                prev_log_term: Term::ZERO,
-                entries: Vec::new(),
-                leader_commit: LogIndex::ZERO,
-            }),
-        };
-        assert_eq!(effects, vec![beat(2), beat(3)]);
+        // Nobody has acked the opening no-op yet, so the beat carries it again.
+        assert_eq!(
+            effects,
+            vec![
+                send(2, append_entries(1, 1, 0, 0, vec![noop(1)], 0)),
+                send(3, append_entries(1, 1, 0, 0, vec![noop(1)], 0)),
+            ],
+        );
     }
 
     #[test]
@@ -4030,15 +4076,16 @@ mod tests {
         assert!(n.log().is_empty());
     }
 
-    /// Node 1 of {1, 2, 3}, leader for term 1 with an empty log, whose
-    /// opening heartbeats both peers have acked — so both are streaming
-    /// ([`Flow::Replicate`]) with nothing in flight.
+    /// Node 1 of {1, 2, 3}, leader for term 1 whose log is just its opening
+    /// no-op at index 1, which both peers have acked — so it is committed and
+    /// both peers are streaming ([`Flow::Replicate`]) with nothing in flight.
     fn acked_leader() -> RaftNode {
         let mut n = node(1, &[2, 3]);
         time_out(&mut n);
         drive(&mut n, deliver(2, vote_reply(1, true)));
-        drive(&mut n, deliver(2, ae_reply(1, true, 0)));
-        drive(&mut n, deliver(3, ae_reply(1, true, 0)));
+        drive(&mut n, deliver(2, ae_reply(1, true, 1)));
+        drive(&mut n, deliver(3, ae_reply(1, true, 1)));
+        assert_eq!(n.commit_index(), LogIndex::new(1));
         assert!(n.is_leader());
         n
     }
@@ -4049,19 +4096,19 @@ mod tests {
 
         let effects = n.step(propose(b"cmd"), NOW);
 
-        assert_eq!(n.log().len(), 1);
-        assert_eq!(n.log().get(LogIndex::new(1)), Some(&entry(1)));
+        assert_eq!(n.log().len(), 2);
+        assert_eq!(n.log().get(LogIndex::new(2)), Some(&entry(1)));
 
         let tail = vec![entry(1)];
         assert_eq!(
             effects,
             vec![
                 Effect::PersistLog {
-                    from_index: LogIndex::new(1),
+                    from_index: LogIndex::new(2),
                     entries: tail.clone(),
                 },
-                send(2, append_entries(1, 1, 0, 0, tail.clone(), 0)),
-                send(3, append_entries(1, 1, 0, 0, tail, 0)),
+                send(2, append_entries(1, 1, 1, 1, tail.clone(), 1)),
+                send(3, append_entries(1, 1, 1, 1, tail, 1)),
             ],
         );
     }
@@ -4090,20 +4137,20 @@ mod tests {
         let effects = n.step(propose(b"cmd"), NOW);
 
         // No ack has come back, but both peers are streaming: the first batch
-        // already moved `next_index` to 2, so the second carries only the new
-        // entry, anchored on the first. Nothing commits — the leader is one of
-        // three.
-        assert_eq!(n.log().len(), 2);
-        assert_eq!(n.commit_index(), LogIndex::ZERO);
+        // already moved `next_index` to 3, so the second carries only the new
+        // entry, anchored on the first. Nothing new commits — the leader is
+        // one of three.
+        assert_eq!(n.log().len(), 3);
+        assert_eq!(n.commit_index(), LogIndex::new(1));
         assert_eq!(
             effects,
             vec![
                 Effect::PersistLog {
-                    from_index: LogIndex::new(2),
+                    from_index: LogIndex::new(3),
                     entries: vec![entry(1)],
                 },
-                send(2, append_entries(1, 1, 1, 1, vec![entry(1)], 0)),
-                send(3, append_entries(1, 1, 1, 1, vec![entry(1)], 0)),
+                send(2, append_entries(1, 1, 2, 1, vec![entry(1)], 1)),
+                send(3, append_entries(1, 1, 2, 1, vec![entry(1)], 1)),
             ],
         );
     }
@@ -4124,11 +4171,11 @@ mod tests {
             effects,
             vec![
                 Effect::PersistLog {
-                    from_index: LogIndex::new(1),
+                    from_index: LogIndex::new(2),
                     entries: tail.clone(),
                 },
-                send(2, append_entries(1, 1, 0, 0, tail.clone(), 0)),
-                send(3, append_entries(1, 1, 0, 0, tail, 0)),
+                send(2, append_entries(1, 1, 1, 1, tail.clone(), 1)),
+                send(3, append_entries(1, 1, 1, 1, tail, 1)),
             ],
         );
     }
@@ -4138,7 +4185,7 @@ mod tests {
         let mut n = acked_leader();
 
         assert!(n.step(Input::Propose { commands: vec![] }, NOW).is_empty());
-        assert!(n.log().is_empty());
+        assert_eq!(n.log().len(), 1); // just the opening no-op
     }
 
     #[test]
@@ -4155,7 +4202,7 @@ mod tests {
         assert_eq!(
             effects,
             vec![Effect::PersistLog {
-                from_index: LogIndex::new(1),
+                from_index: LogIndex::new(2),
                 entries: vec![entry(1)],
             }],
         );
@@ -4226,13 +4273,13 @@ mod tests {
         drive(&mut n, propose(b"cmd"));
         drive(&mut n, propose(b"cmd"));
 
-        assert_eq!(progress_of(&n, 2).next_index, LogIndex::new(3));
-        assert_eq!(progress_of(&n, 2).flow, streaming(&[1, 2]));
+        assert_eq!(progress_of(&n, 2).next_index, LogIndex::new(4));
+        assert_eq!(progress_of(&n, 2).flow, streaming(&[2, 3]));
 
         // An ack frees exactly the batches it covers.
-        drive(&mut n, deliver(2, ae_reply(1, true, 1)));
-        assert_eq!(progress_of(&n, 2).match_index, LogIndex::new(1));
-        assert_eq!(progress_of(&n, 2).flow, streaming(&[2]));
+        drive(&mut n, deliver(2, ae_reply(1, true, 2)));
+        assert_eq!(progress_of(&n, 2).match_index, LogIndex::new(2));
+        assert_eq!(progress_of(&n, 2).flow, streaming(&[3]));
     }
 
     #[test]
@@ -4241,20 +4288,21 @@ mod tests {
         drive(&mut n, propose(b"cmd"));
         drive(&mut n, propose(b"cmd"));
 
-        // Two batches in flight: the third entry is persisted but not sent.
+        // Two batches in flight: the third proposal is persisted but not sent.
         let effects = n.step(propose(b"cmd"), NOW);
         assert!(
             !effects.iter().any(|e| matches!(e, Effect::SendRpc { .. })),
             "sent past a full window: {effects:?}",
         );
 
-        // Node 2 acks the first batch; the freed slot carries entry 3 at once.
-        let effects = rpcs(n.step(deliver(2, ae_reply(1, true, 1)), NOW));
+        // Node 2 acks the first batch (committing it); the freed slot carries
+        // entry 4 at once.
+        let effects = rpcs(n.step(deliver(2, ae_reply(1, true, 2)), NOW));
         assert_eq!(
             effects,
-            vec![send(2, append_entries(1, 1, 2, 1, vec![entry(1)], 1))],
+            vec![send(2, append_entries(1, 1, 3, 1, vec![entry(1)], 2))],
         );
-        assert_eq!(progress_of(&n, 2).flow, streaming(&[2, 3]));
+        assert_eq!(progress_of(&n, 2).flow, streaming(&[3, 4]));
     }
 
     #[test]
@@ -4264,13 +4312,13 @@ mod tests {
         drive(&mut n, propose(b"cmd"));
         drive(&mut n, propose(b"cmd"));
 
-        let effects = rpcs(n.step(deliver(2, ae_reply(1, true, 1)), NOW));
+        let effects = rpcs(n.step(deliver(2, ae_reply(1, true, 2)), NOW));
 
         assert_eq!(
             effects,
             vec![send(
                 2,
-                append_entries(1, 1, 1, 1, vec![entry(1), entry(1)], 1)
+                append_entries(1, 1, 2, 1, vec![entry(1), entry(1)], 2)
             )],
         );
     }
@@ -4330,12 +4378,13 @@ mod tests {
 
         let effects = n.step(Input::HeartbeatTick, NOW);
 
-        // "cmd" is three bytes, so each batch holds one entry.
+        // "cmd" is three bytes, so a batch holds the (empty) no-op and one
+        // command.
         assert_eq!(
             effects,
             vec![
-                send(2, append_entries(1, 1, 0, 0, vec![entry(1)], 0)),
-                send(3, append_entries(1, 1, 0, 0, vec![entry(1)], 0)),
+                send(2, append_entries(1, 1, 0, 0, vec![noop(1), entry(1)], 0)),
+                send(3, append_entries(1, 1, 0, 0, vec![noop(1), entry(1)], 0)),
             ],
         );
     }
@@ -4346,21 +4395,21 @@ mod tests {
         for _ in 0..5 {
             drive(&mut n, propose(b"cmd"));
         }
-        // Entries 1 and 2 went out one per batch; 3, 4 and 5 are held.
-        assert_eq!(progress_of(&n, 2).flow, streaming(&[1, 2]));
+        // Entries 2 and 3 went out one per batch; 4, 5 and 6 are held.
+        assert_eq!(progress_of(&n, 2).flow, streaming(&[2, 3]));
 
-        let effects = rpcs(n.step(deliver(2, ae_reply(1, true, 2)), NOW));
+        let effects = rpcs(n.step(deliver(2, ae_reply(1, true, 3)), NOW));
 
-        // Both slots free up: two one-entry batches, and entry 5 waits.
+        // Both slots free up: two one-entry batches, and entry 6 waits.
         assert_eq!(
             effects,
             vec![
-                send(2, append_entries(1, 1, 2, 1, vec![entry(1)], 2)),
-                send(2, append_entries(1, 1, 3, 1, vec![entry(1)], 2)),
+                send(2, append_entries(1, 1, 3, 1, vec![entry(1)], 3)),
+                send(2, append_entries(1, 1, 4, 1, vec![entry(1)], 3)),
             ],
         );
-        assert_eq!(progress_of(&n, 2).flow, streaming(&[3, 4]));
-        assert_eq!(progress_of(&n, 2).next_index, LogIndex::new(5));
+        assert_eq!(progress_of(&n, 2).flow, streaming(&[4, 5]));
+        assert_eq!(progress_of(&n, 2).next_index, LogIndex::new(6));
     }
 
     #[test]
@@ -4372,8 +4421,8 @@ mod tests {
         assert_eq!(
             effects,
             vec![
-                send(2, append_entries(1, 1, 0, 0, vec![entry(1)], 0)),
-                send(3, append_entries(1, 1, 0, 0, vec![entry(1)], 0)),
+                send(2, append_entries(1, 1, 1, 1, vec![entry(1)], 1)),
+                send(3, append_entries(1, 1, 1, 1, vec![entry(1)], 1)),
             ],
         );
     }
@@ -4386,13 +4435,13 @@ mod tests {
 
         let effects = n.step(Input::HeartbeatTick, NOW);
 
-        // Anchored on entry 1, the last one sent: a peer that lost it rejects,
+        // Anchored on entry 2, the last one sent: a peer that lost it rejects,
         // and the rejection makes the leader resend.
         assert_eq!(
             effects,
             vec![
-                send(2, append_entries(1, 1, 1, 1, vec![], 0)),
-                send(3, append_entries(1, 1, 1, 1, vec![], 0)),
+                send(2, append_entries(1, 1, 2, 1, vec![], 1)),
+                send(3, append_entries(1, 1, 2, 1, vec![], 1)),
             ],
         );
     }
@@ -4401,33 +4450,33 @@ mod tests {
     fn a_heartbeat_to_a_caught_up_streaming_peer_is_empty() {
         let mut n = acked_leader();
         drive(&mut n, propose(b"cmd"));
-        drive(&mut n, deliver(2, ae_reply(1, true, 1)));
+        drive(&mut n, deliver(2, ae_reply(1, true, 2)));
 
         let effects = n.step(Input::HeartbeatTick, NOW);
 
-        assert!(effects.contains(&send(2, append_entries(1, 1, 1, 1, vec![], 1))));
+        assert!(effects.contains(&send(2, append_entries(1, 1, 2, 1, vec![], 2))));
     }
 
     #[test]
     fn a_rejection_while_streaming_resends_from_just_past_match_index() {
         let mut n = acked_leader();
         drive(&mut n, propose(b"cmd"));
-        drive(&mut n, deliver(2, ae_reply(1, true, 1)));
+        drive(&mut n, deliver(2, ae_reply(1, true, 2)));
         drive(&mut n, propose(b"cmd"));
         drive(&mut n, propose(b"cmd"));
-        assert_eq!(progress_of(&n, 2).next_index, LogIndex::new(4));
+        assert_eq!(progress_of(&n, 2).next_index, LogIndex::new(5));
 
-        // Node 2 lost both batches and rejected a heartbeat anchored at 3.
+        // Node 2 lost both batches and rejected a heartbeat anchored at 4.
         let effects = n.step(deliver(2, ae_reply(1, false, 0)), NOW);
 
         assert_eq!(
             effects,
             vec![send(
                 2,
-                append_entries(1, 1, 1, 1, vec![entry(1), entry(1)], 1)
+                append_entries(1, 1, 2, 1, vec![entry(1), entry(1)], 2)
             )],
         );
-        assert_eq!(progress_of(&n, 2).next_index, LogIndex::new(2));
+        assert_eq!(progress_of(&n, 2).next_index, LogIndex::new(3));
         assert_eq!(progress_of(&n, 2).flow, Flow::Probe { paused: true });
     }
 
@@ -4435,18 +4484,18 @@ mod tests {
     fn a_probe_steps_back_past_match_index_for_a_peer_that_lost_its_log() {
         let mut n = acked_leader();
         drive(&mut n, propose(b"cmd"));
-        drive(&mut n, deliver(2, ae_reply(1, true, 1)));
-        drive(&mut n, deliver(2, ae_reply(1, false, 0))); // now probing from 2
+        drive(&mut n, deliver(2, ae_reply(1, true, 2)));
+        drive(&mut n, deliver(2, ae_reply(1, false, 0))); // now probing from 3
 
-        // Node 2 was wiped and rejects again: the probe goes back over entry 1
+        // Node 2 was wiped and rejects again: the probe goes back over entry 2
         // even though node 2 once acked it, and resends it.
         let effects = n.step(deliver(2, ae_reply(1, false, 0)), NOW);
 
         assert_eq!(
             effects,
-            vec![send(2, append_entries(1, 1, 0, 0, vec![entry(1)], 1))],
+            vec![send(2, append_entries(1, 1, 1, 1, vec![entry(1)], 2))],
         );
-        assert_eq!(progress_of(&n, 2).next_index, LogIndex::new(1));
+        assert_eq!(progress_of(&n, 2).next_index, LogIndex::new(2));
     }
 
     #[test]
@@ -4472,8 +4521,8 @@ mod tests {
         assert_eq!(
             effects,
             vec![
-                send(2, append_entries(1, 1, 0, 0, vec![entry(1)], 0)),
-                send(3, append_entries(1, 1, 0, 0, vec![entry(1)], 0)),
+                send(2, append_entries(1, 1, 0, 0, vec![noop(1), entry(1)], 0)),
+                send(3, append_entries(1, 1, 0, 0, vec![noop(1), entry(1)], 0)),
             ],
         );
     }
@@ -4638,15 +4687,16 @@ mod tests {
         drive(&mut n, propose(b"x"));
         assert_eq!(n.commit_index(), LogIndex::ZERO); // leader alone: not yet
 
-        let effects = n.step(deliver(2, ae_reply(1, true, 1)), NOW);
+        let effects = n.step(deliver(2, ae_reply(1, true, 2)), NOW);
 
-        // Peer 2 plus the leader is a majority of three.
-        assert_eq!(n.commit_index(), LogIndex::new(1));
-        assert_eq!(n.last_applied(), LogIndex::new(1));
+        // Peer 2 plus the leader is a majority of three: the no-op and "x"
+        // commit, and only "x" is applied.
+        assert_eq!(n.commit_index(), LogIndex::new(2));
+        assert_eq!(n.last_applied(), LogIndex::new(2));
         assert_eq!(
             effects,
             vec![Effect::ApplyToStateMachine {
-                index: LogIndex::new(1),
+                index: LogIndex::new(2),
                 command: Bytes::from_static(b"x"),
             }],
         );
@@ -4656,7 +4706,7 @@ mod tests {
     fn a_failed_ack_backs_off_next_index_and_retries_immediately() {
         let mut n = node(1, &[2, 3]);
         // Two entries already on this node before it wins, so as leader its
-        // `next_index` for every peer starts at 3.
+        // `next_index` for every peer starts at 3, where its no-op goes.
         n.log.append(entry(1));
         n.log.append(entry(1));
         n.current_term = Term::new(1);
@@ -4668,7 +4718,10 @@ mod tests {
         // next_index[2] 3 -> 2: retry anchors at index 1, carrying index 2 on.
         assert_eq!(
             effects,
-            vec![send(2, append_entries(2, 1, 1, 1, vec![entry(1)], 0))],
+            vec![send(
+                2,
+                append_entries(2, 1, 1, 1, vec![entry(1), noop(2)], 0)
+            )],
         );
 
         // A second failure walks it back once more: anchor at 0, whole log.
@@ -4677,7 +4730,7 @@ mod tests {
             effects,
             vec![send(
                 2,
-                append_entries(2, 1, 0, 0, vec![entry(1), entry(1)], 0)
+                append_entries(2, 1, 0, 0, vec![entry(1), entry(1), noop(2)], 0)
             )],
         );
     }
@@ -4736,48 +4789,47 @@ mod tests {
         // earlier term's entry by count alone (paper Figure 8).
         let effects = n.step(deliver(2, ae_reply(2, true, 1)), NOW);
         assert_eq!(n.commit_index(), LogIndex::ZERO);
-        assert!(effects.is_empty());
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::ApplyToStateMachine { .. })),
+            "applied an uncommitted entry: {effects:?}",
+        );
 
-        // A current-term entry at index 2 now reaches a majority.
-        drive(&mut n, propose(b"new"));
+        // The leader's own no-op at index 2 now reaches a majority.
         let effects = n.step(deliver(2, ae_reply(2, true, 2)), NOW);
 
-        // Committing index 2 carries index 1 with it, applied in order.
+        // Committing index 2 carries index 1 with it; the no-op itself is not
+        // the application's.
         assert_eq!(n.commit_index(), LogIndex::new(2));
         assert_eq!(n.last_applied(), LogIndex::new(2));
         assert_eq!(
             effects,
-            vec![
-                Effect::ApplyToStateMachine {
-                    index: LogIndex::new(1),
-                    command: Bytes::from_static(b"old"),
-                },
-                Effect::ApplyToStateMachine {
-                    index: LogIndex::new(2),
-                    command: Bytes::from_static(b"new"),
-                },
-            ],
+            vec![Effect::ApplyToStateMachine {
+                index: LogIndex::new(1),
+                command: Bytes::from_static(b"old"),
+            }],
         );
     }
 
     #[test]
     fn a_lone_leader_commits_and_applies_a_proposal_in_one_step() {
         let mut n = node(1, &[]);
-        time_out(&mut n); // sole vote -> leader, term 1
+        time_out(&mut n); // sole vote -> leader, term 1, no-op committed
 
         let effects = n.step(propose(b"solo"), NOW);
 
-        assert_eq!(n.commit_index(), LogIndex::new(1));
-        assert_eq!(n.last_applied(), LogIndex::new(1));
+        assert_eq!(n.commit_index(), LogIndex::new(2));
+        assert_eq!(n.last_applied(), LogIndex::new(2));
         assert_eq!(
             effects,
             vec![
                 Effect::PersistLog {
-                    from_index: LogIndex::new(1),
+                    from_index: LogIndex::new(2),
                     entries: vec![entry_cmd(1, b"solo")],
                 },
                 Effect::ApplyToStateMachine {
-                    index: LogIndex::new(1),
+                    index: LogIndex::new(2),
                     command: Bytes::from_static(b"solo"),
                 },
             ],
@@ -4786,8 +4838,9 @@ mod tests {
 
     // --- 8: snapshotting / InstallSnapshot ------------------------------------
 
-    /// Arranges `n` as leader for term 2 with a five-entry term-1 log, then
-    /// compacts it up to `up_to` so the compaction base is non-zero.
+    /// Arranges `n` as leader for term 2 with a five-entry term-1 log (plus
+    /// its term-2 no-op at index 6), then compacts it up to `up_to` so the
+    /// compaction base is non-zero.
     fn leader_with_compacted_log(up_to: u64) -> RaftNode {
         let mut n = node(1, &[2, 3]);
         for _ in 0..5 {
@@ -5111,7 +5164,7 @@ mod tests {
         assert!(effects.contains(&Effect::SendSnapshot { to: NodeId::new(3) }));
     }
 
-    /// A term-2 leader with entries 1–3 compacted (of 5) whose peer 3 has
+    /// A term-2 leader with entries 1–3 compacted (of 6) whose peer 3 has
     /// just been sent the snapshot by a heartbeat, with a retry budget of
     /// `retry_ticks`.
     fn leader_awaiting_a_snapshot_ack(retry_ticks: u32) -> RaftNode {
@@ -5166,10 +5219,10 @@ mod tests {
             effects,
             vec![send(
                 3,
-                append_entries(2, 1, 3, 1, vec![entry(1), entry(1)], 5)
+                append_entries(2, 1, 3, 1, vec![entry(1), entry(1), noop(2)], 5)
             )],
         );
-        assert_eq!(progress_of(&n, 3).flow, streaming(&[5]));
+        assert_eq!(progress_of(&n, 3).flow, streaming(&[6]));
     }
 
     #[test]
@@ -5210,13 +5263,17 @@ mod tests {
 
         let effects = n.step(deliver(2, snapshot_reply_msg(2, 4)), NOW);
 
-        // Entry 5, the only one past the snapshot, is streamed straight after.
+        // Entry 5 and the leader's no-op, all that is past the snapshot, are
+        // streamed straight after.
         assert_eq!(
             effects,
-            vec![send(2, append_entries(2, 1, 4, 1, vec![entry(1)], 5))],
+            vec![send(
+                2,
+                append_entries(2, 1, 4, 1, vec![entry(1), noop(2)], 5)
+            )],
         );
         if let Role::Leader { progress, .. } = n.role() {
-            assert_eq!(progress[&NodeId::new(2)].next_index, LogIndex::new(6));
+            assert_eq!(progress[&NodeId::new(2)].next_index, LogIndex::new(7));
             assert_eq!(progress[&NodeId::new(2)].match_index, LogIndex::new(4));
         } else {
             unreachable!("still a leader");
@@ -5408,13 +5465,13 @@ mod tests {
 
     // --- 10: single-server membership changes -----------------------------
 
-    /// A three-node leader for term 2 with one committed command at index 1.
+    /// A three-node leader for term 2 whose opening no-op, at index 1, is
+    /// committed — so it may start a membership change.
     fn three_node_leader() -> RaftNode {
         let mut n = node(1, &[2, 3]);
         n.current_term = Term::new(1);
         time_out(&mut n); // term 2, candidate
         drive(&mut n, deliver(2, vote_reply(2, true))); // leader, term 2
-        drive(&mut n, propose(b"c0"));
         drive(&mut n, deliver(2, ae_reply(2, true, 1))); // commit index 1
         assert_eq!(n.commit_index(), LogIndex::new(1));
         n
@@ -5458,6 +5515,34 @@ mod tests {
         drive(&mut n, deliver(4, ae_reply(2, true, config_index)));
     }
 
+    /// The single-server membership bug (Ongaro, raft-dev 2015): a leader
+    /// whose predecessor left an uncommitted config entry on a minority could
+    /// otherwise append a change whose majority does not overlap that one's.
+    /// The fix is to change membership only once an entry of the leader's own
+    /// term — its opening no-op — has committed.
+    #[test]
+    fn a_new_leader_changes_membership_only_once_its_noop_commits() {
+        let mut n = node(1, &[2, 3]);
+        n.current_term = Term::new(1);
+        time_out(&mut n); // term 2, candidate
+        drive(&mut n, deliver(2, vote_reply(2, true))); // leader, term 2
+
+        let remove = change(MembershipChange::RemoveServer(NodeId::new(3)));
+        assert!(n.step(remove.clone(), NOW).is_empty());
+        assert_eq!(n.config().len(), 3);
+        assert!(n.pending_change.is_none());
+
+        drive(&mut n, deliver(2, ae_reply(2, true, 1))); // the no-op commits
+        let effects = n.step(remove, NOW);
+
+        assert_eq!(n.config().len(), 2);
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::PersistLog { .. }))
+        );
+    }
+
     #[test]
     fn remove_server_appends_a_config_entry_immediately() {
         let mut n = node(1, &[2, 3, 4, 5]);
@@ -5466,6 +5551,9 @@ mod tests {
         drive(&mut n, deliver(2, vote_reply(2, true)));
         drive(&mut n, deliver(3, vote_reply(2, true)));
         assert!(n.is_leader());
+        // Two acks of the opening no-op commit it: a quorum of five.
+        drive(&mut n, deliver(2, ae_reply(2, true, 1)));
+        drive(&mut n, deliver(3, ae_reply(2, true, 1)));
 
         let effects = n.step(change(MembershipChange::RemoveServer(NodeId::new(5))), NOW);
 
@@ -5856,10 +5944,7 @@ mod tests {
 
         assert_eq!(
             effects,
-            vec![send(
-                3,
-                append_entries(2, 1, 0, 0, vec![entry_cmd(2, b"c0")], 1)
-            )],
+            vec![send(3, append_entries(2, 1, 0, 0, vec![noop(2)], 1))],
         );
         assert!(n.is_transferring());
     }
@@ -5909,13 +5994,22 @@ mod tests {
 
     #[test]
     fn an_install_snapshot_reply_can_complete_the_catch_up() {
-        let mut n = leader_with_compacted_log(5); // whole log is the snapshot
+        let mut n = leader_with_compacted_log(5);
+        // Fold the no-op in too, so the whole log is the snapshot.
+        n.commit_index = LogIndex::new(6);
+        n.last_applied = LogIndex::new(6);
+        drive(
+            &mut n,
+            Input::CompactLog {
+                up_to_index: LogIndex::new(6),
+            },
+        );
         if let Role::Leader { progress, .. } = &mut n.role {
             progress.insert(NodeId::new(2), Progress::new(LogIndex::new(1)));
         }
         drive(&mut n, transfer_to(2));
 
-        let effects = n.step(deliver(2, snapshot_reply_msg(2, 5)), NOW);
+        let effects = n.step(deliver(2, snapshot_reply_msg(2, 6)), NOW);
 
         assert!(effects.contains(&timeout_now(2, 2, 1)));
     }
