@@ -329,6 +329,16 @@ impl LogEntry {
             LogEntryKind::Command(_) => None,
         }
     }
+
+    /// The payload's size in bytes, as counted against
+    /// [`ReplicationConfig::max_append_bytes`]: the command's length, or eight
+    /// bytes per voter for a configuration. Framing overhead is not counted.
+    fn payload_len(&self) -> usize {
+        match &self.kind {
+            LogEntryKind::Command(command) => command.len(),
+            LogEntryKind::Config(config) => config.len() * size_of::<u64>(),
+        }
+    }
 }
 
 /// The replicated log.
@@ -492,6 +502,24 @@ impl Log {
             .saturating_sub(self.snapshot_last_index.get() + 1);
         let start = usize::try_from(start).unwrap_or(usize::MAX);
         self.entries.get(start..).unwrap_or(&[])
+    }
+
+    /// The last index of an `AppendEntries` batch starting at `index`: as many
+    /// entries as fit in `max_bytes` of payload, but always at least one, so
+    /// an entry larger than the cap still goes out on its own. `index.prev()`
+    /// (an empty batch) when there is nothing at or past `index`.
+    fn batch_end(&self, index: LogIndex, max_bytes: usize) -> LogIndex {
+        let mut bytes = 0usize;
+        let mut count = 0u64;
+        for entry in self.entries_from(index) {
+            let size = entry.payload_len();
+            if count > 0 && bytes.saturating_add(size) > max_bytes {
+                break;
+            }
+            bytes = bytes.saturating_add(size);
+            count += 1;
+        }
+        LogIndex::new(index.get() + count).prev()
     }
 
     /// Appends one entry to the end of the log.
@@ -658,11 +686,18 @@ pub struct ReplicationConfig {
     /// The most `AppendEntries` batches a leader keeps unacknowledged per peer
     /// while pipelining (see [`Flow::Replicate`]). Values below 1 act as 1.
     pub max_inflight: usize,
+    /// The most entry payload, in bytes, one `AppendEntries` carries (see
+    /// [`LogEntry`]'s payload sizes). A single entry larger than this is still
+    /// sent, alone, so no entry can stall replication.
+    pub max_append_bytes: usize,
 }
 
 impl Default for ReplicationConfig {
     fn default() -> Self {
-        Self { max_inflight: 8 }
+        Self {
+            max_inflight: 8,
+            max_append_bytes: 1024 * 1024,
+        }
     }
 }
 
@@ -1656,7 +1691,7 @@ impl RaftNode {
                         ticks_left: CATCH_UP_TICKS,
                     },
                 });
-                self.replicate_to(id, true).into_iter().collect()
+                self.replicate_to(id, true)
             }
             MembershipChange::RemoveServer(id) => {
                 if !self.config.contains(id) {
@@ -1691,7 +1726,7 @@ impl RaftNode {
             });
         }
         self.timeout_now_if_caught_up(target).map_or_else(
-            || self.replicate_to(target, true).into_iter().collect(),
+            || self.replicate_to(target, true),
             |timeout_now| vec![timeout_now],
         )
     }
@@ -2237,77 +2272,91 @@ impl RaftNode {
         };
         peers
             .into_iter()
-            .filter_map(|peer| self.replicate_to(peer, force))
+            .flat_map(|peer| self.replicate_to(peer, force))
             .collect()
     }
 
-    /// Builds the replication effect for one peer, if its flow control allows
-    /// one, and records the send in its [`Progress`].
+    /// Builds the replication effects for one peer that its flow control
+    /// allows, and records the sends in its [`Progress`].
     ///
     /// If the peer's `next_index` still points into the log, that is an
     /// `AppendEntries`: the entry just before `next_index` is the §5.3
-    /// consistency-check anchor (`prev_log_index` / `prev_log_term`), and
-    /// everything from `next_index` to the end of the log rides along as
-    /// `entries`. If `next_index` has fallen to or below the compaction base,
-    /// the leader no longer has `prev_log_term`, so it sends the snapshot
-    /// instead ([`Effect::SendSnapshot`]).
+    /// consistency-check anchor (`prev_log_index` / `prev_log_term`), and the
+    /// entries from `next_index` on ride along as `entries`, up to
+    /// [`ReplicationConfig::max_append_bytes`] of them. If `next_index` has
+    /// fallen to or below the compaction base, the leader no longer has
+    /// `prev_log_term`, so it sends the snapshot instead
+    /// ([`Effect::SendSnapshot`]).
     ///
-    /// Without `force`, nothing is sent to a [`Flow::Probe`] peer that is
-    /// waiting on a reply, nor to a [`Flow::Replicate`] peer with nothing new
-    /// or no room in its window. With `force` such a peer still gets an
-    /// `AppendEntries` — an empty heartbeat in the `Replicate` case — so a
-    /// heartbeat always goes out.
-    fn replicate_to(&mut self, peer: NodeId, force: bool) -> Option<Effect> {
-        let last_index = self.log.last_index();
+    /// A [`Flow::Probe`] peer gets one `AppendEntries`, and nothing while it
+    /// is waiting on a reply. A [`Flow::Replicate`] peer gets successive
+    /// batches until it has the whole log or its window is full, and nothing
+    /// when it has no room or nothing new. With `force` a peer that would get
+    /// nothing still gets an `AppendEntries` — an empty heartbeat in the
+    /// `Replicate` case — so a heartbeat always goes out.
+    fn replicate_to(&mut self, peer: NodeId, force: bool) -> Vec<Effect> {
         let max_inflight = self.replication.max_inflight.max(1);
-        let Role::Leader { progress, .. } = &mut self.role else {
-            return None;
-        };
-        let p = progress.get_mut(&peer)?;
-        if p.next_index <= self.log.snapshot_last_index() {
-            return Some(Effect::SendSnapshot { to: peer });
+        let max_bytes = self.replication.max_append_bytes;
+        let last_index = self.log.last_index();
+        let mut effects = Vec::new();
+        while let Role::Leader { progress, .. } = &mut self.role
+            && let Some(p) = progress.get_mut(&peer)
+        {
+            if p.next_index <= self.log.snapshot_last_index() {
+                effects.push(Effect::SendSnapshot { to: peer });
+                break;
+            }
+
+            let next = p.next_index;
+            let must_send = force && effects.is_empty();
+            let (batch_end, more) = match &mut p.flow {
+                Flow::Probe { paused } => {
+                    if *paused && !must_send {
+                        break;
+                    }
+                    *paused = true;
+                    (self.log.batch_end(next, max_bytes), false)
+                }
+                Flow::Replicate { inflight } => {
+                    if next <= last_index && inflight.len() < max_inflight {
+                        let end = self.log.batch_end(next, max_bytes);
+                        inflight.push_back(end);
+                        p.next_index = end.next();
+                        (end, true)
+                    } else if must_send {
+                        (next.prev(), false)
+                    } else {
+                        break;
+                    }
+                }
+            };
+            effects.push(self.append_entries(peer, next, batch_end));
+            if !more {
+                break;
+            }
         }
+        effects
+    }
 
-        let next = p.next_index;
-        let with_entries = match &mut p.flow {
-            Flow::Probe { paused } => {
-                if *paused && !force {
-                    return None;
-                }
-                *paused = true;
-                true
-            }
-            Flow::Replicate { inflight } => {
-                if next <= last_index && inflight.len() < max_inflight {
-                    inflight.push_back(last_index);
-                    p.next_index = last_index.next();
-                    true
-                } else if force {
-                    false
-                } else {
-                    return None;
-                }
-            }
-        };
-
-        let prev_log_index = next.prev();
+    /// An `AppendEntries` for `peer` carrying entries `from..=to` (none when
+    /// `to < from`), anchored on the entry just before `from`.
+    fn append_entries(&self, peer: NodeId, from: LogIndex, to: LogIndex) -> Effect {
+        let prev_log_index = from.prev();
         let prev_log_term = self.log.term_at(prev_log_index).unwrap_or(Term::ZERO);
-        let entries = if with_entries {
-            self.log.entries_from(next).to_vec()
-        } else {
-            Vec::new()
-        };
-        Some(Effect::SendRpc {
+        let count =
+            usize::try_from(to.get().saturating_sub(prev_log_index.get())).unwrap_or(usize::MAX);
+        let entries = self.log.entries_from(from);
+        Effect::SendRpc {
             to: peer,
             message: Message::AppendEntries(AppendEntriesArgs {
                 term: self.current_term,
                 leader_id: self.id,
                 prev_log_index,
                 prev_log_term,
-                entries,
+                entries: entries[..count.min(entries.len())].to_vec(),
                 leader_commit: self.commit_index,
             }),
-        })
+        }
     }
 
     /// This leader's `match_index` for `peer`, or zero when it is not leading
@@ -3821,6 +3870,22 @@ mod tests {
             .collect()
     }
 
+    /// Default replication limits, but at most `max_inflight` batches.
+    fn window(max_inflight: usize) -> ReplicationConfig {
+        ReplicationConfig {
+            max_inflight,
+            ..ReplicationConfig::default()
+        }
+    }
+
+    /// At most `max_inflight` batches of at most `max_append_bytes` each.
+    const fn limits(max_inflight: usize, max_append_bytes: usize) -> ReplicationConfig {
+        ReplicationConfig {
+            max_inflight,
+            max_append_bytes,
+        }
+    }
+
     fn streaming(inflight: &[u64]) -> Flow {
         Flow::Replicate {
             inflight: inflight.iter().copied().map(LogIndex::new).collect(),
@@ -3863,7 +3928,7 @@ mod tests {
 
     #[test]
     fn a_full_window_holds_proposals_until_an_ack_frees_a_slot() {
-        let mut n = acked_leader().with_replication(ReplicationConfig { max_inflight: 2 });
+        let mut n = acked_leader().with_replication(window(2));
         drive(&mut n, propose(b"cmd"));
         drive(&mut n, propose(b"cmd"));
 
@@ -3885,7 +3950,7 @@ mod tests {
 
     #[test]
     fn an_ack_with_entries_still_unsent_sends_them_all_in_one_batch() {
-        let mut n = acked_leader().with_replication(ReplicationConfig { max_inflight: 1 });
+        let mut n = acked_leader().with_replication(window(1));
         drive(&mut n, propose(b"cmd"));
         drive(&mut n, propose(b"cmd"));
         drive(&mut n, propose(b"cmd"));
@@ -3902,8 +3967,111 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_holds_as_many_entries_as_fit_the_byte_cap() {
+        let mut log = Log::new();
+        for command in [&b"aa"[..], b"bb", b"cc", b"dd"] {
+            log.append(entry_cmd(1, command));
+        }
+
+        assert_eq!(log.batch_end(LogIndex::new(1), 4), LogIndex::new(2));
+        assert_eq!(log.batch_end(LogIndex::new(1), 5), LogIndex::new(2));
+        assert_eq!(log.batch_end(LogIndex::new(2), 6), LogIndex::new(4));
+        assert_eq!(
+            log.batch_end(LogIndex::new(1), usize::MAX),
+            LogIndex::new(4)
+        );
+    }
+
+    #[test]
+    fn a_batch_always_holds_at_least_one_entry() {
+        let mut log = Log::new();
+        log.append(entry_cmd(1, b"larger than the cap"));
+        log.append(entry_cmd(1, b"x"));
+
+        assert_eq!(log.batch_end(LogIndex::new(1), 0), LogIndex::new(1));
+        assert_eq!(log.batch_end(LogIndex::new(1), 3), LogIndex::new(1));
+    }
+
+    #[test]
+    fn a_batch_past_the_end_of_the_log_is_empty() {
+        let mut log = Log::new();
+        log.append(entry(1));
+
+        assert_eq!(log.batch_end(LogIndex::new(2), 1024), LogIndex::new(1));
+    }
+
+    #[test]
+    fn a_config_entry_counts_eight_bytes_per_voter() {
+        let config = ClusterConfig::new([1, 2, 3].map(NodeId::new));
+        let mut log = Log::new();
+        log.append(LogEntry::config(Term::new(1), config));
+        log.append(entry_cmd(1, b"x"));
+
+        assert_eq!(log.batch_end(LogIndex::new(1), 24), LogIndex::new(1));
+        assert_eq!(log.batch_end(LogIndex::new(1), 25), LogIndex::new(2));
+    }
+
+    #[test]
+    fn a_probe_carries_a_single_capped_batch() {
+        let mut n = node(1, &[2, 3]).with_replication(limits(8, 3));
+        time_out(&mut n);
+        drive(&mut n, deliver(2, vote_reply(1, true)));
+        drive(&mut n, propose(b"cmd")); // held: the opening probe is unanswered
+        drive(&mut n, propose(b"cmd"));
+
+        let effects = n.step(Input::HeartbeatTick, NOW);
+
+        // "cmd" is three bytes, so each batch holds one entry.
+        assert_eq!(
+            effects,
+            vec![
+                send(2, append_entries(1, 1, 0, 0, vec![entry(1)], 0)),
+                send(3, append_entries(1, 1, 0, 0, vec![entry(1)], 0)),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_streaming_peer_that_is_behind_gets_capped_batches_until_the_window_fills() {
+        let mut n = acked_leader().with_replication(limits(2, 3));
+        for _ in 0..5 {
+            drive(&mut n, propose(b"cmd"));
+        }
+        // Entries 1 and 2 went out one per batch; 3, 4 and 5 are held.
+        assert_eq!(progress_of(&n, 2).flow, streaming(&[1, 2]));
+
+        let effects = rpcs(n.step(deliver(2, ae_reply(1, true, 2)), NOW));
+
+        // Both slots free up: two one-entry batches, and entry 5 waits.
+        assert_eq!(
+            effects,
+            vec![
+                send(2, append_entries(1, 1, 2, 1, vec![entry(1)], 2)),
+                send(2, append_entries(1, 1, 3, 1, vec![entry(1)], 2)),
+            ],
+        );
+        assert_eq!(progress_of(&n, 2).flow, streaming(&[3, 4]));
+        assert_eq!(progress_of(&n, 2).next_index, LogIndex::new(5));
+    }
+
+    #[test]
+    fn an_entry_larger_than_the_cap_is_still_replicated() {
+        let mut n = acked_leader().with_replication(limits(8, 1));
+
+        let effects = rpcs(n.step(propose(b"cmd"), NOW));
+
+        assert_eq!(
+            effects,
+            vec![
+                send(2, append_entries(1, 1, 0, 0, vec![entry(1)], 0)),
+                send(3, append_entries(1, 1, 0, 0, vec![entry(1)], 0)),
+            ],
+        );
+    }
+
+    #[test]
     fn a_heartbeat_to_a_full_window_is_empty_and_anchored_past_the_batches() {
-        let mut n = acked_leader().with_replication(ReplicationConfig { max_inflight: 1 });
+        let mut n = acked_leader().with_replication(window(1));
         drive(&mut n, propose(b"cmd"));
         drive(&mut n, propose(b"cmd")); // held: the window is full
 
