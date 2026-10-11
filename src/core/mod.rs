@@ -19,7 +19,7 @@
 //! returns the [`Effect`]s the driver must carry out. Nothing in here performs
 //! IO, reads a real clock, spawns a thread, or draws randomness.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 use bytes::Bytes;
@@ -587,14 +587,18 @@ pub enum Role {
     },
 }
 
-/// A leader's replication bookkeeping for one peer (Figure 2, "Volatile state
-/// on leaders").
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A leader's replication bookkeeping for one peer: Figure 2's "Volatile
+/// state on leaders", plus the flow control that pipelines `AppendEntries`.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Progress {
-    /// The index of the next log entry to send the peer.
+    /// The index of the next log entry to send the peer. While
+    /// [`Flow::Replicate`] it runs ahead of any ack: it is moved past each
+    /// batch as the batch is sent.
     pub next_index: LogIndex,
     /// The highest log index known to be replicated on the peer.
     pub match_index: LogIndex,
+    /// How eagerly the leader may send to the peer.
+    pub flow: Flow,
 }
 
 impl Progress {
@@ -604,7 +608,61 @@ impl Progress {
         Self {
             next_index,
             match_index: LogIndex::ZERO,
+            flow: Flow::Probe { paused: false },
         }
+    }
+}
+
+/// Flow control for one peer's `AppendEntries` stream.
+///
+/// Figure 2 leaves the send schedule open. Sending the whole unacknowledged
+/// tail on every proposal re-sends the same entries over and over while acks
+/// are in flight, and waiting for each ack before sending more caps throughput
+/// at one batch per round trip. Like etcd/raft, the leader instead **probes**
+/// until it learns where the peer's log matches its own, then **pipelines**:
+/// it sends each new batch as soon as it exists, advancing `next_index`
+/// without waiting, with at most [`ReplicationConfig::max_inflight`] batches
+/// unacknowledged.
+///
+/// None of this affects safety: the §5.3 consistency check on every
+/// `AppendEntries` is what keeps logs matching, so a wrong guess here only
+/// costs a rejection or a redundant resend.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Flow {
+    /// Where the peer's log diverges from ours is unknown: one `AppendEntries`
+    /// at a time, and `next_index` moves only on a reply — back by one on a
+    /// rejection (Figure 2), forward on success. Every peer starts here when a
+    /// leader is elected, and returns here after any rejection.
+    Probe {
+        /// An `AppendEntries` has been sent and not yet answered, so another
+        /// waits for the reply or the next heartbeat (which re-sends it in
+        /// case it was lost).
+        paused: bool,
+    },
+    /// The peer's log matches ours up to `match_index`: stream new entries
+    /// without waiting for acks.
+    Replicate {
+        /// The last index carried by each unacknowledged batch, oldest first.
+        /// An ack frees every batch at or below the index it confirms. When
+        /// full, the leader sends nothing but heartbeats; a heartbeat that
+        /// finds the peer missing a lost batch is rejected, which drops the
+        /// peer back to [`Flow::Probe`] to resend it.
+        inflight: VecDeque<LogIndex>,
+    },
+}
+
+/// Tunables for how a leader streams its log to followers. None of them
+/// affects safety, only throughput and message sizes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplicationConfig {
+    /// The most `AppendEntries` batches a leader keeps unacknowledged per peer
+    /// while pipelining (see [`Flow::Replicate`]). Values below 1 act as 1.
+    pub max_inflight: usize,
+}
+
+impl Default for ReplicationConfig {
+    fn default() -> Self {
+        Self { max_inflight: 8 }
     }
 }
 
@@ -940,6 +998,8 @@ pub struct RaftNode {
     /// While this node leads and has a membership change under way, its
     /// progress on it. At most one change is in flight at a time.
     pending_change: Option<PendingChange>,
+    /// How this node streams its log while it leads.
+    replication: ReplicationConfig,
 }
 
 impl RaftNode {
@@ -967,9 +1027,17 @@ impl RaftNode {
             heard_from_leader: false,
             pre_vote_round: PreVoteRound::ZERO,
             pending_change: None,
+            replication: ReplicationConfig::default(),
         };
         node.recompute_config();
         node
+    }
+
+    /// Replaces the default [`ReplicationConfig`].
+    #[must_use]
+    pub const fn with_replication(mut self, replication: ReplicationConfig) -> Self {
+        self.replication = replication;
+        self
     }
 
     /// Creates a server that is **not** in any bootstrap configuration: a
@@ -1402,8 +1470,9 @@ impl RaftNode {
     ///
     /// A reply from a newer term steps us down. Otherwise, while we are still
     /// the leader for the reply's term: `success` moves `match_index[from]` /
-    /// `next_index[from]` forward and may advance `commit_index` (§5.4.2);
-    /// failure decrements `next_index[from]` and retries straight away.
+    /// `next_index[from]` forward, may advance `commit_index` (§5.4.2), and
+    /// sends `from` whatever it is still missing; failure steps
+    /// `next_index[from]` back and retries straight away.
     fn handle_append_entries_reply(
         &mut self,
         from: NodeId,
@@ -1430,8 +1499,8 @@ impl RaftNode {
             effects.extend(self.timeout_now_if_caught_up(from));
         } else {
             self.back_off(from);
-            effects.push(self.replicate_to(from));
         }
+        effects.extend(self.replicate_to(from, false));
         effects
     }
 
@@ -1508,6 +1577,7 @@ impl RaftNode {
         self.record_match(from, reply.last_included_index);
         self.maybe_advance_commit_index(&mut effects);
         effects.extend(self.timeout_now_if_caught_up(from));
+        effects.extend(self.replicate_to(from, false));
         effects
     }
 
@@ -1586,7 +1656,7 @@ impl RaftNode {
                         ticks_left: CATCH_UP_TICKS,
                     },
                 });
-                vec![self.replicate_to(id)]
+                self.replicate_to(id, true).into_iter().collect()
             }
             MembershipChange::RemoveServer(id) => {
                 if !self.config.contains(id) {
@@ -1620,8 +1690,10 @@ impl RaftNode {
                 ticks_left: TRANSFER_TICKS,
             });
         }
-        self.timeout_now_if_caught_up(target)
-            .map_or_else(|| vec![self.replicate_to(target)], |effect| vec![effect])
+        self.timeout_now_if_caught_up(target).map_or_else(
+            || self.replicate_to(target, true).into_iter().collect(),
+            |timeout_now| vec![timeout_now],
+        )
     }
 
     /// While transferring leadership to `peer`, the [`Message::TimeoutNow`] to
@@ -1696,7 +1768,7 @@ impl RaftNode {
             },
             Effect::MembershipChanged { config: new_config },
         ];
-        effects.extend(self.replicate_to_peers());
+        effects.extend(self.replicate_to_peers(false));
         self.maybe_advance_commit_index(&mut effects);
         effects
     }
@@ -1781,22 +1853,49 @@ impl RaftNode {
 
     /// Records a successful ack: `match_index[peer]` only moves forward (a
     /// reordered older ack cannot pull it back) and `next_index[peer]` follows.
+    /// The peer's log is now known to match ours up to there, so it streams
+    /// ([`Flow::Replicate`]), with every batch the ack covers freed.
     fn record_match(&mut self, peer: NodeId, matched: LogIndex) {
         if let Role::Leader { progress, .. } = &mut self.role
             && let Some(p) = progress.get_mut(&peer)
         {
             p.match_index = matched.max(p.match_index);
             p.next_index = matched.next().max(p.next_index);
+            match &mut p.flow {
+                Flow::Replicate { inflight } => {
+                    while inflight.front().is_some_and(|&last| last <= p.match_index) {
+                        inflight.pop_front();
+                    }
+                }
+                Flow::Probe { .. } => {
+                    p.flow = Flow::Replicate {
+                        inflight: VecDeque::new(),
+                    };
+                }
+            }
         }
     }
 
-    /// Figure 2: on a failed `AppendEntries`, step `next_index` for the peer
-    /// back by one (never below 1) so the next attempt probes further back.
+    /// On a failed `AppendEntries` the peer goes back to [`Flow::Probe`],
+    /// unpaused so the retry goes out at once. A peer that was already probing
+    /// steps `next_index` back by one (Figure 2, never below 1) to probe
+    /// further back; one that was streaming restarts just past `match_index`,
+    /// the last point it acknowledged.
+    ///
+    /// Probing is not floored at `match_index`: a follower that lost its
+    /// storage (or a stale rejection) can send `next_index` below it, and a
+    /// floor there would leave such a follower rejecting the same probe
+    /// forever.
     fn back_off(&mut self, peer: NodeId) {
         if let Role::Leader { progress, .. } = &mut self.role
             && let Some(p) = progress.get_mut(&peer)
         {
-            p.next_index = p.next_index.prev().max(LogIndex::new(1));
+            let retry_from = match p.flow {
+                Flow::Probe { .. } => p.next_index.prev(),
+                Flow::Replicate { .. } => p.match_index.next(),
+            };
+            p.next_index = retry_from.max(LogIndex::new(1));
+            p.flow = Flow::Probe { paused: false };
         }
     }
 
@@ -1908,7 +2007,7 @@ impl RaftNode {
                 self.abort_catch_up();
             }
         }
-        self.replicate_to_peers()
+        self.replicate_to_peers(true)
     }
 
     /// Handles a client proposal (Figure 2, "Clients of Raft").
@@ -1937,7 +2036,7 @@ impl RaftNode {
             from_index,
             entries: self.log.entries_from(from_index).to_vec(),
         }];
-        effects.extend(self.replicate_to_peers());
+        effects.extend(self.replicate_to_peers(false));
         self.maybe_advance_commit_index(&mut effects);
         effects
     }
@@ -2073,7 +2172,7 @@ impl RaftNode {
         }
 
         self.become_leader();
-        self.replicate_to_peers()
+        self.replicate_to_peers(true)
     }
 
     /// If we are a pre-candidate whose straw poll has reached a quorum of "yes"
@@ -2125,27 +2224,25 @@ impl RaftNode {
         effects
     }
 
-    /// Replicates to every peer: an `AppendEntries` carrying the entries it is
-    /// missing according to its `next_index`, or an [`Effect::SendSnapshot`]
-    /// when that entry has been compacted away. With every peer caught up this
-    /// is a batch of empty heartbeats; after a fresh `Propose` it carries the
-    /// new tail. Used on winning an election, on `HeartbeatTick`, and on
-    /// `Propose`.
-    fn replicate_to_peers(&self) -> Vec<Effect> {
-        match &self.role {
-            Role::Leader { progress, .. } => {
-                // Voters plus any catching-up learner (which has a progress
-                // entry but is not yet in the configuration).
-                progress
-                    .keys()
-                    .map(|&peer| self.replicate_to(peer))
-                    .collect()
-            }
+    /// Replicates to every peer (see [`RaftNode::replicate_to`]). With
+    /// `force` (on winning an election and on `HeartbeatTick`) every peer is
+    /// sent something, a heartbeat at least; without it (on `Propose` and on a
+    /// new configuration entry) only peers whose flow control has room are.
+    fn replicate_to_peers(&mut self, force: bool) -> Vec<Effect> {
+        let peers: Vec<NodeId> = match &self.role {
+            // Voters plus any catching-up learner (which has a progress entry
+            // but is not yet in the configuration).
+            Role::Leader { progress, .. } => progress.keys().copied().collect(),
             Role::Follower | Role::PreCandidate { .. } | Role::Candidate { .. } => Vec::new(),
-        }
+        };
+        peers
+            .into_iter()
+            .filter_map(|peer| self.replicate_to(peer, force))
+            .collect()
     }
 
-    /// Builds the replication effect for one peer.
+    /// Builds the replication effect for one peer, if its flow control allows
+    /// one, and records the send in its [`Progress`].
     ///
     /// If the peer's `next_index` still points into the log, that is an
     /// `AppendEntries`: the entry just before `next_index` is the §5.3
@@ -2154,41 +2251,63 @@ impl RaftNode {
     /// `entries`. If `next_index` has fallen to or below the compaction base,
     /// the leader no longer has `prev_log_term`, so it sends the snapshot
     /// instead ([`Effect::SendSnapshot`]).
-    fn replicate_to(&self, peer: NodeId) -> Effect {
-        let next = self.next_index_for(peer);
-        if next <= self.log.snapshot_last_index() {
-            return Effect::SendSnapshot { to: peer };
+    ///
+    /// Without `force`, nothing is sent to a [`Flow::Probe`] peer that is
+    /// waiting on a reply, nor to a [`Flow::Replicate`] peer with nothing new
+    /// or no room in its window. With `force` such a peer still gets an
+    /// `AppendEntries` — an empty heartbeat in the `Replicate` case — so a
+    /// heartbeat always goes out.
+    fn replicate_to(&mut self, peer: NodeId, force: bool) -> Option<Effect> {
+        let last_index = self.log.last_index();
+        let max_inflight = self.replication.max_inflight.max(1);
+        let Role::Leader { progress, .. } = &mut self.role else {
+            return None;
+        };
+        let p = progress.get_mut(&peer)?;
+        if p.next_index <= self.log.snapshot_last_index() {
+            return Some(Effect::SendSnapshot { to: peer });
         }
+
+        let next = p.next_index;
+        let with_entries = match &mut p.flow {
+            Flow::Probe { paused } => {
+                if *paused && !force {
+                    return None;
+                }
+                *paused = true;
+                true
+            }
+            Flow::Replicate { inflight } => {
+                if next <= last_index && inflight.len() < max_inflight {
+                    inflight.push_back(last_index);
+                    p.next_index = last_index.next();
+                    true
+                } else if force {
+                    false
+                } else {
+                    return None;
+                }
+            }
+        };
+
         let prev_log_index = next.prev();
         let prev_log_term = self.log.term_at(prev_log_index).unwrap_or(Term::ZERO);
-        Effect::SendRpc {
+        let entries = if with_entries {
+            self.log.entries_from(next).to_vec()
+        } else {
+            Vec::new()
+        };
+        Some(Effect::SendRpc {
             to: peer,
             message: Message::AppendEntries(AppendEntriesArgs {
                 term: self.current_term,
                 leader_id: self.id,
                 prev_log_index,
                 prev_log_term,
-                entries: self.log.entries_from(next).to_vec(),
+                entries,
                 leader_commit: self.commit_index,
             }),
-        }
-    }
-
-    /// This leader's `next_index` for `peer`.
-    ///
-    /// [`RaftNode::become_leader`] seeds one entry per peer, so on the leader
-    /// path the map always contains `peer`. The fallback — one past the last
-    /// log index, the value `become_leader` itself uses — keeps the function
-    /// total for any off-path caller a future step might add.
-    fn next_index_for(&self, peer: NodeId) -> LogIndex {
-        match &self.role {
-            Role::Leader { progress, .. } => progress
-                .get(&peer)
-                .map_or_else(|| self.log.last_index().next(), |p| p.next_index),
-            Role::Follower | Role::PreCandidate { .. } | Role::Candidate { .. } => {
-                self.log.last_index().next()
-            }
-        }
+        })
     }
 
     /// This leader's `match_index` for `peer`, or zero when it is not leading
@@ -2396,10 +2515,11 @@ mod tests {
     use bytes::Bytes;
 
     use super::{
-        AppendEntriesArgs, AppendEntriesReply, CATCH_UP_TICKS, ClusterConfig, Effect, Input,
+        AppendEntriesArgs, AppendEntriesReply, CATCH_UP_TICKS, ClusterConfig, Effect, Flow, Input,
         InstallSnapshotArgs, InstallSnapshotReply, Log, LogEntry, LogIndex, LogicalInstant,
         MembershipChange, Message, NodeId, PreVoteArgs, PreVoteReply, PreVoteRound, Progress,
-        RaftNode, RequestVoteArgs, RequestVoteReply, Role, TRANSFER_TICKS, Term, TimeoutNowArgs,
+        RaftNode, ReplicationConfig, RequestVoteArgs, RequestVoteReply, Role, TRANSFER_TICKS, Term,
+        TimeoutNowArgs,
     };
 
     /// The core does not consult the clock under this timer model, so every
@@ -3586,12 +3706,22 @@ mod tests {
         assert!(n.log().is_empty());
     }
 
-    #[test]
-    fn propose_on_a_leader_appends_persists_then_replicates() {
+    /// Node 1 of {1, 2, 3}, leader for term 1 with an empty log, whose
+    /// opening heartbeats both peers have acked — so both are streaming
+    /// ([`Flow::Replicate`]) with nothing in flight.
+    fn acked_leader() -> RaftNode {
         let mut n = node(1, &[2, 3]);
         time_out(&mut n);
         drive(&mut n, deliver(2, vote_reply(1, true)));
+        drive(&mut n, deliver(2, ae_reply(1, true, 0)));
+        drive(&mut n, deliver(3, ae_reply(1, true, 0)));
         assert!(n.is_leader());
+        n
+    }
+
+    #[test]
+    fn propose_on_a_leader_appends_persists_then_replicates() {
+        let mut n = acked_leader();
 
         let effects = n.step(propose(b"cmd"), NOW);
 
@@ -3614,9 +3744,7 @@ mod tests {
 
     #[test]
     fn persist_log_precedes_the_replicating_send_rpcs() {
-        let mut n = node(1, &[2, 3]);
-        time_out(&mut n);
-        drive(&mut n, deliver(2, vote_reply(1, true)));
+        let mut n = acked_leader();
 
         let effects = n.step(propose(b"cmd"), NOW);
 
@@ -3631,17 +3759,15 @@ mod tests {
     }
 
     #[test]
-    fn a_second_proposal_replicates_the_whole_unacked_tail() {
-        let mut n = node(1, &[2, 3]);
-        time_out(&mut n);
-        drive(&mut n, deliver(2, vote_reply(1, true)));
+    fn a_second_proposal_pipelines_only_the_new_entry() {
+        let mut n = acked_leader();
 
         drive(&mut n, propose(b"cmd"));
         let effects = n.step(propose(b"cmd"), NOW);
 
-        // No ack has come back, so `next_index` for both peers is still 1: the
-        // PersistLog covers only the new entry, but the AppendEntries carries
-        // the whole uncommitted tail. Nothing commits — the leader is one of
+        // No ack has come back, but both peers are streaming: the first batch
+        // already moved `next_index` to 2, so the second carries only the new
+        // entry, anchored on the first. Nothing commits — the leader is one of
         // three.
         assert_eq!(n.log().len(), 2);
         assert_eq!(n.commit_index(), LogIndex::ZERO);
@@ -3652,10 +3778,209 @@ mod tests {
                     from_index: LogIndex::new(2),
                     entries: vec![entry(1)],
                 },
-                send(2, append_entries(1, 1, 0, 0, vec![entry(1), entry(1)], 0)),
-                send(3, append_entries(1, 1, 0, 0, vec![entry(1), entry(1)], 0)),
+                send(2, append_entries(1, 1, 1, 1, vec![entry(1)], 0)),
+                send(3, append_entries(1, 1, 1, 1, vec![entry(1)], 0)),
             ],
         );
+    }
+
+    #[test]
+    fn a_proposal_waits_while_a_probe_is_unanswered() {
+        let mut n = node(1, &[2, 3]);
+        time_out(&mut n);
+        drive(&mut n, deliver(2, vote_reply(1, true)));
+
+        // The opening heartbeats are probes nobody has answered yet, so the
+        // new entry is only persisted; the heartbeat tick or the probe's reply
+        // carries it out.
+        let effects = n.step(propose(b"cmd"), NOW);
+
+        assert_eq!(
+            effects,
+            vec![Effect::PersistLog {
+                from_index: LogIndex::new(1),
+                entries: vec![entry(1)],
+            }],
+        );
+    }
+
+    /// The [`Progress`] this leader holds for `peer`.
+    #[track_caller]
+    fn progress_of(n: &RaftNode, peer: u64) -> Progress {
+        let Role::Leader { progress, .. } = n.role() else {
+            unreachable!("not a leader");
+        };
+        progress[&NodeId::new(peer)].clone()
+    }
+
+    /// Just the `SendRpc` effects, in order.
+    fn rpcs(effects: Vec<Effect>) -> Vec<Effect> {
+        effects
+            .into_iter()
+            .filter(|e| matches!(e, Effect::SendRpc { .. }))
+            .collect()
+    }
+
+    fn streaming(inflight: &[u64]) -> Flow {
+        Flow::Replicate {
+            inflight: inflight.iter().copied().map(LogIndex::new).collect(),
+        }
+    }
+
+    #[test]
+    fn a_new_leader_probes_every_peer() {
+        let mut n = node(1, &[2, 3]);
+        time_out(&mut n);
+        drive(&mut n, deliver(2, vote_reply(1, true)));
+
+        // The opening heartbeat is the first probe, now awaiting its reply.
+        assert_eq!(progress_of(&n, 2).flow, Flow::Probe { paused: true });
+        assert_eq!(progress_of(&n, 3).flow, Flow::Probe { paused: true });
+    }
+
+    #[test]
+    fn a_successful_ack_switches_a_probing_peer_to_streaming() {
+        let n = acked_leader();
+
+        assert_eq!(progress_of(&n, 2).flow, streaming(&[]));
+        assert_eq!(progress_of(&n, 3).flow, streaming(&[]));
+    }
+
+    #[test]
+    fn each_streamed_batch_is_tracked_until_acked() {
+        let mut n = acked_leader();
+        drive(&mut n, propose(b"cmd"));
+        drive(&mut n, propose(b"cmd"));
+
+        assert_eq!(progress_of(&n, 2).next_index, LogIndex::new(3));
+        assert_eq!(progress_of(&n, 2).flow, streaming(&[1, 2]));
+
+        // An ack frees exactly the batches it covers.
+        drive(&mut n, deliver(2, ae_reply(1, true, 1)));
+        assert_eq!(progress_of(&n, 2).match_index, LogIndex::new(1));
+        assert_eq!(progress_of(&n, 2).flow, streaming(&[2]));
+    }
+
+    #[test]
+    fn a_full_window_holds_proposals_until_an_ack_frees_a_slot() {
+        let mut n = acked_leader().with_replication(ReplicationConfig { max_inflight: 2 });
+        drive(&mut n, propose(b"cmd"));
+        drive(&mut n, propose(b"cmd"));
+
+        // Two batches in flight: the third entry is persisted but not sent.
+        let effects = n.step(propose(b"cmd"), NOW);
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::SendRpc { .. })),
+            "sent past a full window: {effects:?}",
+        );
+
+        // Node 2 acks the first batch; the freed slot carries entry 3 at once.
+        let effects = rpcs(n.step(deliver(2, ae_reply(1, true, 1)), NOW));
+        assert_eq!(
+            effects,
+            vec![send(2, append_entries(1, 1, 2, 1, vec![entry(1)], 1))],
+        );
+        assert_eq!(progress_of(&n, 2).flow, streaming(&[2, 3]));
+    }
+
+    #[test]
+    fn an_ack_with_entries_still_unsent_sends_them_all_in_one_batch() {
+        let mut n = acked_leader().with_replication(ReplicationConfig { max_inflight: 1 });
+        drive(&mut n, propose(b"cmd"));
+        drive(&mut n, propose(b"cmd"));
+        drive(&mut n, propose(b"cmd"));
+
+        let effects = rpcs(n.step(deliver(2, ae_reply(1, true, 1)), NOW));
+
+        assert_eq!(
+            effects,
+            vec![send(
+                2,
+                append_entries(1, 1, 1, 1, vec![entry(1), entry(1)], 1)
+            )],
+        );
+    }
+
+    #[test]
+    fn a_heartbeat_to_a_full_window_is_empty_and_anchored_past_the_batches() {
+        let mut n = acked_leader().with_replication(ReplicationConfig { max_inflight: 1 });
+        drive(&mut n, propose(b"cmd"));
+        drive(&mut n, propose(b"cmd")); // held: the window is full
+
+        let effects = n.step(Input::HeartbeatTick, NOW);
+
+        // Anchored on entry 1, the last one sent: a peer that lost it rejects,
+        // and the rejection makes the leader resend.
+        assert_eq!(
+            effects,
+            vec![
+                send(2, append_entries(1, 1, 1, 1, vec![], 0)),
+                send(3, append_entries(1, 1, 1, 1, vec![], 0)),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_heartbeat_to_a_caught_up_streaming_peer_is_empty() {
+        let mut n = acked_leader();
+        drive(&mut n, propose(b"cmd"));
+        drive(&mut n, deliver(2, ae_reply(1, true, 1)));
+
+        let effects = n.step(Input::HeartbeatTick, NOW);
+
+        assert!(effects.contains(&send(2, append_entries(1, 1, 1, 1, vec![], 1))));
+    }
+
+    #[test]
+    fn a_rejection_while_streaming_resends_from_just_past_match_index() {
+        let mut n = acked_leader();
+        drive(&mut n, propose(b"cmd"));
+        drive(&mut n, deliver(2, ae_reply(1, true, 1)));
+        drive(&mut n, propose(b"cmd"));
+        drive(&mut n, propose(b"cmd"));
+        assert_eq!(progress_of(&n, 2).next_index, LogIndex::new(4));
+
+        // Node 2 lost both batches and rejected a heartbeat anchored at 3.
+        let effects = n.step(deliver(2, ae_reply(1, false, 0)), NOW);
+
+        assert_eq!(
+            effects,
+            vec![send(
+                2,
+                append_entries(1, 1, 1, 1, vec![entry(1), entry(1)], 1)
+            )],
+        );
+        assert_eq!(progress_of(&n, 2).next_index, LogIndex::new(2));
+        assert_eq!(progress_of(&n, 2).flow, Flow::Probe { paused: true });
+    }
+
+    #[test]
+    fn a_probe_steps_back_past_match_index_for_a_peer_that_lost_its_log() {
+        let mut n = acked_leader();
+        drive(&mut n, propose(b"cmd"));
+        drive(&mut n, deliver(2, ae_reply(1, true, 1)));
+        drive(&mut n, deliver(2, ae_reply(1, false, 0))); // now probing from 2
+
+        // Node 2 was wiped and rejects again: the probe goes back over entry 1
+        // even though node 2 once acked it, and resends it.
+        let effects = n.step(deliver(2, ae_reply(1, false, 0)), NOW);
+
+        assert_eq!(
+            effects,
+            vec![send(2, append_entries(1, 1, 0, 0, vec![entry(1)], 1))],
+        );
+        assert_eq!(progress_of(&n, 2).next_index, LogIndex::new(1));
+    }
+
+    #[test]
+    fn a_reply_from_a_peer_without_progress_sends_nothing() {
+        let mut n = acked_leader();
+        if let Role::Leader { progress, .. } = &mut n.role {
+            progress.remove(&NodeId::new(3));
+        }
+
+        assert!(n.step(deliver(3, ae_reply(1, false, 0)), NOW).is_empty());
+        assert!(n.step(deliver(3, ae_reply(1, true, 0)), NOW).is_empty());
     }
 
     #[test]
@@ -4081,10 +4406,15 @@ mod tests {
             progress.insert(NodeId::new(2), Progress::new(LogIndex::new(1)));
         }
 
-        drive(&mut n, deliver(2, snapshot_reply_msg(2, 4)));
+        let effects = n.step(deliver(2, snapshot_reply_msg(2, 4)), NOW);
 
+        // Entry 5, the only one past the snapshot, is streamed straight after.
+        assert_eq!(
+            effects,
+            vec![send(2, append_entries(2, 1, 4, 1, vec![entry(1)], 5))],
+        );
         if let Role::Leader { progress, .. } = n.role() {
-            assert_eq!(progress[&NodeId::new(2)].next_index, LogIndex::new(5));
+            assert_eq!(progress[&NodeId::new(2)].next_index, LogIndex::new(6));
             assert_eq!(progress[&NodeId::new(2)].match_index, LogIndex::new(4));
         } else {
             unreachable!("still a leader");
@@ -4361,6 +4691,7 @@ mod tests {
         };
 
         // The config entry that removes node 3 goes to node 3 as well.
+        drive(&mut n, deliver(3, ae_reply(2, true, 1)));
         let effects = n.step(change(MembershipChange::RemoveServer(removed)), NOW);
         assert!(!n.config().contains(removed));
         assert!(sends_to(&effects, removed));
