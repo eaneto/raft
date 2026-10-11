@@ -59,7 +59,10 @@ See §8.
   target skips pre-vote on `Message::TimeoutNow`, and its `RequestVote`s carry
   `leadership_transfer` past the leader-contact rule; abandoned after
   `TRANSFER_TICKS` heartbeats)
-- Batching / pipelining of `AppendEntries`
+- ~~Batching / pipelining of `AppendEntries`~~ — **done** (per-peer `Progress`
+  with Probe/Replicate flow control and a `max_inflight` window, a
+  `max_append_bytes` cap per batch, and batched `Input::Propose` drained by the
+  driver; `ReplicationConfig` holds the limits)
 - Read-index / lease reads (thesis §6.4)
 
 **Out of scope:** multi-Raft / sharding, a production network stack, Byzantine fault
@@ -71,8 +74,8 @@ tolerance, alternative consensus algorithms.
 
 The sans-IO rewrite is complete through Phase 1 (leader election, log
 replication, snapshotting / `InstallSnapshot`, single-server membership
-changes), plus pre-vote, the §4.2.3 disruption fixes, and leadership transfer
-from Phase 2. The original IO-coupled prototype (`src/raft.rs`,
+changes), plus pre-vote, the §4.2.3 disruption fixes, leadership transfer, and
+`AppendEntries` batching / pipelining from Phase 2. The original IO-coupled prototype (`src/raft.rs`,
 `src/command.rs`) has been **deleted** — the new modules fully supersede it.
 `ROADMAP.md` tracks what is done and what remains.
 

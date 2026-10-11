@@ -271,6 +271,37 @@ fn leader_index(nodes: &[Node]) -> Option<usize> {
 }
 
 #[test]
+fn a_burst_of_proposals_commits_in_order_on_every_node() {
+    let (nodes, sms, _addrs, _dirs) = start_cluster(3);
+    assert!(
+        wait_until(Duration::from_secs(3), || leader_index(&nodes).is_some()),
+        "no leader elected",
+    );
+    let leader = unwrap(leader_index(&nodes).ok_or("no leader"));
+
+    // Fired back to back, these queue up behind one another, so the driver
+    // steps them in batches and the leader pipelines them to the followers.
+    let commands: Vec<Bytes> = (0..500)
+        .map(|k| Bytes::from(format!("burst-{k}").into_bytes()))
+        .collect();
+    for command in &commands {
+        assert!(nodes[leader].propose(command.clone()).is_ok());
+    }
+
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            sms.iter().all(|sm| sm.applied() == commands)
+        }),
+        "not every node applied the whole burst in order: {:?}",
+        sms.iter().map(|sm| sm.applied().len()).collect::<Vec<_>>(),
+    );
+
+    for node in nodes {
+        let _ = node.shutdown();
+    }
+}
+
+#[test]
 fn the_leader_removes_a_follower_from_the_cluster() {
     let (nodes, _sms, _addrs, _dirs) = start_cluster(4);
 
