@@ -529,8 +529,10 @@ impl Log {
         let Some(term) = self.term_at(index) else {
             return index;
         };
+        // `term_at` answers `None` below the compaction base, which ends the
+        // walk there.
         let mut start = index;
-        while start > self.snapshot_last_index && self.term_at(start.prev()) == Some(term) {
+        while self.term_at(start.prev()) == Some(term) {
             start = start.prev();
         }
         start
@@ -538,17 +540,13 @@ impl Log {
 
     /// The highest index holding an entry of `term`, or `None` if the log
     /// (including its compaction base) has none. Terms never decrease along
-    /// the log, so the scan stops at the first older entry.
+    /// the log, so a run of `term` ends just before the first newer entry,
+    /// which a binary search finds.
     fn last_index_of_term(&self, term: Term) -> Option<LogIndex> {
-        let mut index = self.last_index();
-        while index >= self.snapshot_last_index && index > LogIndex::ZERO {
-            match self.term_at(index) {
-                Some(t) if t == term => return Some(index),
-                Some(t) if t < term => return None,
-                _ => index = index.prev(),
-            }
-        }
-        None
+        let up_to_term = self.entries.partition_point(|entry| entry.term <= term);
+        // usize -> u64 cannot lose bits on any platform Raft runs on.
+        let index = LogIndex::new(self.snapshot_last_index.get() + up_to_term as u64);
+        (self.term_at(index) == Some(term)).then_some(index)
     }
 
     /// Appends one entry to the end of the log.
