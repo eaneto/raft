@@ -1262,3 +1262,93 @@ fn a_wiped_follower_recovers_through_a_tight_window() {
         );
     }
 }
+
+// --- Phase 2: fast log backtracking ---------------------------------------------
+
+/// Runs until some node in partition `group` other than `exclude` leads, and
+/// returns it; asserts one appears.
+fn run_until_leader_in_group(sim: &mut Sim, group: usize, exclude: &[usize]) -> usize {
+    let deadline = sim.now + 5_000;
+    let mut found = None;
+    while found.is_none() && sim.now < deadline {
+        sim.run_until(sim.now + HEARTBEAT_PERIOD);
+        found = sim
+            .leaders()
+            .into_iter()
+            .find(|&i| sim.groups[i] == group && !exclude.contains(&i));
+    }
+    assert!(
+        found.is_some(),
+        "seed={}: no new leader in group {group}",
+        sim.seed,
+    );
+    found.unwrap_or(0)
+}
+
+/// Fast log backtracking (paper §5.3, Figure 7). A leader cut off from the
+/// rest of the cluster keeps accepting proposals, piling up a long tail from
+/// its own term that can never commit. The majority elects a successor, which
+/// commits as long a tail of its own over the same indices; then that
+/// successor is cut off too and a third leader is elected — one that starts
+/// probing the deposed first leader from past both tails. Stepping back one
+/// entry per rejection would take a round trip per stale entry; the hint
+/// steps over the stale term in one.
+fn assert_divergent_tail_is_skipped_per_term(seed: u64) {
+    const STALE: usize = 60;
+    let node_count = 5;
+    let mut sim = Sim::new(node_count, seed).with_net(JITTER5);
+    let first = sim.run_until_leader(5_000);
+    sim.propose_at(first, b"committed");
+    sim.run_until(sim.now + 500);
+
+    // Isolate the leader; it keeps leading its term alone and appends a tail
+    // that no quorum will ever acknowledge.
+    let mut groups = vec![0usize; node_count];
+    groups[first] = 1;
+    sim.set_groups(groups.clone());
+    for k in 0..STALE {
+        sim.propose_at(first, format!("stale-{k}").as_bytes());
+    }
+
+    // The majority elects a successor, which commits a tail of its own.
+    let second = run_until_leader_in_group(&mut sim, 0, &[]);
+    for k in 0..STALE {
+        sim.propose_at(second, format!("fresh-{k}").as_bytes());
+    }
+    sim.run_until(sim.now + 1_000);
+
+    // Cut the successor off too: the remaining three elect a leader whose
+    // `nextIndex` for everyone starts past the fresh tail.
+    groups[second] = 2;
+    sim.set_groups(groups.clone());
+    let third = run_until_leader_in_group(&mut sim, 0, &[second]);
+
+    // Reconnect the first leader alone and count its rejections while it
+    // catches up. The successor stays cut off: its own `nextIndex` for the
+    // first leader dates from before the fresh tail, so it would repair it
+    // without any backtracking.
+    sim.rejections_sent[first] = 0;
+    groups[first] = 0;
+    sim.set_groups(groups);
+    sim.run_until(sim.now + 3_000);
+
+    assert_eq!(
+        sim.log_entries(first),
+        sim.log_entries(third),
+        "seed={seed}: the deposed leader did not converge on the new log",
+    );
+    // One hinted round trip covers the stale term; the rest are heartbeats
+    // that crossed the first rejection on the wire.
+    let rejections = sim.rejections_sent[first];
+    assert!(
+        rejections <= 3,
+        "seed={seed}: {rejections} rejections to discard a {STALE}-entry stale tail",
+    );
+}
+
+#[test]
+fn a_divergent_tail_is_skipped_a_term_at_a_time() {
+    for seed in seeds(&[1, 2, 3, 42, 1_000, 0x5EED, 7, 99]) {
+        assert_divergent_tail_is_skipped_per_term(seed);
+    }
+}
