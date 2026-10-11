@@ -48,6 +48,10 @@ enum Op {
     /// the node count). The core refuses a target that is itself, a learner,
     /// or mid-change, so any position is a valid op.
     Transfer(usize),
+    /// Ask the node at this position (modulo the node count) for a
+    /// linearizable read; the harness checks any answer against what was
+    /// committed before it was asked.
+    Read(usize),
 }
 
 const CHURN_NET: Net = Net {
@@ -67,6 +71,7 @@ fn op_strategy(allow_add: bool) -> impl Strategy<Value = Op> {
         3 => Just(Op::Heal),
         add_weight => Just(Op::AddServer),
         2 => (0usize..8).prop_map(Op::Transfer),
+        3 => (0usize..8).prop_map(Op::Read),
     ]
 }
 
@@ -145,6 +150,7 @@ fn run_schedule(
                     sim.transfer_leadership(target.get());
                 }
             }
+            Op::Read(position) => sim.issue_read(position % sim.nodes.len()),
         }
     }
     sim

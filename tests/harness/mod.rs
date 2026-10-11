@@ -19,7 +19,7 @@ use rand::{Rng, SeedableRng};
 
 use raft::core::{
     Effect, Input, InstallSnapshotArgs, LogEntry, LogIndex, LogicalInstant, MembershipChange,
-    Message, NodeId, RaftNode, ReplicationConfig, Term,
+    Message, NodeId, RaftNode, ReadId, ReplicationConfig, Term,
 };
 
 // Timer and network constants, in logical milliseconds. The heartbeat period
@@ -101,6 +101,13 @@ pub struct Sim {
     /// Per node, how many failed `AppendEntriesReply`s it has sent — one per
     /// round trip a leader spends walking its `nextIndex` back.
     pub rejections_sent: Vec<usize>,
+    /// Reads issued and not yet answered: id -> (node asked, the highest index
+    /// committed anywhere in the cluster when the read was issued). A
+    /// linearizable read must reflect at least that index.
+    pub pending_reads: BTreeMap<u64, (usize, u64)>,
+    pub next_read_id: u64,
+    pub reads_served: usize,
+    pub reads_failed: usize,
     pub rng: StdRng,
 
     // --- invariant bookkeeping (Raft safety properties) ---
@@ -142,6 +149,10 @@ impl Sim {
             replication: ReplicationConfig::default(),
             snapshots_sent: 0,
             rejections_sent: vec![0; node_count],
+            pending_reads: BTreeMap::new(),
+            next_read_id: 0,
+            reads_served: 0,
+            reads_failed: 0,
             rng,
             prev_commit: vec![0; node_count],
             prev_applied: vec![0; node_count],
@@ -281,13 +292,21 @@ impl Sim {
                 }
                 // The simulator has no durability model, so persistence
                 // effects are dropped; membership is read straight off the
-                // nodes, so the announcement is informational. No test issues
-                // reads yet.
+                // nodes, so the announcement is informational.
                 Effect::Persist { .. }
                 | Effect::PersistLog { .. }
-                | Effect::MembershipChanged { .. }
-                | Effect::ReadReady { .. }
-                | Effect::ReadFailed { .. } => {}
+                | Effect::MembershipChanged { .. } => {}
+                Effect::ReadReady { id, read_index } => self.check_read(i, id, read_index),
+                Effect::ReadFailed { id } => {
+                    let asked = self.pending_reads.remove(&id.get());
+                    assert!(
+                        asked.is_some_and(|(node, _)| node == i),
+                        "seed={}: node {i} failed read {} it was never asked",
+                        self.seed,
+                        id.get(),
+                    );
+                    self.reads_failed += 1;
+                }
                 // The leader streams its whole snapshot as one `InstallSnapshot`
                 // message (offset 0, done); the network can still drop it.
                 Effect::SendSnapshot { to } => {
@@ -387,6 +406,45 @@ impl Sim {
         );
     }
 
+    /// Asks node `i` for a linearizable read, remembering the highest index
+    /// committed anywhere right now as the floor its answer must reach.
+    pub fn issue_read(&mut self, i: usize) {
+        let id = self.next_read_id;
+        self.next_read_id += 1;
+        let floor = self.committed.keys().next_back().copied().unwrap_or(0);
+        self.pending_reads.insert(id, (i, floor));
+        self.step(
+            i,
+            Input::ReadIndex {
+                id: ReadId::new(id),
+            },
+        );
+        self.check_invariants();
+    }
+
+    /// Linearizability of a served read: node `i` was the node asked, and both
+    /// the read index and what its state machine has applied reach every entry
+    /// committed anywhere before the read was issued. A deposed leader serving
+    /// from a stale log fails this.
+    fn check_read(&mut self, i: usize, id: ReadId, read_index: LogIndex) {
+        let seed = self.seed;
+        let asked = self.pending_reads.remove(&id.get());
+        assert!(
+            asked.is_some_and(|(node, _)| node == i),
+            "seed={seed}: node {i} served read {} it was never asked",
+            id.get(),
+        );
+        let floor = asked.map_or(0, |(_, floor)| floor);
+        let applied = self.nodes[i].last_applied().get();
+        assert!(
+            read_index.get() >= floor && applied >= read_index.get(),
+            "seed={seed}: node {i} served read {} at index {read_index} with {applied} applied, \
+             but index {floor} was committed before it was issued",
+            id.get(),
+        );
+        self.reads_served += 1;
+    }
+
     /// Queues a message on the network, applying drop / jitter / duplication.
     /// Every `AppendEntries` is first checked against the byte cap.
     pub fn send(&mut self, from_idx: usize, to: NodeId, message: Message) {
@@ -475,6 +533,8 @@ impl Sim {
     pub fn wipe_node(&mut self, i: usize) {
         let peers = self.ids.iter().copied().filter(|&id| id != self.ids[i]);
         self.nodes[i] = RaftNode::new(self.ids[i], peers).with_replication(self.replication);
+        // The new incarnation knows nothing of the reads its predecessor took.
+        self.pending_reads.retain(|_, (node, _)| *node != i);
         self.applied[i].clear();
         self.snapshot[i] = None;
         self.prev_commit[i] = 0;
