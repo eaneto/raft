@@ -4,3 +4,6 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
+cc 7ffa4a0a40539dc8b25c3ed540326ae9e1a8b3d83344a260ea056de150c30b82 # shrinks to node_count = 3, seed = 8650928168920956208, replication = ReplicationConfig { max_inflight: 3, max_append_bytes: 16, snapshot_retry_ticks: 1 }, snapshot_threshold = Some(3), ops = [ProposeBurst(3), ProposeBurst(2), AddServer, Tick(57)]
+cc 444a90880a01050aa8fbf273a54b78f64f9f06c92f2c54361a6e8696f4f90bcc # shrinks to seed = 7315883664130969147, replication = ReplicationConfig { max_inflight: 4, max_append_bytes: 8, snapshot_retry_ticks: 1 }, snapshot_threshold = Some(7), ops = [Tick(40), Tick(40), Propose, Heal, AddServer, Tick(109), Transfer(3), Propose, Propose]
+cc d72cc86ad0b074ccfd0c651f585556371a582c9f41da393bd43ac2499fce3ae7 # shrinks to node_count = 3, seed = 16459505736703515604, replication = ReplicationConfig { max_inflight: 4, max_append_bytes: 0, snapshot_retry_ticks: 1 }, snapshot_threshold = Some(3), ops = [Tick(142), ProposeBurst(6)]

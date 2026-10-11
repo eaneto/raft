@@ -8,8 +8,8 @@
 //! tests assert liveness: once the network heals the cluster converges to one
 //! identical applied sequence. Each case also draws its own `AppendEntries`
 //! streaming limits — down to one batch in flight and a byte cap smaller than
-//! a single command — so pipelining and batch splitting run under the same
-//! churn.
+//! a single command — and an optional compaction threshold, so pipelining,
+//! batch splitting and snapshot catch-up run under the same churn.
 //!
 //! The schedules stay within Raft's fault budget — partitions and message loss
 //! (which Raft tolerates), plus *learner additions* (a passive node) and
@@ -71,19 +71,35 @@ fn op_strategy(allow_add: bool) -> impl Strategy<Value = Op> {
 }
 
 /// Streaming limits from one batch in flight with a 0-byte cap (one entry per
-/// batch) up to roomy ones.
+/// batch) up to roomy ones, and a snapshot retry budget from one heartbeat up.
 fn replication_strategy() -> impl Strategy<Value = ReplicationConfig> {
-    (1usize..=4, 0usize..=24).prop_map(|(max_inflight, max_append_bytes)| ReplicationConfig {
-        max_inflight,
-        max_append_bytes,
-    })
+    (1usize..=4, 0usize..=24, 1u32..=10).prop_map(
+        |(max_inflight, max_append_bytes, snapshot_retry_ticks)| ReplicationConfig {
+            max_inflight,
+            max_append_bytes,
+            snapshot_retry_ticks,
+        },
+    )
+}
+
+/// No compaction, or compaction every few entries, so lagging peers are
+/// caught up by snapshot under the same churn.
+fn snapshot_threshold_strategy() -> impl Strategy<Value = Option<u64>> {
+    prop::option::of(3u64..=12)
 }
 
 /// Runs `ops` against a fresh cluster and returns the final [`Sim`].
-fn run_schedule(node_count: usize, seed: u64, replication: ReplicationConfig, ops: &[Op]) -> Sim {
+fn run_schedule(
+    node_count: usize,
+    seed: u64,
+    replication: ReplicationConfig,
+    snapshot_threshold: Option<u64>,
+    ops: &[Op],
+) -> Sim {
     let mut sim = Sim::new(node_count, seed)
         .with_net(CHURN_NET)
         .with_replication(replication);
+    sim.snapshot_threshold = snapshot_threshold;
     sim.run_until_leader(15_000);
 
     let mut next_id = node_count as u64 + 1;
@@ -178,9 +194,10 @@ proptest! {
         node_count in 3usize..=5,
         seed in any::<u64>(),
         replication in replication_strategy(),
+        snapshot_threshold in snapshot_threshold_strategy(),
         ops in prop::collection::vec(op_strategy(false), 0..40),
     ) {
-        let _ = run_schedule(node_count, seed, replication, &ops);
+        let _ = run_schedule(node_count, seed, replication, snapshot_threshold, &ops);
     }
 
     /// After any partition churn, a healed cluster converges to one identical
@@ -190,9 +207,10 @@ proptest! {
         node_count in 3usize..=5,
         seed in any::<u64>(),
         replication in replication_strategy(),
+        snapshot_threshold in snapshot_threshold_strategy(),
         ops in prop::collection::vec(op_strategy(false), 0..32),
     ) {
-        let mut sim = run_schedule(node_count, seed, replication, &ops);
+        let mut sim = run_schedule(node_count, seed, replication, snapshot_threshold, &ops);
         heal_and_settle(&mut sim);
         assert_converged(&sim);
     }
@@ -203,9 +221,10 @@ proptest! {
     fn proptest_membership_changes_preserve_safety(
         seed in any::<u64>(),
         replication in replication_strategy(),
+        snapshot_threshold in snapshot_threshold_strategy(),
         ops in prop::collection::vec(op_strategy(true), 0..32),
     ) {
-        let mut sim = run_schedule(3, seed, replication, &ops);
+        let mut sim = run_schedule(3, seed, replication, snapshot_threshold, &ops);
         heal_and_settle(&mut sim);
         assert_converged(&sim);
     }
