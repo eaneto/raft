@@ -35,6 +35,9 @@ this file just tracks the sequence of small steps and what's done.
 | Change lifecycle | `Input::ChangeMembership` → (catch-up) → `Config` entry → commit. A new leader with an uncommitted `Config` entry adopts the pending change. Leader steps down after committing a config that removes it (§4.2.2). A server being removed keeps receiving `AppendEntries` until its removal commits, so it learns of it. A server absent from its own config stays passive. `Effect::MembershipChanged` drives transport reconciliation |
 | Pre-vote (§9.6) | election timeout → `Role::PreCandidate` runs a `Message::PreVote` straw poll at `currentTerm + 1` with no term bump / self-vote / persist; a quorum of grants promotes to a real `Candidate`. "A leader is still alive" is `RaftNode::heard_from_leader` — set on accepted `AppendEntries` / `InstallSnapshot`, cleared on `ElectionTimeout` — so the core reads no clock. A (pre-)vote is withheld while `heard_from_leader`, and a leader grants no pre-votes (§4.2.3). A removed server that never received its removal keeps its stale config for good but can no longer disrupt |
 | Leadership transfer (§3.10) | `Input::TransferLeadership { target }`; the transfer lives on `Role::Leader` (`LeadershipTransfer`), so any step-down drops it. The leader refuses proposals and membership changes while transferring, and refuses a transfer to itself, to a non-voter, during a membership change, or while one is running. It sends `Message::TimeoutNow` on every ack showing the target holds its whole log (a lost one is retried on the next heartbeat's ack). The target skips pre-vote and campaigns at once; its `RequestVote`s carry `leadership_transfer: bool`, which lets voters grant despite `heard_from_leader`. The transfer is abandoned after `TRANSFER_TICKS` heartbeats — **DEVIATION** from §3.10's election-timeout bound, since the core has no clock |
+| `AppendEntries` flow control | etcd-style per-peer `Progress { next_index, match_index, flow }` on `Role::Leader`. `Flow::Probe { paused }`: one `AppendEntries` at a time, `next_index` moves only on a reply. A success switches to `Flow::Replicate { inflight }`: each batch goes out at once and advances `next_index` optimistically, ≤ `max_inflight` unacked. A rejection drops back to `Probe` from `match_index + 1`; probing is **not** floored at `match_index`, so a wiped follower is still walked back. Heartbeats always go out — to a full window, empty and anchored past the in-flight batches, so a lost batch surfaces as a rejection |
+| Batch caps | `ReplicationConfig { max_inflight, max_append_bytes }` (defaults 8 / 1 MiB), set via `RaftNode::with_replication` and `node::Config::replication`. Bytes = command payload (8 per voter for a config), always ≥ 1 entry per batch. A streaming peer that is behind gets batches until its window fills |
+| Proposal batching | `Input::Propose { commands: Vec<Bytes> }` → one `PersistLog` + one round of `AppendEntries`. The driver drains proposals queued behind the first (≤ `MAX_PROPOSALS_PER_STEP`) and stashes the first other event so ordering holds |
 | `PreVoteRound` | pre-vote rounds are numbered (`PreVoteArgs.round`, echoed by the reply) and a grant counts only for the round it answers. Rounds at one term are otherwise indistinguishable — `currentTerm` deliberately does not move — so a late "yes" from an earlier round would be spent in a later one, promoting on consent the peer no longer gives; the term bump that follows unseats a healthy leader via `AppendEntriesReply`. This is why `PreVote` gets its own structs instead of reusing `RequestVoteArgs` / `RequestVoteReply` |
 
 ## Done
@@ -160,7 +163,17 @@ TCP transport. `just check` is green. Every module rustdoc is self-contained.
       (`a_leader_hands_off_to_a_chosen_voter`,
       `a_transfer_to_an_unreachable_voter_is_abandoned`) + a proptest
       `Transfer` op; `Node::transfer_leadership` + a TCP integration test.
-- [ ] Batching / pipelining `AppendEntries`
+- [x] **Batching / pipelining `AppendEntries`.** `Progress` refactor;
+      Probe/Replicate flow control with a `max_inflight` window; a
+      `max_append_bytes` cap per batch; batched `Input::Propose` drained by
+      the driver. Sim batteries
+      (`bursts_commit_through_a_tight_pipelining_window`,
+      `a_wiped_follower_recovers_through_a_tight_window`), a harness check of
+      the byte cap on every `AppendEntries`, per-case limits + a
+      `ProposeBurst` op in proptest, and a TCP burst integration test. —
+      `665da3f..`
+- [ ] Fast log backtracking (`AppendEntriesReply` carries a conflict
+      index/term so the leader skips a whole term per rejection — paper §5.3)
 - [ ] Read-index / lease reads (thesis §6.4)
 
 ## Module layout (`AGENTS.md` §5)
