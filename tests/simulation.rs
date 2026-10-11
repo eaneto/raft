@@ -1356,3 +1356,127 @@ fn a_divergent_tail_is_skipped_a_term_at_a_time() {
         assert_divergent_tail_is_skipped_per_term(seed);
     }
 }
+
+// --- Phase 2: ReadIndex (thesis §6.4) ------------------------------------------
+
+/// Linearizable reads under the kitchen-sink network: loss, duplication,
+/// reordering and a partition redrawn every ~700ms. Every slice proposes a
+/// write to the leader (if any), asks a rotating node for a read, and asks
+/// every node that believes it leads -- a deposed leader in a minority among
+/// them. The harness checks each served read against everything committed
+/// before it was issued. Once the network heals and settles, every read has
+/// been answered one way or the other.
+fn assert_reads_stay_linearizable_under_chaos(seed: u64) {
+    let node_count = 5;
+    let net = Net {
+        drop_permille: 50,
+        dup_permille: 120,
+        jitter: 25,
+        repartition_every: 700,
+    };
+    let mut sim = Sim::new(node_count, seed).with_net(net);
+
+    let mut slice = 0usize;
+    while sim.now < 30_000 {
+        if let Some(leader) = sim.sole_leader() {
+            sim.propose_at(leader, format!("c{slice}").as_bytes());
+        }
+        sim.issue_read(slice % node_count);
+        for leader in sim.leaders() {
+            sim.issue_read(leader);
+        }
+        slice += 1;
+        sim.run_until(sim.now + 137);
+    }
+
+    sim.net.repartition_every = 0;
+    sim.next_net_change = NEVER;
+    sim.set_groups(vec![0; node_count]);
+    sim.run_until(sim.now + 10_000);
+    let leader = sim.run_until_leader(10_000);
+    sim.issue_read(leader);
+    sim.run_until(sim.now + 1_000);
+
+    assert!(
+        sim.reads_served > 0,
+        "seed={seed}: no read was ever served under chaos",
+    );
+    assert!(
+        sim.pending_reads.is_empty(),
+        "seed={seed}: reads still unanswered after the heal: {:?}",
+        sim.pending_reads,
+    );
+}
+
+#[test]
+fn reads_stay_linearizable_under_chaos() {
+    for seed in seeds(&[1, 2, 3, 42, 1_000, 0x5EED, 7, 99]) {
+        assert_reads_stay_linearizable_under_chaos(seed);
+    }
+}
+
+/// The stale read `ReadIndex` exists to prevent. A leader cut off from the rest
+/// still believes it leads; the majority elects a successor and commits a
+/// write the old leader never sees. A read asked of the old leader must not be
+/// served from its stale state: no quorum echoes its round, so the read waits,
+/// and fails once the heal makes it step down. The new leader serves a read
+/// that reflects the write.
+fn assert_deposed_leader_never_serves_a_stale_read(seed: u64) {
+    let node_count = 5;
+    let mut sim = Sim::new(node_count, seed).with_net(JITTER5);
+    let old_leader = sim.run_until_leader(5_000);
+    sim.propose_at(old_leader, b"before");
+    sim.run_until(sim.now + 500);
+
+    let mut groups = vec![0usize; node_count];
+    groups[old_leader] = 1;
+    sim.set_groups(groups);
+    let mut new_leader = None;
+    let deadline = sim.now + 5_000;
+    while new_leader.is_none() && sim.now < deadline {
+        sim.run_until(sim.now + HEARTBEAT_PERIOD);
+        new_leader = sim.leader_in_group(0);
+    }
+    assert!(
+        new_leader.is_some(),
+        "seed={seed}: the majority elected no leader"
+    );
+    let new_leader = new_leader.unwrap_or(0);
+    sim.propose_at(new_leader, b"after");
+    sim.run_until(sim.now + 500);
+
+    assert!(
+        sim.nodes[old_leader].is_leader(),
+        "seed={seed}: the isolated leader stepped down on its own",
+    );
+    sim.issue_read(old_leader);
+    sim.run_until(sim.now + 2_000);
+    assert_eq!(
+        (sim.reads_served, sim.reads_failed),
+        (0, 0),
+        "seed={seed}: the isolated leader answered a read it cannot confirm",
+    );
+
+    sim.set_groups(vec![0; node_count]);
+    sim.run_until(sim.now + 1_000);
+    assert_eq!(
+        (sim.reads_served, sim.reads_failed),
+        (0, 1),
+        "seed={seed}: the deposed leader's read did not fail on the heal",
+    );
+
+    let leader = sim.run_until_leader(5_000);
+    sim.issue_read(leader);
+    sim.run_until(sim.now + 500);
+    assert_eq!(
+        sim.reads_served, 1,
+        "seed={seed}: the current leader did not serve a read",
+    );
+}
+
+#[test]
+fn a_deposed_leader_never_serves_a_stale_read() {
+    for seed in seeds(&[1, 2, 3, 42, 1_000, 0x5EED, 7, 99]) {
+        assert_deposed_leader_never_serves_a_stale_read(seed);
+    }
+}
