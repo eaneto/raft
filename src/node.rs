@@ -599,6 +599,8 @@ impl<S: Storage, M: StateMachine, T: PeerTransport> Driver<S, M, T> {
                     self.receive_snapshot_chunk(meta, offset, &data, done, now)?;
                 }
                 Effect::MembershipChanged { config } => self.reconcile_transport(&config),
+                // The driver issues no reads yet, so the core answers none.
+                Effect::ReadReady { .. } | Effect::ReadFailed { .. } => {}
             }
         }
         Ok(())

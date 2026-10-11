@@ -202,6 +202,67 @@ impl PreVoteRound {
     }
 }
 
+/// Numbers a leader's rounds of `AppendEntries` within its term, so that it
+/// can tell which replies answer an RPC sent *after* a given moment (thesis
+/// §6.4).
+///
+/// To serve a read, the leader must confirm it was still leader at some point
+/// after the read arrived. An ack proves only that the follower had not moved
+/// to a newer term when it handled the RPC, so it counts only for an RPC sent
+/// after the read: the leader starts a new round when a read arrives, every
+/// `AppendEntries` carries the current round, and every reply echoes it. Any
+/// reply at the leader's term counts, success or not.
+///
+/// Rounds restart at zero with each leadership. Replies are matched to a
+/// leadership by term, and a server leads at most once per term.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct HeartbeatRound(u64);
+
+impl HeartbeatRound {
+    /// The round a leadership starts in, before any read has asked for one.
+    pub const ZERO: Self = Self(0);
+
+    /// Wraps a raw round number.
+    #[must_use]
+    pub const fn new(round: u64) -> Self {
+        Self(round)
+    }
+
+    /// The next round.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+
+    /// The raw round number.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// The driver's handle for one linearizable read ([`Input::ReadIndex`]),
+/// echoed by [`Effect::ReadReady`] or [`Effect::ReadFailed`]. The core never
+/// interprets it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReadId(u64);
+
+impl ReadId {
+    /// Wraps a raw id.
+    #[must_use]
+    pub const fn new(id: u64) -> Self {
+        Self(id)
+    }
+
+    /// The raw id.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 impl fmt::Display for PreVoteRound {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
@@ -655,6 +716,8 @@ pub enum Role {
         /// The leadership transfer this leader is running, if any (thesis
         /// §3.10). While it is `Some` the leader accepts no new proposals.
         transfer: Option<LeadershipTransfer>,
+        /// The round every `AppendEntries` now carries; bumped by each read.
+        heartbeat_round: HeartbeatRound,
     },
 }
 
@@ -670,6 +733,8 @@ pub struct Progress {
     pub match_index: LogIndex,
     /// How eagerly the leader may send to the peer.
     pub flow: Flow,
+    /// The newest [`HeartbeatRound`] the peer has echoed back.
+    pub acked_round: HeartbeatRound,
 }
 
 impl Progress {
@@ -680,8 +745,21 @@ impl Progress {
             next_index,
             match_index: LogIndex::ZERO,
             flow: Flow::Probe { paused: false },
+            acked_round: HeartbeatRound::ZERO,
         }
     }
+}
+
+/// A read the leader has accepted but not yet answered (thesis §6.4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingRead {
+    id: ReadId,
+    /// The first round sent after the read arrived; a quorum must echo it.
+    round: HeartbeatRound,
+    /// `commitIndex` once an entry of the leader's term has committed (no
+    /// sooner: until then it may lag the cluster's). The read is served from
+    /// a state machine that has applied at least this far.
+    read_index: Option<LogIndex>,
 }
 
 /// Flow control for one peer's `AppendEntries` stream.
@@ -951,6 +1029,15 @@ pub enum Input {
         /// The voter that should become leader.
         target: NodeId,
     },
+    /// A client wants a linearizable read (thesis §6.4, `ReadIndex`). The
+    /// leader answers with [`Effect::ReadReady`] once it has confirmed it
+    /// still leads and its state machine has caught up to the read's index —
+    /// or [`Effect::ReadFailed`] if it is not leader, or stops leading first.
+    /// Nothing is written to the log.
+    ReadIndex {
+        /// The driver's handle for the read, echoed in the answer.
+        id: ReadId,
+    },
 }
 
 /// A side effect the core needs the driver to perform.
@@ -1048,6 +1135,23 @@ pub enum Effect {
         /// The configuration now in force.
         config: ClusterConfig,
     },
+    /// The read `id` is safe to serve now: query the state machine as it
+    /// stands. The state machine has applied at least `read_index`, and this
+    /// effect follows every [`Effect::ApplyToStateMachine`] of the same step,
+    /// so performing effects in order is enough.
+    ReadReady {
+        /// The handle from [`Input::ReadIndex`].
+        id: ReadId,
+        /// The leader's `commitIndex` the read is linearized at.
+        read_index: LogIndex,
+    },
+    /// The read `id` cannot be served by this node: it is not the leader, or
+    /// stopped leading before the read was confirmed. The client may retry,
+    /// ideally against the current leader.
+    ReadFailed {
+        /// The handle from [`Input::ReadIndex`].
+        id: ReadId,
+    },
 }
 
 /// A single Raft server: the pure state machine.
@@ -1104,6 +1208,8 @@ pub struct RaftNode {
     pending_change: Option<PendingChange>,
     /// How this node streams its log while it leads.
     replication: ReplicationConfig,
+    /// Reads accepted while leading and not yet answered, oldest first.
+    reads: Vec<PendingRead>,
 }
 
 impl RaftNode {
@@ -1132,6 +1238,7 @@ impl RaftNode {
             pre_vote_round: PreVoteRound::ZERO,
             pending_change: None,
             replication: ReplicationConfig::default(),
+            reads: Vec::new(),
         };
         node.recompute_config();
         node
@@ -1228,6 +1335,13 @@ impl RaftNode {
     #[must_use]
     pub fn step(&mut self, input: Input, now: LogicalInstant) -> Vec<Effect> {
         let _ = now;
+        let mut effects = self.dispatch(input);
+        self.settle_reads(&mut effects);
+        effects
+    }
+
+    /// Routes one input to its handler.
+    fn dispatch(&mut self, input: Input) -> Vec<Effect> {
         match input {
             Input::Deliver { from, message } => match message {
                 Message::RequestVote(args) => self.handle_request_vote(args),
@@ -1253,7 +1367,91 @@ impl RaftNode {
             Input::CompactLog { up_to_index } => self.handle_compact_log(up_to_index),
             Input::ChangeMembership { change } => self.handle_change_membership(change),
             Input::TransferLeadership { target } => self.handle_transfer_leadership(target),
+            Input::ReadIndex { id } => self.handle_read_index(id),
         }
+    }
+
+    /// Handles [`Input::ReadIndex`] (thesis §6.4). A non-leader fails the read
+    /// at once. A leader starts a new [`HeartbeatRound`] and sends it to every
+    /// peer straight away; [`RaftNode::settle_reads`] answers the read once a
+    /// quorum has echoed that round.
+    fn handle_read_index(&mut self, id: ReadId) -> Vec<Effect> {
+        let Role::Leader {
+            heartbeat_round, ..
+        } = &mut self.role
+        else {
+            return vec![Effect::ReadFailed { id }];
+        };
+        *heartbeat_round = heartbeat_round.next();
+        self.reads.push(PendingRead {
+            id,
+            round: *heartbeat_round,
+            read_index: None,
+        });
+        self.replicate_to_peers(true)
+    }
+
+    /// Runs after every input: answers each pending read that has become
+    /// servable, and fails them all once this node no longer leads — however
+    /// it stopped, so no step-down path can strand a read.
+    ///
+    /// A read takes `commitIndex` as its read index only once an entry of this
+    /// leader's term has committed (until then `commitIndex` may lag the
+    /// cluster's). It is ready when a quorum has echoed its round and
+    /// `lastApplied` has reached its read index.
+    fn settle_reads(&mut self, effects: &mut Vec<Effect>) {
+        if self.reads.is_empty() {
+            return;
+        }
+        if !self.is_leader() {
+            effects.extend(
+                self.reads
+                    .drain(..)
+                    .map(|read| Effect::ReadFailed { id: read.id }),
+            );
+            return;
+        }
+        if self.committed_in_current_term() {
+            let commit_index = self.commit_index;
+            for read in &mut self.reads {
+                read.read_index.get_or_insert(commit_index);
+            }
+        }
+        let confirmed = self.confirmed_round();
+        let last_applied = self.last_applied;
+        self.reads.retain(|read| match read.read_index {
+            Some(read_index) if read.round <= confirmed && read_index <= last_applied => {
+                effects.push(Effect::ReadReady {
+                    id: read.id,
+                    read_index,
+                });
+                false
+            }
+            _ => true,
+        });
+    }
+
+    /// The newest [`HeartbeatRound`] a quorum of voters has echoed, this
+    /// leader counting as having echoed its own current round. Zero when not
+    /// leading.
+    fn confirmed_round(&self) -> HeartbeatRound {
+        let Role::Leader {
+            progress,
+            heartbeat_round,
+            ..
+        } = &self.role
+        else {
+            return HeartbeatRound::ZERO;
+        };
+        // Only voters count, as for commitment.
+        let mut acked: Vec<HeartbeatRound> = progress
+            .iter()
+            .filter(|(peer, _)| self.config.contains(**peer))
+            .map(|(_, p)| p.acked_round)
+            .collect();
+        acked.push(*heartbeat_round);
+        acked.sort_unstable_by_key(|&round| std::cmp::Reverse(round));
+        acked[self.quorum() - 1]
     }
 
     /// Handles an incoming `RequestVote` (Figure 2).
@@ -1452,7 +1650,7 @@ impl RaftNode {
         // Receiver rule 1: reply false to a leader from an older term, and do
         // not treat it as leader contact.
         if args.term < self.current_term {
-            effects.push(self.append_entries_reply(args.leader_id, false, LogIndex::ZERO, None));
+            effects.push(self.append_entries_reply(args, false, LogIndex::ZERO, None));
             return effects;
         }
 
@@ -1480,12 +1678,7 @@ impl RaftNode {
         if !consistent {
             let conflict = self.conflict_at(args.prev_log_index);
             effects.push(Effect::ResetElectionTimer);
-            effects.push(self.append_entries_reply(
-                args.leader_id,
-                false,
-                LogIndex::ZERO,
-                Some(conflict),
-            ));
+            effects.push(self.append_entries_reply(args, false, LogIndex::ZERO, Some(conflict)));
             return effects;
         }
 
@@ -1521,7 +1714,7 @@ impl RaftNode {
         }
 
         effects.push(Effect::ResetElectionTimer);
-        effects.push(self.append_entries_reply(args.leader_id, true, last_covered, None));
+        effects.push(self.append_entries_reply(args, true, last_covered, None));
         effects
     }
 
@@ -1625,6 +1818,14 @@ impl RaftNode {
         // A stale reply, or one meant for a leadership we no longer hold.
         if reply.term < self.current_term || !self.is_leader() {
             return effects;
+        }
+
+        // Any reply at our term shows `from` still followed us when it
+        // handled that round (thesis §6.4).
+        if let Role::Leader { progress, .. } = &mut self.role
+            && let Some(p) = progress.get_mut(&from)
+        {
+            p.acked_round = p.acked_round.max(reply.heartbeat_round);
         }
 
         if reply.success {
@@ -2284,6 +2485,7 @@ impl RaftNode {
         self.role = Role::Leader {
             progress,
             transfer: None,
+            heartbeat_round: HeartbeatRound::ZERO,
         };
         self.adopt_pending_config_change();
     }
@@ -2534,7 +2736,20 @@ impl RaftNode {
                 prev_log_term,
                 entries: entries[..count.min(entries.len())].to_vec(),
                 leader_commit: self.commit_index,
+                heartbeat_round: self.heartbeat_round(),
             }),
+        }
+    }
+
+    /// The round this leader's `AppendEntries` carry; zero when not leading.
+    const fn heartbeat_round(&self) -> HeartbeatRound {
+        match &self.role {
+            Role::Leader {
+                heartbeat_round, ..
+            } => *heartbeat_round,
+            Role::Follower | Role::PreCandidate { .. } | Role::Candidate { .. } => {
+                HeartbeatRound::ZERO
+            }
         }
     }
 
@@ -2583,21 +2798,23 @@ impl RaftNode {
     ///
     /// `match_index` is the highest index the follower has stored for this
     /// leader on `success`, and [`LogIndex::ZERO`] otherwise; `conflict` is
-    /// the back-off hint on a failed consistency check.
+    /// the back-off hint on a failed consistency check. The reply goes to
+    /// `args`' leader and echoes its heartbeat round.
     const fn append_entries_reply(
         &self,
-        leader: NodeId,
+        args: &AppendEntriesArgs,
         success: bool,
         match_index: LogIndex,
         conflict: Option<Conflict>,
     ) -> Effect {
         Effect::SendRpc {
-            to: leader,
+            to: args.leader_id,
             message: Message::AppendEntriesReply(AppendEntriesReply {
                 term: self.current_term,
                 success,
                 match_index,
                 conflict,
+                heartbeat_round: args.heartbeat_round,
             }),
         }
     }
@@ -2767,10 +2984,10 @@ mod tests {
 
     use super::{
         AppendEntriesArgs, AppendEntriesReply, CATCH_UP_TICKS, ClusterConfig, Conflict, Effect,
-        Flow, Input, InstallSnapshotArgs, InstallSnapshotReply, Log, LogEntry, LogIndex,
-        LogicalInstant, MembershipChange, Message, NodeId, PreVoteArgs, PreVoteReply, PreVoteRound,
-        Progress, RaftNode, ReplicationConfig, RequestVoteArgs, RequestVoteReply, Role,
-        TRANSFER_TICKS, Term, TimeoutNowArgs,
+        Flow, HeartbeatRound, Input, InstallSnapshotArgs, InstallSnapshotReply, Log, LogEntry,
+        LogIndex, LogicalInstant, MembershipChange, Message, NodeId, PreVoteArgs, PreVoteReply,
+        PreVoteRound, Progress, RaftNode, ReadId, ReplicationConfig, RequestVoteArgs,
+        RequestVoteReply, Role, TRANSFER_TICKS, Term, TimeoutNowArgs,
     };
 
     /// The core does not consult the clock under this timer model, so every
@@ -2868,6 +3085,7 @@ mod tests {
             prev_log_term: Term::new(prev_log_term),
             entries: Vec::new(),
             leader_commit: LogIndex::ZERO,
+            heartbeat_round: HeartbeatRound::ZERO,
         })
     }
 
@@ -2880,6 +3098,7 @@ mod tests {
                 success,
                 match_index: LogIndex::ZERO,
                 conflict: None,
+                heartbeat_round: HeartbeatRound::ZERO,
             }),
         }
     }
@@ -2899,6 +3118,7 @@ mod tests {
                 term: conflict_term.map(Term::new),
                 index: LogIndex::new(conflict_index),
             }),
+            heartbeat_round: HeartbeatRound::ZERO,
         })
     }
 
@@ -2911,8 +3131,20 @@ mod tests {
                 success: true,
                 match_index: LogIndex::new(matched),
                 conflict: None,
+                heartbeat_round: HeartbeatRound::ZERO,
             }),
         }
+    }
+
+    /// An incoming `AppendEntriesReply` message answering heartbeat `round`.
+    fn ae_reply_in_round(term: u64, success: bool, matched: u64, round: u64) -> Message {
+        Message::AppendEntriesReply(AppendEntriesReply {
+            term: Term::new(term),
+            success,
+            match_index: LogIndex::new(matched),
+            conflict: None,
+            heartbeat_round: HeartbeatRound::new(round),
+        })
     }
 
     /// An incoming `AppendEntriesReply` message.
@@ -2922,6 +3154,7 @@ mod tests {
             success,
             match_index: LogIndex::new(matched),
             conflict: None,
+            heartbeat_round: HeartbeatRound::ZERO,
         })
     }
 
@@ -2940,6 +3173,7 @@ mod tests {
             prev_log_term: Term::new(prev_log_term),
             entries,
             leader_commit: LogIndex::new(leader_commit),
+            heartbeat_round: HeartbeatRound::ZERO,
         })
     }
 
@@ -6215,5 +6449,203 @@ mod tests {
         assert_eq!(n.log().last_index(), before.next());
         // And a fresh transfer may start.
         assert!(!n.step(transfer_to(2), NOW).is_empty());
+    }
+
+    // --- Phase 2: ReadIndex (thesis §6.4) ------------------------------------
+
+    fn read(id: u64) -> Input {
+        Input::ReadIndex {
+            id: ReadId::new(id),
+        }
+    }
+
+    fn read_ready(id: u64, read_index: u64) -> Effect {
+        Effect::ReadReady {
+            id: ReadId::new(id),
+            read_index: LogIndex::new(read_index),
+        }
+    }
+
+    fn read_failed(id: u64) -> Effect {
+        Effect::ReadFailed {
+            id: ReadId::new(id),
+        }
+    }
+
+    /// The `heartbeat_round` of every `AppendEntries` in `effects`.
+    fn rounds(effects: &[Effect]) -> Vec<u64> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::SendRpc {
+                    message: Message::AppendEntries(args),
+                    ..
+                } => Some(args.heartbeat_round.get()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_read_id_round_trips_its_raw_value() {
+        assert_eq!(ReadId::new(7).get(), 7);
+        assert_eq!(HeartbeatRound::new(3).get(), 3);
+        assert_eq!(HeartbeatRound::ZERO.next(), HeartbeatRound::new(1));
+    }
+
+    #[test]
+    fn a_follower_fails_a_read_at_once() {
+        let mut n = node(1, &[2, 3]);
+
+        assert_eq!(n.step(read(7), NOW), vec![read_failed(7)]);
+    }
+
+    #[test]
+    fn a_read_starts_a_new_round_sent_to_every_peer_at_once() {
+        let mut n = acked_leader();
+
+        let effects = n.step(read(7), NOW);
+
+        assert_eq!(rounds(&effects), vec![1, 1]);
+        assert!(!effects.contains(&read_ready(7, 1)));
+    }
+
+    #[test]
+    fn a_quorum_echoing_the_reads_round_serves_it() {
+        let mut n = acked_leader();
+        drive(&mut n, read(7));
+
+        let effects = n.step(deliver(2, ae_reply_in_round(1, true, 1, 1)), NOW);
+
+        assert_eq!(effects, vec![read_ready(7, 1)]);
+    }
+
+    #[test]
+    fn an_ack_for_a_round_before_the_read_does_not_confirm_it() {
+        let mut n = acked_leader();
+        drive(&mut n, read(7));
+
+        // An AppendEntries sent before the read arrived proves nothing about
+        // leadership after it.
+        let effects = n.step(deliver(2, ae_reply_in_round(1, true, 1, 0)), NOW);
+
+        assert!(!effects.contains(&read_ready(7, 1)));
+    }
+
+    #[test]
+    fn a_rejection_at_the_leaders_term_still_confirms_a_read() {
+        let mut n = acked_leader();
+        drive(&mut n, read(7));
+
+        let effects = n.step(deliver(2, ae_reply_in_round(1, false, 0, 1)), NOW);
+
+        assert!(effects.contains(&read_ready(7, 1)));
+    }
+
+    #[test]
+    fn later_proposals_carry_the_latest_round() {
+        let mut n = acked_leader();
+        drive(&mut n, read(7));
+        drive(&mut n, read(8));
+
+        let effects = n.step(propose(b"cmd"), NOW);
+
+        assert_eq!(rounds(&effects), vec![2, 2]);
+    }
+
+    #[test]
+    fn each_read_waits_for_its_own_round() {
+        let mut n = acked_leader();
+        drive(&mut n, read(7)); // round 1
+        drive(&mut n, read(8)); // round 2
+
+        let effects = n.step(deliver(2, ae_reply_in_round(1, true, 1, 1)), NOW);
+        assert_eq!(effects, vec![read_ready(7, 1)]);
+
+        let effects = n.step(deliver(3, ae_reply_in_round(1, true, 1, 2)), NOW);
+        assert_eq!(effects, vec![read_ready(8, 1)]);
+    }
+
+    #[test]
+    fn a_read_waits_for_the_leaders_noop_to_commit() {
+        let mut n = node(1, &[2, 3]);
+        time_out(&mut n);
+        drive(&mut n, deliver(2, vote_reply(1, true))); // leader, no-op unacked
+        drive(&mut n, read(7));
+
+        // Leadership is confirmed, but commitIndex may still lag the
+        // cluster's until the no-op commits.
+        let effects = n.step(deliver(2, ae_reply_in_round(1, false, 0, 1)), NOW);
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::ReadReady { .. })),
+            "served a read before the no-op committed: {effects:?}",
+        );
+
+        let effects = n.step(deliver(2, ae_reply_in_round(1, true, 1, 1)), NOW);
+        assert!(effects.contains(&read_ready(7, 1)));
+    }
+
+    #[test]
+    fn a_read_waits_until_the_state_machine_reaches_its_index() {
+        let mut n = acked_leader();
+        // As if index 1 were committed but not yet applied.
+        n.last_applied = LogIndex::ZERO;
+        drive(&mut n, read(7));
+
+        let effects = n.step(deliver(2, ae_reply_in_round(1, true, 1, 1)), NOW);
+
+        assert!(effects.is_empty(), "{effects:?}");
+    }
+
+    #[test]
+    fn a_single_server_serves_a_read_at_once() {
+        let mut n = node(1, &[]);
+        drive(&mut n, Input::ElectionTimeout); // leader, no-op committed
+
+        assert_eq!(n.step(read(7), NOW), vec![read_ready(7, 1)]);
+    }
+
+    #[test]
+    fn a_leader_that_steps_down_fails_its_pending_reads() {
+        let mut n = acked_leader();
+        drive(&mut n, read(7));
+        drive(&mut n, read(8));
+
+        let effects = n.step(deliver(3, ae_reply(5, false, 0)), NOW);
+
+        assert!(n.is_follower());
+        assert!(effects.ends_with(&[read_failed(7), read_failed(8)]));
+        // Nothing is left to answer later.
+        drive(&mut n, deliver(2, ae_reply_in_round(1, true, 1, 2)));
+        assert!(n.reads.is_empty());
+    }
+
+    #[test]
+    fn only_voters_confirm_a_read() {
+        let mut n = acked_leader();
+        if let Role::Leader { progress, .. } = &mut n.role {
+            progress.insert(NodeId::new(4), Progress::new(LogIndex::new(2)));
+        }
+        drive(&mut n, read(7));
+
+        // Node 4 is a learner, not in the configuration.
+        let effects = n.step(deliver(4, ae_reply_in_round(1, true, 1, 1)), NOW);
+
+        assert!(!effects.contains(&read_ready(7, 1)));
+    }
+
+    #[test]
+    fn a_follower_echoes_the_round_it_was_sent() {
+        let mut n = node(1, &[2, 3]);
+        let Message::AppendEntries(mut args) = heartbeat(1, 2, 0, 0) else {
+            unreachable!("heartbeat builds an AppendEntries");
+        };
+        args.heartbeat_round = HeartbeatRound::new(9);
+
+        let effects = n.step(deliver(2, Message::AppendEntries(args)), NOW);
+
+        assert!(effects.contains(&send(2, ae_reply_in_round(1, true, 0, 9))));
     }
 }
