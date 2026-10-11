@@ -1667,6 +1667,10 @@ impl RaftNode {
             && up_to_index <= self.last_applied
             && let Some(term) = self.log.term_at(up_to_index)
         {
+            // The snapshot replaces every `Config` entry up to `up_to_index`,
+            // so the fallback configuration must become the one in force
+            // there — not stay the bootstrap set.
+            self.base_config = self.config_at(up_to_index);
             self.log.compact(up_to_index, term);
             self.recompute_config();
         }
@@ -2195,17 +2199,7 @@ impl RaftNode {
     /// The configuration in force just before `config_index`: the previous
     /// configuration entry in the log, or `base_config` if there is none.
     fn config_before(&self, config_index: LogIndex) -> ClusterConfig {
-        let base = self.log.snapshot_last_index().get();
-        self.log
-            .entries_from(LogIndex::new(1))
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(pos, entry)| {
-                entry.as_config().is_some() && base + *pos as u64 + 1 < config_index.get()
-            })
-            .and_then(|(_, entry)| entry.as_config().cloned())
-            .unwrap_or_else(|| self.base_config.clone())
+        self.config_at(config_index.prev())
     }
 
     /// If we are a candidate holding a quorum of votes, become leader and
@@ -2483,6 +2477,26 @@ impl RaftNode {
     #[must_use]
     pub const fn config(&self) -> &ClusterConfig {
         &self.config
+    }
+
+    /// The configuration in force at log index `index`: the latest
+    /// [`LogEntryKind::Config`] entry at or below it, or the configuration the
+    /// log was compacted (or bootstrapped) with if there is none in memory.
+    ///
+    /// This is the configuration a snapshot covering `index` must carry
+    /// (thesis §5.1); a later, possibly uncommitted, `Config` entry does not
+    /// belong in it.
+    #[must_use]
+    pub fn config_at(&self, index: LogIndex) -> ClusterConfig {
+        let base = self.log.snapshot_last_index().get();
+        self.log
+            .entries_from(LogIndex::new(1))
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(pos, entry)| entry.as_config().is_some() && base + (*pos as u64) < index.get())
+            .and_then(|(_, entry)| entry.as_config().cloned())
+            .unwrap_or_else(|| self.base_config.clone())
     }
 
     /// The current role and its per-role volatile state.
@@ -4588,6 +4602,94 @@ mod tests {
             },
         );
         n
+    }
+
+    #[test]
+    fn config_at_is_the_latest_config_entry_at_or_below_the_index() {
+        let mut n = node(1, &[2, 3]);
+        n.log.append(entry(1)); // 1
+        n.log
+            .append(LogEntry::config(Term::new(1), config(&[1, 2, 3, 4]))); // 2
+        n.log.append(entry(1)); // 3
+        n.log
+            .append(LogEntry::config(Term::new(1), config(&[1, 2, 4]))); // 4
+
+        assert_eq!(n.config_at(LogIndex::new(1)), config(&[1, 2, 3]));
+        assert_eq!(n.config_at(LogIndex::new(2)), config(&[1, 2, 3, 4]));
+        assert_eq!(n.config_at(LogIndex::new(3)), config(&[1, 2, 3, 4]));
+        assert_eq!(n.config_at(LogIndex::new(4)), config(&[1, 2, 4]));
+    }
+
+    #[test]
+    fn compacting_past_a_config_entry_keeps_that_configuration() {
+        let mut n = node(1, &[2, 3]);
+        n.log.append(entry(1)); // 1
+        n.log
+            .append(LogEntry::config(Term::new(1), config(&[1, 2]))); // 2
+        n.log.append(entry(1)); // 3
+        n.log
+            .append(LogEntry::config(Term::new(1), config(&[1, 2, 5]))); // 4, later
+        n.current_term = Term::new(1);
+        n.commit_index = LogIndex::new(3);
+        n.last_applied = LogIndex::new(3);
+
+        drive(
+            &mut n,
+            Input::CompactLog {
+                up_to_index: LogIndex::new(3),
+            },
+        );
+
+        // The removal of node 3 is folded into the snapshot, not reverted to
+        // the bootstrap set; the later entry is still in force on top of it.
+        assert_eq!(n.config_at(LogIndex::new(3)), config(&[1, 2]));
+        assert_eq!(n.config(), &config(&[1, 2, 5]));
+
+        // Once the later entry is compacted too, it becomes the fallback.
+        n.commit_index = LogIndex::new(4);
+        n.last_applied = LogIndex::new(4);
+        drive(
+            &mut n,
+            Input::CompactLog {
+                up_to_index: LogIndex::new(4),
+            },
+        );
+        assert_eq!(n.log().snapshot_last_index(), n.log().last_index());
+        assert_eq!(n.config(), &config(&[1, 2, 5]));
+    }
+
+    #[test]
+    fn a_learner_that_compacts_away_its_admission_keeps_its_configuration() {
+        let mut n = RaftNode::new_learner(NodeId::new(4));
+        drive(
+            &mut n,
+            deliver(
+                1,
+                append_entries(
+                    1,
+                    1,
+                    0,
+                    0,
+                    vec![
+                        entry(1),
+                        LogEntry::config(Term::new(1), config(&[1, 2, 3, 4])),
+                    ],
+                    2,
+                ),
+            ),
+        );
+        assert!(n.config().contains(NodeId::new(4)));
+
+        drive(
+            &mut n,
+            Input::CompactLog {
+                up_to_index: LogIndex::new(2),
+            },
+        );
+
+        // Before the fix this fell back to the learner's empty bootstrap set,
+        // leaving a voter (or leader) with no quorum at all.
+        assert_eq!(n.config(), &config(&[1, 2, 3, 4]));
     }
 
     #[test]
