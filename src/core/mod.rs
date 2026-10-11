@@ -760,6 +760,8 @@ struct PendingRead {
     /// sooner: until then it may lag the cluster's). The read is served from
     /// a state machine that has applied at least this far.
     read_index: Option<LogIndex>,
+    /// Heartbeat ticks left before the read is failed; see [`READ_TICKS`].
+    ticks_left: u32,
 }
 
 /// Flow control for one peer's `AppendEntries` stream.
@@ -873,6 +875,18 @@ pub struct LeadershipTransfer {
 /// that is one maximal election timeout, the bound thesis §3.10 asks for. See
 /// [`LeadershipTransfer::ticks_left`].
 pub const TRANSFER_TICKS: u32 = 6;
+
+/// Heartbeat ticks a read has to be confirmed in before the leader gives up
+/// on it with [`Effect::ReadFailed`].
+///
+/// A leader cut off from a quorum never confirms a read, and without
+/// check-quorum it does not step down on its own either, so the read would
+/// otherwise wait for the partition to heal. With the default 50 ms heartbeat
+/// and 150–300 ms election timeout this is one maximal election timeout.
+///
+/// DEVIATION: thesis §6.4 sets no bound on a read; the pure core has no clock,
+/// so the bound is counted in heartbeat ticks.
+pub const READ_TICKS: u32 = 6;
 
 /// A single-server membership change (thesis §4): one server added or removed
 /// per configuration entry. Joint consensus is deliberately not used.
@@ -1032,8 +1046,9 @@ pub enum Input {
     /// A client wants a linearizable read (thesis §6.4, `ReadIndex`). The
     /// leader answers with [`Effect::ReadReady`] once it has confirmed it
     /// still leads and its state machine has caught up to the read's index —
-    /// or [`Effect::ReadFailed`] if it is not leader, or stops leading first.
-    /// Nothing is written to the log.
+    /// or [`Effect::ReadFailed`] if it is not leader, stops leading first, or
+    /// cannot confirm the read within [`READ_TICKS`] heartbeats. Nothing is
+    /// written to the log.
     ReadIndex {
         /// The driver's handle for the read, echoed in the answer.
         id: ReadId,
@@ -1145,9 +1160,10 @@ pub enum Effect {
         /// The leader's `commitIndex` the read is linearized at.
         read_index: LogIndex,
     },
-    /// The read `id` cannot be served by this node: it is not the leader, or
-    /// stopped leading before the read was confirmed. The client may retry,
-    /// ideally against the current leader.
+    /// The read `id` cannot be served by this node: it is not the leader,
+    /// stopped leading before the read was confirmed, or could not confirm it
+    /// within [`READ_TICKS`] heartbeats. The client may retry, ideally against
+    /// the current leader.
     ReadFailed {
         /// The handle from [`Input::ReadIndex`].
         id: ReadId,
@@ -1387,6 +1403,7 @@ impl RaftNode {
             id,
             round: *heartbeat_round,
             read_index: None,
+            ticks_left: READ_TICKS,
         });
         self.replicate_to_peers(true)
     }
@@ -2382,7 +2399,23 @@ impl RaftNode {
             }
         }
         self.expire_snapshot_waits();
-        self.replicate_to_peers(true)
+        let mut effects = self.expire_reads();
+        effects.extend(self.replicate_to_peers(true));
+        effects
+    }
+
+    /// Counts a heartbeat tick against every pending read and fails those
+    /// whose [`READ_TICKS`] budget has run out.
+    fn expire_reads(&mut self) -> Vec<Effect> {
+        let mut failed = Vec::new();
+        self.reads.retain_mut(|read| {
+            read.ticks_left = read.ticks_left.saturating_sub(1);
+            if read.ticks_left == 0 {
+                failed.push(Effect::ReadFailed { id: read.id });
+            }
+            read.ticks_left > 0
+        });
+        failed
     }
 
     /// Handles client proposals (Figure 2, "Clients of Raft").
@@ -2986,7 +3019,7 @@ mod tests {
         AppendEntriesArgs, AppendEntriesReply, CATCH_UP_TICKS, ClusterConfig, Conflict, Effect,
         Flow, HeartbeatRound, Input, InstallSnapshotArgs, InstallSnapshotReply, Log, LogEntry,
         LogIndex, LogicalInstant, MembershipChange, Message, NodeId, PreVoteArgs, PreVoteReply,
-        PreVoteRound, Progress, RaftNode, ReadId, ReplicationConfig, RequestVoteArgs,
+        PreVoteRound, Progress, READ_TICKS, RaftNode, ReadId, ReplicationConfig, RequestVoteArgs,
         RequestVoteReply, Role, TRANSFER_TICKS, Term, TimeoutNowArgs,
     };
 
@@ -6620,6 +6653,39 @@ mod tests {
         // Nothing is left to answer later.
         drive(&mut n, deliver(2, ae_reply_in_round(1, true, 1, 2)));
         assert!(n.reads.is_empty());
+    }
+
+    #[test]
+    fn a_read_no_quorum_confirms_fails_after_its_tick_budget() {
+        let mut n = acked_leader();
+        drive(&mut n, read(7));
+
+        for _ in 1..READ_TICKS {
+            let effects = n.step(Input::HeartbeatTick, NOW);
+            assert!(!effects.contains(&read_failed(7)));
+        }
+        let effects = n.step(Input::HeartbeatTick, NOW);
+
+        assert!(effects.contains(&read_failed(7)));
+        assert!(n.is_leader());
+        assert!(n.reads.is_empty());
+    }
+
+    #[test]
+    fn a_read_confirmed_in_time_is_not_failed_later() {
+        let mut n = acked_leader();
+        drive(&mut n, read(7));
+        drive(&mut n, read(8));
+        for _ in 1..READ_TICKS {
+            drive(&mut n, Input::HeartbeatTick);
+        }
+
+        // Read 7 is confirmed with a tick to spare; read 8 never is.
+        let effects = n.step(deliver(2, ae_reply_in_round(1, true, 1, 1)), NOW);
+        assert_eq!(effects, vec![read_ready(7, 1)]);
+        let effects = n.step(Input::HeartbeatTick, NOW);
+        assert!(effects.contains(&read_failed(8)));
+        assert!(!effects.contains(&read_failed(7)));
     }
 
     #[test]

@@ -1418,9 +1418,9 @@ fn reads_stay_linearizable_under_chaos() {
 /// The stale read `ReadIndex` exists to prevent. A leader cut off from the rest
 /// still believes it leads; the majority elects a successor and commits a
 /// write the old leader never sees. A read asked of the old leader must not be
-/// served from its stale state: no quorum echoes its round, so the read waits,
-/// and fails once the heal makes it step down. The new leader serves a read
-/// that reflects the write.
+/// served from its stale state: no quorum echoes its round, so the read fails
+/// once its `READ_TICKS` budget runs out, though the old leader still believes
+/// it leads. The new leader serves a read that reflects the write.
 fn assert_deposed_leader_never_serves_a_stale_read(seed: u64) {
     let node_count = 5;
     let mut sim = Sim::new(node_count, seed).with_net(JITTER5);
@@ -1453,17 +1453,16 @@ fn assert_deposed_leader_never_serves_a_stale_read(seed: u64) {
     sim.run_until(sim.now + 2_000);
     assert_eq!(
         (sim.reads_served, sim.reads_failed),
-        (0, 0),
-        "seed={seed}: the isolated leader answered a read it cannot confirm",
+        (0, 1),
+        "seed={seed}: the isolated leader's read was not failed within its budget",
+    );
+    assert!(
+        sim.nodes[old_leader].is_leader(),
+        "seed={seed}: the isolated leader stepped down on its own",
     );
 
     sim.set_groups(vec![0; node_count]);
     sim.run_until(sim.now + 1_000);
-    assert_eq!(
-        (sim.reads_served, sim.reads_failed),
-        (0, 1),
-        "seed={seed}: the deposed leader's read did not fail on the heal",
-    );
 
     let leader = sim.run_until_leader(5_000);
     sim.issue_read(leader);
