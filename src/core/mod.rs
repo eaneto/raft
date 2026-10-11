@@ -574,19 +574,38 @@ pub enum Role {
         votes_granted: BTreeSet<NodeId>,
     },
     /// Won the election for the current term; replicates the log and sends
-    /// heartbeats. Both maps are keyed by peer id and reinitialised on
-    /// election (Figure 2, "Volatile state on leaders"). While a server is
-    /// being added they also carry an entry for that non-voting learner, which
-    /// [`RaftNode::config`] does not yet list.
+    /// heartbeats.
     Leader {
-        /// For each peer, the index of the next log entry to send it.
-        next_index: BTreeMap<NodeId, LogIndex>,
-        /// For each peer, the highest log index known to be replicated on it.
-        match_index: BTreeMap<NodeId, LogIndex>,
+        /// Replication progress for each peer, reinitialised on election
+        /// (Figure 2, "Volatile state on leaders"). While a server is being
+        /// added it also carries an entry for that non-voting learner, which
+        /// [`RaftNode::config`] does not yet list.
+        progress: BTreeMap<NodeId, Progress>,
         /// The leadership transfer this leader is running, if any (thesis
         /// §3.10). While it is `Some` the leader accepts no new proposals.
         transfer: Option<LeadershipTransfer>,
     },
+}
+
+/// A leader's replication bookkeeping for one peer (Figure 2, "Volatile state
+/// on leaders").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Progress {
+    /// The index of the next log entry to send the peer.
+    pub next_index: LogIndex,
+    /// The highest log index known to be replicated on the peer.
+    pub match_index: LogIndex,
+}
+
+impl Progress {
+    /// Progress for a peer nothing is yet known about: probe from `next_index`
+    /// (one past the leader's last entry), with nothing matched.
+    const fn new(next_index: LogIndex) -> Self {
+        Self {
+            next_index,
+            match_index: LogIndex::ZERO,
+        }
+    }
 }
 
 /// A leader's progress on handing leadership to another server (thesis §3.10).
@@ -1557,14 +1576,8 @@ impl RaftNode {
                     return Vec::new();
                 }
                 let next = self.log.last_index().next();
-                if let Role::Leader {
-                    next_index,
-                    match_index,
-                    ..
-                } = &mut self.role
-                {
-                    next_index.insert(id, next);
-                    match_index.insert(id, LogIndex::ZERO);
+                if let Role::Leader { progress, .. } = &mut self.role {
+                    progress.insert(id, Progress::new(next));
                 }
                 self.pending_change = Some(PendingChange {
                     change,
@@ -1621,14 +1634,13 @@ impl RaftNode {
     /// target has moved to a newer term and drops it as stale.
     fn timeout_now_if_caught_up(&self, peer: NodeId) -> Option<Effect> {
         let Role::Leader {
-            match_index,
             transfer: Some(LeadershipTransfer { target, .. }),
             ..
         } = &self.role
         else {
             return None;
         };
-        let matched = match_index.get(&peer).copied().unwrap_or(LogIndex::ZERO);
+        let matched = self.match_index_for(peer);
         (peer == *target && matched >= self.log.last_index()).then(|| Effect::SendRpc {
             to: peer,
             message: Message::TimeoutNow(TimeoutNowArgs {
@@ -1668,7 +1680,7 @@ impl RaftNode {
             .append(LogEntry::config(self.current_term, new_config.clone()));
         let config_index = self.log.last_index();
         self.recompute_config();
-        // `next_index` / `match_index` stay as they are: a promoted learner
+        // The peers' progress stays as it is: a promoted learner
         // already has entries, and a peer being removed keeps its own until the
         // removal commits (`check_config_committed` drops them), so it is sent
         // the entry that removes it and does not sit there timing out.
@@ -1705,12 +1717,7 @@ impl RaftNode {
         if from != id {
             return;
         }
-        let matched = match &self.role {
-            Role::Leader { match_index, .. } => {
-                match_index.get(&id).copied().unwrap_or(LogIndex::ZERO)
-            }
-            _ => return,
-        };
+        let matched = self.match_index_for(id);
         if matched < round_target {
             return;
         }
@@ -1734,14 +1741,9 @@ impl RaftNode {
             change: MembershipChange::AddServer(id),
             ..
         }) = self.pending_change.take()
-            && let Role::Leader {
-                next_index,
-                match_index,
-                ..
-            } = &mut self.role
+            && let Role::Leader { progress, .. } = &mut self.role
         {
-            next_index.remove(&id);
-            match_index.remove(&id);
+            progress.remove(&id);
         }
     }
 
@@ -1764,14 +1766,9 @@ impl RaftNode {
         // Now that a removal is durable everywhere it matters, stop replicating
         // to the removed peer.
         if let MembershipChange::RemoveServer(id) = change
-            && let Role::Leader {
-                next_index,
-                match_index,
-                ..
-            } = &mut self.role
+            && let Role::Leader { progress, .. } = &mut self.role
         {
-            next_index.remove(&id);
-            match_index.remove(&id);
+            progress.remove(&id);
         }
         effects.push(Effect::MembershipChanged {
             config: self.config.clone(),
@@ -1785,28 +1782,21 @@ impl RaftNode {
     /// Records a successful ack: `match_index[peer]` only moves forward (a
     /// reordered older ack cannot pull it back) and `next_index[peer]` follows.
     fn record_match(&mut self, peer: NodeId, matched: LogIndex) {
-        if let Role::Leader {
-            next_index,
-            match_index,
-            ..
-        } = &mut self.role
+        if let Role::Leader { progress, .. } = &mut self.role
+            && let Some(p) = progress.get_mut(&peer)
         {
-            if let Some(m) = match_index.get_mut(&peer) {
-                *m = matched.max(*m);
-            }
-            if let Some(n) = next_index.get_mut(&peer) {
-                *n = matched.next().max(*n);
-            }
+            p.match_index = matched.max(p.match_index);
+            p.next_index = matched.next().max(p.next_index);
         }
     }
 
     /// Figure 2: on a failed `AppendEntries`, step `next_index` for the peer
     /// back by one (never below 1) so the next attempt probes further back.
     fn back_off(&mut self, peer: NodeId) {
-        if let Role::Leader { next_index, .. } = &mut self.role
-            && let Some(n) = next_index.get_mut(&peer)
+        if let Role::Leader { progress, .. } = &mut self.role
+            && let Some(p) = progress.get_mut(&peer)
         {
-            *n = n.prev().max(LogIndex::new(1));
+            p.next_index = p.next_index.prev().max(LogIndex::new(1));
         }
     }
 
@@ -1818,15 +1808,15 @@ impl RaftNode {
     /// applies.
     fn maybe_advance_commit_index(&mut self, effects: &mut Vec<Effect>) {
         let majority_matched = {
-            let Role::Leader { match_index, .. } = &self.role else {
+            let Role::Leader { progress, .. } = &self.role else {
                 return;
             };
             // Only voters count: a still-catching-up learner has a
-            // `match_index` entry but is not in the configuration.
-            let mut matched: Vec<LogIndex> = match_index
+            // progress entry but is not in the configuration.
+            let mut matched: Vec<LogIndex> = progress
                 .iter()
                 .filter(|(peer, _)| self.config.contains(**peer))
-                .map(|(_, index)| *index)
+                .map(|(_, p)| p.match_index)
                 .collect();
             matched.push(self.log.last_index()); // our own log end
             matched.sort_unstable_by_key(|&index| std::cmp::Reverse(index));
@@ -2009,16 +1999,14 @@ impl RaftNode {
     /// replication bookkeeping (Figure 2).
     fn become_leader(&mut self) {
         let next = self.log.last_index().next();
-        let next_index = self.peers.iter().map(|&peer| (peer, next)).collect();
-        let match_index = self
+        let progress = self
             .peers
             .iter()
-            .map(|&peer| (peer, LogIndex::ZERO))
+            .map(|&peer| (peer, Progress::new(next)))
             .collect();
         self.leader_id = Some(self.id);
         self.role = Role::Leader {
-            next_index,
-            match_index,
+            progress,
             transfer: None,
         };
         self.adopt_pending_config_change();
@@ -2043,14 +2031,10 @@ impl RaftNode {
         };
         if affected != self.id {
             let next = self.log.last_index().next();
-            if let Role::Leader {
-                next_index,
-                match_index,
-                ..
-            } = &mut self.role
-            {
-                next_index.entry(affected).or_insert(next);
-                match_index.entry(affected).or_insert(LogIndex::ZERO);
+            if let Role::Leader { progress, .. } = &mut self.role {
+                progress
+                    .entry(affected)
+                    .or_insert_with(|| Progress::new(next));
             }
         }
         self.pending_change = Some(PendingChange {
@@ -2149,10 +2133,10 @@ impl RaftNode {
     /// `Propose`.
     fn replicate_to_peers(&self) -> Vec<Effect> {
         match &self.role {
-            Role::Leader { next_index, .. } => {
-                // Voters plus any catching-up learner (which has a `next_index`
+            Role::Leader { progress, .. } => {
+                // Voters plus any catching-up learner (which has a progress
                 // entry but is not yet in the configuration).
-                next_index
+                progress
                     .keys()
                     .map(|&peer| self.replicate_to(peer))
                     .collect()
@@ -2198,13 +2182,23 @@ impl RaftNode {
     /// total for any off-path caller a future step might add.
     fn next_index_for(&self, peer: NodeId) -> LogIndex {
         match &self.role {
-            Role::Leader { next_index, .. } => next_index
+            Role::Leader { progress, .. } => progress
                 .get(&peer)
-                .copied()
-                .unwrap_or_else(|| self.log.last_index().next()),
+                .map_or_else(|| self.log.last_index().next(), |p| p.next_index),
             Role::Follower | Role::PreCandidate { .. } | Role::Candidate { .. } => {
                 self.log.last_index().next()
             }
+        }
+    }
+
+    /// This leader's `match_index` for `peer`, or zero when it is not leading
+    /// or has no progress for `peer`.
+    fn match_index_for(&self, peer: NodeId) -> LogIndex {
+        match &self.role {
+            Role::Leader { progress, .. } => progress
+                .get(&peer)
+                .map_or(LogIndex::ZERO, |p| p.match_index),
+            Role::Follower | Role::PreCandidate { .. } | Role::Candidate { .. } => LogIndex::ZERO,
         }
     }
 
@@ -2404,8 +2398,8 @@ mod tests {
     use super::{
         AppendEntriesArgs, AppendEntriesReply, CATCH_UP_TICKS, ClusterConfig, Effect, Input,
         InstallSnapshotArgs, InstallSnapshotReply, Log, LogEntry, LogIndex, LogicalInstant,
-        MembershipChange, Message, NodeId, PreVoteArgs, PreVoteReply, PreVoteRound, RaftNode,
-        RequestVoteArgs, RequestVoteReply, Role, TRANSFER_TICKS, Term, TimeoutNowArgs,
+        MembershipChange, Message, NodeId, PreVoteArgs, PreVoteReply, PreVoteRound, Progress,
+        RaftNode, RequestVoteArgs, RequestVoteReply, Role, TRANSFER_TICKS, Term, TimeoutNowArgs,
     };
 
     /// The core does not consult the clock under this timer model, so every
@@ -3921,8 +3915,8 @@ mod tests {
         assert_eq!(n.commit_index(), LogIndex::ZERO);
         assert!(n.is_leader());
         // It vouches for node 2's log in a term we no longer lead.
-        if let Role::Leader { match_index, .. } = n.role() {
-            assert_eq!(match_index[&NodeId::new(2)], LogIndex::ZERO);
+        if let Role::Leader { progress, .. } = n.role() {
+            assert_eq!(progress[&NodeId::new(2)].match_index, LogIndex::ZERO);
         } else {
             unreachable!("still a leader");
         }
@@ -4071,8 +4065,8 @@ mod tests {
     #[test]
     fn a_heartbeat_tick_sends_a_snapshot_to_a_peer_behind_the_base() {
         let mut n = leader_with_compacted_log(3);
-        if let Role::Leader { next_index, .. } = &mut n.role {
-            next_index.insert(NodeId::new(3), LogIndex::new(1));
+        if let Role::Leader { progress, .. } = &mut n.role {
+            progress.insert(NodeId::new(3), Progress::new(LogIndex::new(1)));
         }
 
         let effects = n.step(Input::HeartbeatTick, NOW);
@@ -4083,20 +4077,15 @@ mod tests {
     #[test]
     fn an_install_snapshot_reply_advances_next_index_past_the_compacted_region() {
         let mut n = leader_with_compacted_log(3);
-        if let Role::Leader { next_index, .. } = &mut n.role {
-            next_index.insert(NodeId::new(2), LogIndex::new(1));
+        if let Role::Leader { progress, .. } = &mut n.role {
+            progress.insert(NodeId::new(2), Progress::new(LogIndex::new(1)));
         }
 
         drive(&mut n, deliver(2, snapshot_reply_msg(2, 4)));
 
-        if let Role::Leader {
-            next_index,
-            match_index,
-            ..
-        } = n.role()
-        {
-            assert_eq!(next_index[&NodeId::new(2)], LogIndex::new(5));
-            assert_eq!(match_index[&NodeId::new(2)], LogIndex::new(4));
+        if let Role::Leader { progress, .. } = n.role() {
+            assert_eq!(progress[&NodeId::new(2)].next_index, LogIndex::new(5));
+            assert_eq!(progress[&NodeId::new(2)].match_index, LogIndex::new(4));
         } else {
             unreachable!("still a leader");
         }
@@ -4105,21 +4094,16 @@ mod tests {
     #[test]
     fn a_stale_install_snapshot_reply_is_ignored() {
         let mut n = leader_with_compacted_log(3); // leader, term 2
-        if let Role::Leader { next_index, .. } = &mut n.role {
-            next_index.insert(NodeId::new(2), LogIndex::new(1));
+        if let Role::Leader { progress, .. } = &mut n.role {
+            progress.insert(NodeId::new(2), Progress::new(LogIndex::new(1)));
         }
 
         let effects = n.step(deliver(2, snapshot_reply_msg(1, 4)), NOW);
 
         assert!(effects.is_empty());
-        if let Role::Leader {
-            next_index,
-            match_index,
-            ..
-        } = n.role()
-        {
-            assert_eq!(next_index[&NodeId::new(2)], LogIndex::new(1));
-            assert_eq!(match_index[&NodeId::new(2)], LogIndex::ZERO);
+        if let Role::Leader { progress, .. } = n.role() {
+            assert_eq!(progress[&NodeId::new(2)].next_index, LogIndex::new(1));
+            assert_eq!(progress[&NodeId::new(2)].match_index, LogIndex::ZERO);
         } else {
             unreachable!("still a leader");
         }
@@ -4320,8 +4304,8 @@ mod tests {
             [Effect::SendRpc { to, .. }] if *to == new
         ));
         assert!(!n.config().contains(new));
-        if let Role::Leader { next_index, .. } = n.role() {
-            assert!(next_index.contains_key(&new));
+        if let Role::Leader { progress, .. } = n.role() {
+            assert!(progress.contains_key(&new));
         } else {
             unreachable!("still leader");
         }
@@ -4452,8 +4436,8 @@ mod tests {
         }
 
         assert_eq!(n.config().len(), 3);
-        if let Role::Leader { next_index, .. } = n.role() {
-            assert!(!next_index.contains_key(&new));
+        if let Role::Leader { progress, .. } = n.role() {
+            assert!(!progress.contains_key(&new));
         } else {
             unreachable!("still leader");
         }
@@ -4494,8 +4478,8 @@ mod tests {
                 ..
             }) if id == NodeId::new(3)
         ));
-        if let Role::Leader { next_index, .. } = b.role() {
-            assert!(next_index.contains_key(&NodeId::new(3)));
+        if let Role::Leader { progress, .. } = b.role() {
+            assert!(progress.contains_key(&NodeId::new(3)));
         } else {
             unreachable!("still leader");
         }
@@ -4537,8 +4521,8 @@ mod tests {
                 LogIndex::new(1)
             ))
         );
-        if let Role::Leader { next_index, .. } = n.role() {
-            assert!(next_index.contains_key(&NodeId::new(4)));
+        if let Role::Leader { progress, .. } = n.role() {
+            assert!(progress.contains_key(&NodeId::new(4)));
         } else {
             unreachable!("still leader");
         }
@@ -4793,8 +4777,8 @@ mod tests {
     #[test]
     fn an_install_snapshot_reply_can_complete_the_catch_up() {
         let mut n = leader_with_compacted_log(5); // whole log is the snapshot
-        if let Role::Leader { next_index, .. } = &mut n.role {
-            next_index.insert(NodeId::new(2), LogIndex::new(1));
+        if let Role::Leader { progress, .. } = &mut n.role {
+            progress.insert(NodeId::new(2), Progress::new(LogIndex::new(1)));
         }
         drive(&mut n, transfer_to(2));
 
