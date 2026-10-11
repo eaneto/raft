@@ -1067,6 +1067,50 @@ fn bursts_commit_through_a_tight_pipelining_window() {
     }
 }
 
+/// Followers compact every few entries while duplicated and reordered
+/// `AppendEntries` from before each compaction keep arriving, anchored below
+/// the follower's snapshot. They must be recognised as already covered —
+/// never spliced over the snapshot — and the cluster converges.
+fn assert_compaction_survives_stale_append_entries(node_count: usize, seed: u64) {
+    let net = Net {
+        drop_permille: 20,
+        dup_permille: 300,
+        jitter: 40,
+        repartition_every: 0,
+    };
+    let mut sim = Sim::new(node_count, seed)
+        .with_net(net)
+        .with_replication(TIGHT)
+        .with_snapshot_threshold(3);
+
+    let mut want = Vec::new();
+    for k in 0..8 {
+        let burst: Vec<Vec<u8>> = (0..4).map(|j| format!("s-{k}-{j}").into_bytes()).collect();
+        let leader = sim.run_until_leader(10_000);
+        let commands: Vec<&[u8]> = burst.iter().map(Vec::as_slice).collect();
+        sim.propose_batch_at(leader, &commands);
+        want.extend(burst.iter().map(|c| Bytes::copy_from_slice(c)));
+        sim.run_until(sim.now + 300);
+    }
+    sim.run_until(sim.now + 20_000);
+
+    for i in 0..node_count {
+        assert_eq!(
+            sim.applied_commands(i),
+            want,
+            "seed={seed}: node {i} did not converge while compacting",
+        );
+    }
+}
+
+#[test]
+fn compaction_survives_stale_append_entries() {
+    for seed in seeds(&[1, 2, 3, 42, 1_000, 0x5EED, 7, 99]) {
+        assert_compaction_survives_stale_append_entries(3, seed);
+        assert_compaction_survives_stale_append_entries(5, seed);
+    }
+}
+
 /// A wiped follower (empty log, but the leader still remembers a high
 /// `matchIndex` for it) is walked back past that stale `matchIndex` and
 /// refilled under tight limits.
