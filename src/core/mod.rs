@@ -1402,8 +1402,13 @@ impl RaftNode {
         self.persist_if_changed(before, &mut effects);
 
         // Receiver rule 2: the log must contain `prev_log_index` with a
-        // matching term, or this is the empty-log base case.
+        // matching term, or this is the empty-log base case. An anchor below
+        // our snapshot also matches: a snapshot only covers committed entries,
+        // which every current leader holds (Leader Completeness), so by Log
+        // Matching our prefix up to it is the leader's. Only a delayed or
+        // duplicated RPC from before we compacted is anchored there.
         let consistent = args.prev_log_index == LogIndex::ZERO
+            || args.prev_log_index < self.log.snapshot_last_index()
             || self.log.term_at(args.prev_log_index) == Some(args.prev_log_term);
         if !consistent {
             effects.push(Effect::ResetElectionTimer);
@@ -1454,6 +1459,10 @@ impl RaftNode {
     /// are, so a delayed or duplicated RPC never rewinds the log (Log
     /// Matching, Leader Append-Only on the leader's behalf).
     ///
+    /// Entries at or below the compaction base are skipped: the snapshot
+    /// already holds them, committed, so they cannot conflict, and the
+    /// snapshot itself is never truncated.
+    ///
     /// Returns `Some(from_index)` — the 1-based index of the first entry
     /// written — when the log changed, or `None` when every entry was already
     /// present.
@@ -1462,10 +1471,11 @@ impl RaftNode {
         prev_log_index: LogIndex,
         entries: &[LogEntry],
     ) -> Option<LogIndex> {
+        let base = self.log.snapshot_last_index();
         let mut index = prev_log_index;
         for (offset, entry) in entries.iter().enumerate() {
             index = index.next();
-            if self.log.term_at(index) == Some(entry.term) {
+            if index <= base || self.log.term_at(index) == Some(entry.term) {
                 continue;
             }
             // Conflict, or past our end: drop anything from `index` on and
@@ -4559,6 +4569,68 @@ mod tests {
         assert_eq!(n.log().get(LogIndex::new(5)), None); // folded away
         assert_eq!(n.log().get(LogIndex::new(6)), Some(&entry(1)));
         assert_eq!(n.log().last_index(), LogIndex::new(8));
+    }
+
+    /// Node 1 of {1, 2, 3}, a term-1 follower of node 2 holding entries 1–5,
+    /// all committed and applied, with 1–3 compacted into a snapshot.
+    fn follower_behind_a_snapshot() -> RaftNode {
+        let mut n = node(1, &[2, 3]);
+        for _ in 0..5 {
+            n.log.append(entry(1));
+        }
+        n.current_term = Term::new(1);
+        n.commit_index = LogIndex::new(5);
+        n.last_applied = LogIndex::new(5);
+        drive(
+            &mut n,
+            Input::CompactLog {
+                up_to_index: LogIndex::new(3),
+            },
+        );
+        n
+    }
+
+    #[test]
+    fn a_stale_append_entries_anchored_below_the_snapshot_leaves_the_log_intact() {
+        let mut n = follower_behind_a_snapshot();
+        let log_before = n.log().clone();
+
+        // A delayed RPC from before the compaction: anchored at 0, carrying
+        // entries the snapshot already holds. Treating the snapshot as a
+        // conflict would truncate below the base and append entry 1 at 4.
+        let effects = n.step(
+            deliver(2, append_entries(1, 2, 0, 0, vec![entry(1), entry(1)], 2)),
+            NOW,
+        );
+
+        assert_eq!(n.log(), &log_before);
+        assert_eq!(effects.last(), Some(&ack(2, 1, 2)));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::PersistLog { .. }))
+        );
+    }
+
+    #[test]
+    fn an_append_entries_straddling_the_snapshot_appends_only_past_it() {
+        let mut n = follower_behind_a_snapshot();
+
+        let effects = n.step(
+            deliver(
+                2,
+                append_entries(1, 2, 1, 1, vec![entry(1); 5], 5), // entries 2..=6
+            ),
+            NOW,
+        );
+
+        assert_eq!(n.log().snapshot_last_index(), LogIndex::new(3));
+        assert_eq!(n.log().last_index(), LogIndex::new(6));
+        assert!(effects.contains(&Effect::PersistLog {
+            from_index: LogIndex::new(6),
+            entries: vec![entry(1)],
+        }));
+        assert_eq!(effects.last(), Some(&ack(2, 1, 6)));
     }
 
     #[test]
