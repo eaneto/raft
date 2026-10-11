@@ -335,7 +335,9 @@ impl Sim {
             leader_id: self.nodes[i].id(),
             last_included_index: LogIndex::new(last_index),
             last_included_term: Term::new(last_term),
-            config: self.nodes[i].config().clone(),
+            // The leader's log is compacted to exactly `last_index`, so this
+            // is the configuration its snapshot covers.
+            config: self.nodes[i].config_at(LogIndex::new(last_index)),
             offset: 0,
             data: encode_applied(&prefix),
             done: true,

@@ -583,6 +583,70 @@ fn assert_added_server_catches_up_and_votes(seed: u64) {
     }
 }
 
+/// A server added to a compacting cluster soon has the `Config` entry that
+/// admitted it folded into a snapshot, on every node. Everyone must keep the
+/// four-node configuration — not fall back to the bootstrap set (or, on the
+/// new server, to its empty learner set) — and the new server must be able to
+/// lead.
+fn assert_added_server_keeps_its_config_after_compaction(seed: u64) {
+    let mut sim = Sim::new(3, seed)
+        .with_net(JITTER5)
+        .with_snapshot_threshold(3);
+    let leader = sim.run_until_leader(5_000);
+    sim.propose_at(leader, b"pre");
+    sim.run_until(sim.now + 300);
+
+    sim.add_server(4);
+    let deadline = sim.now + 15_000;
+    while sim.now < deadline && !sim.all_agree_member(4, true) {
+        sim.run_until(sim.now + HEARTBEAT_PERIOD);
+    }
+    assert!(
+        sim.all_agree_member(4, true),
+        "seed={seed}: node 4 not added"
+    );
+
+    // Enough entries that every node compacts past the configuration entry.
+    for k in 0..8 {
+        let current = sim.run_until_leader(8_000);
+        sim.propose_at(current, format!("post-{k}").as_bytes());
+        sim.run_until(sim.now + 200);
+    }
+    for i in 0..sim.nodes.len() {
+        assert!(
+            sim.nodes[i].log().snapshot_last_index().get() > 4,
+            "seed={seed}: node {i} never compacted past the configuration entry",
+        );
+        assert_eq!(
+            sim.nodes[i].config().len(),
+            4,
+            "seed={seed}: node {i} lost the four-node configuration",
+        );
+    }
+
+    sim.transfer_leadership(4);
+    sim.run_until(sim.now + 2_000);
+    let leader = sim.run_until_leader(8_000);
+    sim.propose_at(leader, b"after");
+    sim.run_until(sim.now + 1_000);
+    let reference = sim.applied_commands(leader);
+    assert_eq!(reference.last().map(|c| &c[..]), Some(&b"after"[..]));
+    for i in 0..sim.nodes.len() {
+        assert_eq!(
+            sim.applied_commands(i),
+            reference,
+            "seed={seed}: node {i} diverged after compaction",
+        );
+    }
+}
+
+#[test]
+fn an_added_server_keeps_its_config_after_compaction() {
+    for seed in seeds(&[1, 2, 3, 42, 1_000, 0x5EED]) {
+        assert_added_server_keeps_its_config_after_compaction(seed);
+    }
+}
+
 #[test]
 fn a_server_added_by_the_leader_catches_up_and_votes() {
     for seed in seeds(&[1, 2, 3, 42, 1_000, 0x5EED]) {

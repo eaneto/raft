@@ -727,7 +727,7 @@ impl<S: Storage, M: StateMachine, T: PeerTransport> Driver<S, M, T> {
         let meta = SnapshotMeta {
             last_included_index: last_applied,
             last_included_term: term,
-            config: self.node.config().clone(),
+            config: self.node.config_at(last_applied),
         };
         let data = self.state_machine.snapshot();
         self.storage.persist_snapshot(meta.clone(), &data)?;
